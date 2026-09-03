@@ -1,0 +1,355 @@
+# Cut a release from a tag: the same artefacts `make release` makes locally,
+# executed once before they are published, then a GitHub Release and a
+# multi-arch container image.
+#
+# The build does NOT reimplement anything: it runs `scripts/release.sh`, one
+# target per matrix leg, so the path remapping, the `check_no_build_paths` leak
+# check, the tarball layout and SHA256SUMS are byte-for-byte the same procedure
+# a release built by hand goes through. `docs/OWNER_RUNBOOK.md` still describes
+# that hand-built path, which is what an offline release uses.
+#
+# The LIVE gates are not here - they need the operator's homeserver and
+# accounts (tests/live/README.md). Tagging is the operator's statement that they
+# have run them against the musl binary; this workflow's own proof is that both
+# binaries were EXECUTED before anybody could download them.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+# Read-only by default; the two jobs that publish widen it for themselves.
+permissions:
+  contents: read
+
+# One release at a time per tag, and never cancel one in flight: a half-uploaded
+# release is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned so a rebuild of the same tag produces the same binaries. zig 0.16.0
+  # is a version cargo-zigbuild 0.23.x tests against.
+  CARGO_ZIGBUILD_VERSION: '0.23.4'
+  ZIG_VERSION: '0.16.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The tag names the artefacts; Cargo.toml is what the binary prints. If
+      # they disagree, everything downstream is mislabelled, so stop here.
+      - name: The tag and Cargo.toml must agree
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$tagged" != "$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} but Cargo.toml says ${version}" >&2
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${version}"
+
+      - name: Rust stable, with the musl target
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cargo registry and target cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      # A musl build needs a C compiler for the target: aws-lc-sys (the rustls
+      # crypto provider) and the bundled SQLite are C. `zig cc` is that
+      # compiler, exactly as scripts/release.sh's header says.
+      - name: Zig, the cross C toolchain
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ matrix.target }}
+
+      - name: Restore cargo-zigbuild
+        id: zigbuild-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}-${{ env.CARGO_ZIGBUILD_VERSION }}
+
+      - name: Install cargo-zigbuild
+        if: steps.zigbuild-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
+
+      # The release script, unchanged, one target at a time.
+      - name: scripts/release.sh
+        run: TARGETS='${{ matrix.target }}' ./scripts/release.sh
+
+      - name: Upload the tarball and its checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: run both binaries
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Download both tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: artifacts
+
+      - name: Unpack them
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p unpacked
+          for arch in x86_64 aarch64; do
+            target="${arch}-unknown-linux-musl"
+            tar xzf "artifacts/dist-${target}/agent-room-${version}-${target}.tar.gz" -C unpacked
+          done
+          file unpacked/*/agent-room
+
+      # The x86-64 binary runs on the runner as a friend would run it.
+      - name: x86-64, natively
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary="unpacked/agent-room-${version}-x86_64-unknown-linux-musl/agent-room"
+          printed="$("$binary" --version)"
+          echo "$printed"
+          if [ "$printed" != "agent-room ${version}" ]; then
+            echo "expected 'agent-room ${version}', got '${printed}'" >&2
+            exit 1
+          fi
+
+      # binfmt_misc registration for arm64, installed with the fix-binary flag,
+      # so an aarch64 static binary runs from this shell as if it were native.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
+      # The FIRST time the arm64 build is ever executed. Until this step it is a
+      # file nobody has run, and cross-compiling is exactly where a binary that
+      # links and does not start comes from.
+      - name: aarch64, under emulation
+        run: |
+          set -euo pipefail
+          # Without a registered interpreter the next line dies with "Exec
+          # format error" and says nothing about why, so say it here.
+          if ! compgen -G '/proc/sys/fs/binfmt_misc/*aarch64*' >/dev/null; then
+            echo "no binfmt_misc handler for aarch64: the QEMU step did not take" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          binary="unpacked/agent-room-${version}-aarch64-unknown-linux-musl/agent-room"
+          printed="$("$binary" --version)"
+          echo "$printed"
+          if [ "$printed" != "agent-room ${version}" ]; then
+            echo "expected 'agent-room ${version}', got '${printed}'" >&2
+            exit 1
+          fi
+
+  release:
+    name: GitHub Release
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write      # create the release and upload the artefacts to it
+      id-token: write      # the Sigstore identity the attestation is signed with
+      attestations: write  # record the attestation against this repository
+    steps:
+      - name: Download both tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: artifacts
+
+      # Each matrix leg wrote a SHA256SUMS with its own line in it. The release
+      # carries ONE, the way `make release` writes it, and it is checked here
+      # against the files that are about to be uploaded.
+      - name: Merge the artefacts and their checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp artifacts/dist-*/*.tar.gz dist/
+          cat artifacts/dist-*/SHA256SUMS | sort -k 2 > dist/SHA256SUMS
+          cd dist
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest the tarballs' provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          args=(
+            "$GITHUB_REF_NAME"
+            --title "agent-room ${version}"
+            --generate-notes
+            --verify-tag
+          )
+          # A tag with a hyphen in it is 1.0.0-rc.1 and friends: not the stable
+          # download, so it must not look like one.
+          case "$version" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          gh release create "${args[@]}" dist/*.tar.gz dist/SHA256SUMS
+
+  image:
+    name: container image
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read       # read the CI Dockerfile out of the tree
+      packages: write      # push to the registry
+      id-token: write      # the Sigstore identity the attestation is signed with
+      attestations: write  # record the attestation against this repository
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download both tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: artifacts
+
+      # The image is built from the RELEASED binaries, not from a second
+      # compilation: what a friend pulls is the file the smoke job ran.
+      - name: Stage a binary per platform
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage() {
+            target="$1"
+            platform="$2"
+            tar xzf "artifacts/dist-${target}/agent-room-${version}-${target}.tar.gz" -C artifacts
+            mkdir -p "image/${platform}"
+            install -m 0755 "artifacts/agent-room-${version}-${target}/agent-room" \
+              "image/${platform}/agent-room"
+          }
+          stage x86_64-unknown-linux-musl linux/amd64
+          stage aarch64-unknown-linux-musl linux/arm64
+          find image -type f -exec ls -l {} +
+
+      - name: Work out the tags and the labels
+        id: meta
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          description="$(sed -n 's/^description = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          license="$(sed -n 's/^license = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          {
+            echo "version=${version}"
+            echo "image=${image}"
+            echo "tags<<TAGS"
+            echo "${image}:${version}"
+            # `latest` is the stable download only. A pre-release tag carries a
+            # hyphen and must never become what a bare `docker pull` gets.
+            case "$version" in
+              *-*) ;;
+              *) echo "${image}:latest" ;;
+            esac
+            echo "TAGS"
+            echo "labels<<LABELS"
+            echo "org.opencontainers.image.title=agent-room"
+            echo "org.opencontainers.image.description=${description}"
+            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.version=${version}"
+            echo "org.opencontainers.image.licenses=${license}"
+            echo "LABELS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to the registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: image
+          file: .github/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # buildkit's own attestations are off: the provenance this repository
+          # publishes is the signed one from the step below, and one claim about
+          # a build is easier to verify than two.
+          provenance: false
+          sbom: false
+
+      - name: Attest the image's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # Pull back what was just pushed and run it, once per platform. Until this
+      # step nothing has proved the published manifest resolves to a binary that
+      # starts.
+      - name: Run the pushed image, both platforms
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            printed="$(docker run --rm --platform "$platform" "${IMAGE}:${VERSION}" --version)"
+            echo "${platform}: ${printed}"
+            if [ "$printed" != "agent-room ${VERSION}" ]; then
+              echo "expected 'agent-room ${VERSION}', got '${printed}'" >&2
+              exit 1
+            fi
+          done

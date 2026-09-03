@@ -5,9 +5,19 @@ binary a friend installs**, and **hand them the Matrix account it runs as**.
 
 ## Cut a release
 
-There is no CI - private repo, house rule - so a release is built here, by hand,
-and the same `make gate` and live sweep that gate every slice are what says it
-is fit to send.
+**A release is a tag.** Pushing `vX.Y.Z` runs `.github/workflows/release.yml`,
+which builds both musl targets by running `scripts/release.sh` - the same script
+`make release` runs here, so the path remapping, the leak check, the tarball
+layout and `SHA256SUMS` are identical - then RUNS both binaries, publishes the
+GitHub Release with the tarballs and their checksums, attests their provenance,
+and pushes the multi-arch container image.
+
+What that workflow cannot do is the part that matters most: the **live gates**
+need this homeserver, these accounts and the tokens in
+`~/.config/agent-room/live.env`, and a hosted runner has none of them. Handing
+them to one would mean handing a third party a running deployment's
+credentials. So the tag is not the gate - the tag is you SAYING the gate passed.
+Everything below happens here, in this order, and the tag goes last.
 
 **Once, on the machine you build from.** Cross-compiling to musl needs a C
 toolchain for the target, because two dependencies are C: `aws-lc-sys` (the
@@ -22,6 +32,10 @@ that toolchain, driven by `cargo-zigbuild`:
     zig version
 
 (Any other zig on PATH does just as well: <https://ziglang.org/download/>.)
+
+You need this even though CI builds the release too: the live gates in step 5
+drive the musl binary, so the musl binary has to exist HERE first. The workflow
+installs its own pinned zig and `cargo-zigbuild` and does not touch yours.
 
 **Every time:**
 
@@ -58,9 +72,61 @@ that toolchain, driven by `cargo-zigbuild`:
 6. Record the run in `docs/GATES.md` under the version, the way every other gate
    run is recorded: the artefact sizes and hashes, the gate table with its
    timings, and anything that was looked at and deliberately left alone.
+7. Commit, push, and **tag**. This is the whole publish:
 
-`TARGETS='x86_64-unknown-linux-musl' make release` builds just the one, for a
-quick check.
+       git tag v1.0.0-rc.1
+       git push origin main
+       git push origin v1.0.0-rc.1
+
+   The tag has a leading `v`; the version inside it must equal the one in
+   `Cargo.toml`, and the first thing the workflow does is refuse the tag if it
+   does not ("tag v1.2.3 but Cargo.toml says 1.2.4"). A tag with a hyphen in it
+   (`v1.0.0-rc.1`) is published as a **pre-release** and does not move the
+   image's `latest`.
+8. Watch it, and check what came out:
+
+       gh run watch
+       gh release view v1.0.0-rc.1
+
+   The four jobs are `build` (once per target), `smoke`, `release` and `image`.
+   `smoke` is the one that matters most: it runs BOTH binaries, and it is the
+   first time the arm64 build has ever been executed anywhere - a cross-compile
+   that links and does not start dies here rather than on a friend's box.
+
+**Verify the published release** the way a reader would, from a directory that
+holds nothing of yours:
+
+    gh release download v1.0.0-rc.1
+    sha256sum -c SHA256SUMS
+    gh attestation verify agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz \
+        --repo mtclab/agent-room
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.1 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.1 \
+        --repo mtclab/agent-room
+
+The image is built FROM the tarballs the same run produced, so a friend pulling
+it and a friend unpacking a tarball get the same bytes.
+
+**On the FIRST release only:** a new registry package starts **private**, and a
+public repository does not make it public. Until it is switched over once -
+Packages, then `agent-room`, then package settings, then change visibility -
+`docker pull` works for you and 401s for everybody else, so the `docker run`
+above proves nothing about what a friend can reach. Check it from a logged-out
+shell (`docker logout ghcr.io`) the first time.
+
+**If the tag was wrong**, delete it and tag again - the workflow only ever runs
+on a tag being pushed, so nothing happens until one is:
+
+    git push origin :refs/tags/v1.0.0-rc.1 && git tag -d v1.0.0-rc.1
+
+If the release was already created, delete that too (`gh release delete`); a
+release GitHub still holds is one somebody can download.
+
+`make release` has not gone anywhere and is the **offline** path: it produces
+the identical artefacts on this machine with no network beyond crates.io, for
+handing somebody a tarball directly (below) or for cutting a build when GitHub
+is not part of the plan. `TARGETS='x86_64-unknown-linux-musl' make release`
+builds just the one, for a quick check.
 
 **Sanity-check what you are about to send**, on the machine you built it on:
 
@@ -80,11 +146,13 @@ Send them, over a channel you trust:
   below);
 - a pointer to `ONBOARDING.md`, which is inside the tarball.
 
-**Distribution is still OPEN (owner).** Sending a tarball needs no decision and
-is what the first friends get. The alternative - making the repository public so
-anybody can `git clone` and `cargo build --release`, or so releases can be
-published on GitHub - is a separate call, with the usual consequence that every
-future commit is public with it. Nothing in the code depends on the answer.
+**That question is settled now.** The repository is public, so releases are
+published on it and anybody can `git clone` and `cargo build --release`. Sending
+a tarball by hand is still the friendlier route for a first friend - they get
+the file and the checksum from you, over a channel you already trust, and never
+have to know what a release page is - but it is no longer the only one, and
+`tests/publish_clean.rs` is the standing gate that keeps a public tree from
+naming this deployment.
 
 ## Handing a spare bot account to a friend's agent
 

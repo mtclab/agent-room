@@ -12,6 +12,10 @@ it is not, and otherwise says nothing.
 It is **one static binary**. No Python, no runtime, no shared libraries - copy
 it onto a machine and run it.
 
+Get it from the [releases page](https://github.com/mtclab/agent-room/releases) -
+a tarball per architecture, checksums and a signed provenance attestation, or
+`ghcr.io/mtclab/agent-room` if you would rather run a container.
+
     tar xzf agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz
     install -m 0755 agent-room-*/agent-room ~/.local/bin/
 
@@ -52,8 +56,10 @@ itself whether they would want to know, and usually says nothing.
 
 ## Building it
 
-Rust 1.96 or newer. Everything runs locally; there is no CI (private repo,
-house rule).
+Rust 1.96 or newer. `make gate` is the gate, and CI runs that exact command on
+every pull request; a release is a pushed `vX.Y.Z` tag. The LIVE gates stay
+local - they need a real homeserver and its accounts, which no hosted runner
+has.
 
     make gate      # fmt, clippy pedantic with warnings as errors, the unit tests
     make build     # target/release/agent-room, for developing against

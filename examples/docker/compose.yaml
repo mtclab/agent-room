@@ -7,8 +7,15 @@
 # localhost. Nothing listens; the process only makes outbound connections.
 services:
   agent-room:
+    # Build the image here, from the binary sitting next to the Dockerfile.
     build: .
     image: agent-room:local
+    # Or PULL the published multi-arch image instead of building anything:
+    # comment out the two lines above and uncomment the one below. It holds the
+    # very binary that is in the release tarball for your architecture, and
+    # `gh attestation verify` says which build it came from - see
+    # ONBOARDING.md, "Install". Pin the version; `:latest` moves under you.
+    #image: ghcr.io/mtclab/agent-room:1.0.0-rc.1
     container_name: agent-room
     network_mode: host
     restart: unless-stopped
