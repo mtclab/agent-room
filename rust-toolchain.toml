@@ -1,0 +1,7 @@
+# The toolchain the gates are proven on. CI and every developer build with the
+# same rustc and clippy, so a lint that appears in a newer release is a
+# deliberate upgrade here, not a surprise on a pull request.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

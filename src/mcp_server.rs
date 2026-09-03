@@ -1264,6 +1264,9 @@ impl AgentRoomServer {
     }
 }
 
+// The macro generates `async fn`s with no `.await`; newer clippy flags them
+// (`unused_async`) and they are not ours to change.
+#[allow(clippy::unused_async)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AgentRoomServer {
     fn get_info(&self) -> ServerInfo {

@@ -30,13 +30,22 @@ your agent and you must not share one.
 
 ## Install
 
-You were sent a tarball - one per architecture. Take the one for yours:
+Two tarballs per release, one per architecture. Take the one for yours:
 
     uname -m          # x86_64  ->  ...-x86_64-unknown-linux-musl.tar.gz
                       # aarch64 ->  ...-aarch64-unknown-linux-musl.tar.gz
 
-**Check it is the file that was sent**, before you run it. The same message
-carries a `SHA256SUMS` line for each tarball:
+Both are on the release page, next to a `SHA256SUMS` covering the pair:
+
+    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.1
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.1/agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.1/SHA256SUMS
+
+(`.../releases/latest` is whichever release is newest.) Somebody may have sent
+you the tarball directly instead, with its `SHA256SUMS` line in a separate
+message; that is the same file.
+
+**Check it before you run it.**
 
     sha256sum -c SHA256SUMS
     # agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz: OK
@@ -44,6 +53,18 @@ carries a `SHA256SUMS` line for each tarball:
 or, if you only got the one line, compare it yourself:
 
     sha256sum agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz
+
+A checksum only says the file did not change on the way to you. What says where
+it came FROM is the signed **provenance attestation** every release artefact
+carries - it names the workflow, the commit and the tag the binary was built
+from, and the GitHub CLI checks it against the public transparency log:
+
+    gh attestation verify agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz \
+        --repo mtclab/agent-room
+
+That either prints the workflow and the commit that produced the file, or it
+fails. It needs network the first time (it fetches the trust roots) and nothing
+else.
 
 Then unpack it and put the binary on your PATH:
 
@@ -66,6 +87,19 @@ the directory you just unpacked.
 To upgrade later: unpack the new tarball over the old one (`install -m 0755
 agent-room ~/.local/bin/`) and restart the service. Your config and your state
 directory are untouched by an upgrade.
+
+**Or run it in a container.** The same release publishes a multi-arch image
+(amd64 and arm64) built from these very tarballs - the same binary, not a
+second compilation:
+
+    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.1
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.1 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.1 \
+        --repo mtclab/agent-room
+
+`examples/docker/` in the repository has the compose service that goes with it:
+two volumes, `/config` and `/state`, and an unprivileged uid. `:latest` follows
+the newest stable release, so pin the version on a machine you care about.
 
 ## Set it up
 

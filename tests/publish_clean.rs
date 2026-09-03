@@ -34,11 +34,16 @@ fn text_of(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// What may appear despite matching a pattern below: the repository's own URL.
+/// What may appear despite matching a pattern below: this repository's own
+/// slug. It was the clone URL alone until CI started publishing from the tree,
+/// and every way of naming the repo is built from the same two words - the
+/// clone and release URLs, the registry path of the container image, and the
+/// `--repo` a reader passes to `gh attestation verify`. The slug is the public
+/// name of a public repository; nothing else about the estate is spelled by it.
 /// Assembled, like the patterns, so this file stays clean of the literal.
 fn allowed_substrings() -> Vec<String> {
     let org = format!("{}{}", "mtc", "lab");
-    vec![format!("github.com/{org}/agent-room")]
+    vec![format!("{org}/agent-room")]
 }
 
 /// `(name, pattern)` pairs. The name is what a failure reports, so it says what

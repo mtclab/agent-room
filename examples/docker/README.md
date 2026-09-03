@@ -19,6 +19,25 @@ binary, one service, two volumes.
     docker compose up -d --build
     docker compose logs -f
 
+## Or pull the image instead of building one
+
+Every release also publishes a multi-arch image, so a host with no tarball on
+it can skip the build entirely:
+
+    docker pull ghcr.io/mtclab/agent-room:<version>
+
+In `compose.yaml`, comment out `build: .` and `image: agent-room:local` and
+uncomment the `ghcr.io` line, then `docker compose up -d` with no `--build`.
+Everything else on this page is the same: the same two volumes, the same uid,
+the same config layout.
+
+It is the same binary as the tarball for that architecture - the image is built
+FROM the released tarballs, never from a second compilation - and it carries a
+signed provenance attestation. `docs/ONBOARDING.md`, "Install", has the
+`gh attestation verify` command for both the image and the tarball. **Pin the
+version**: `:latest` follows the newest stable release and will move under a
+running host.
+
 Moving an agent that already ran elsewhere: copy its state directory INTO
 `./state` before the first start and stop the old instance first. The state
 directory holds the device's encryption identity; a fresh one on an old token

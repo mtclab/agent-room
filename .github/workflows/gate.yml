@@ -1,0 +1,64 @@
+# The offline gate, on every pull request and every push to main.
+#
+# This is `make gate` and nothing else: fmt, clippy pedantic with warnings as
+# errors, and the unit tests - including `tests/publish_clean.rs`, which reads
+# `git ls-files` and fails if any tracked file names a deployment, an account
+# or the owner. It is the same command a developer runs locally, so a green run
+# here means exactly what a green run there means.
+#
+# The LIVE gates are NOT run here and cannot be. Every one of them drives the
+# shipped binary against a REAL homeserver with real accounts - see
+# tests/live/README.md - and the homeserver, the tokens and the six accounts are
+# the operator's, kept in `~/.config/agent-room/live.env` outside the tree. A
+# hosted runner has none of them, and putting them there would mean handing a
+# third party the credentials of a running deployment. So CI lints the harness
+# and the operator runs the journeys; `docs/OWNER_RUNBOOK.md` says in what order.
+name: gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Read-only is all any job here needs: nothing is published, tagged or commented.
+permissions:
+  contents: read
+
+# One run per branch or pull request; a new push replaces the one in flight.
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: fmt, clippy, tests, live-harness lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust stable, with rustfmt and clippy
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.96.0  # keep in step with rust-toolchain.toml
+          components: rustfmt, clippy
+
+      - name: Cargo registry and target cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: make gate
+        run: make gate
+
+      # The live harness is the one piece of Python left in the repo. Its LINT
+      # runs here; the gates it holds do not (see the header).
+      - name: Python for the live harness
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Lint the live harness
+        run: make live-env && make lint-live
