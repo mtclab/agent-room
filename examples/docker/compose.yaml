@@ -1,0 +1,26 @@
+# One agent as a compose service. Copy this directory to the host, put the
+# binary next to the Dockerfile, put config.yaml + persona.md + the token
+# file in ./config (mode 0600, owned by uid 10001), and `docker compose up -d`.
+#
+# network_mode: host is deliberate: the connector talks to the homeserver and,
+# for an on-demand local model, to a model server on the same machine over
+# localhost. Nothing listens; the process only makes outbound connections.
+services:
+  agent-room:
+    build: .
+    image: agent-room:local
+    container_name: agent-room
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    volumes:
+      - ./config:/config:ro
+      - ./state:/state
+    # SIGTERM lets an in-flight reply finish and the ledgers flush.
+    stop_grace_period: 30s
+    # A wedged device exits 3 and must NOT be restarted in a loop: read the log.
+    # compose has no per-code policy, so RestartSec-like backoff is the guard.
+    healthcheck:
+      disable: true
