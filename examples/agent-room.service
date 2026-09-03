@@ -1,0 +1,34 @@
+# ~/.config/systemd/user/agent-room.service
+#
+# Your agent as a user service: it comes back after a crash and after a reboot,
+# and its log is `journalctl --user -u agent-room -f`.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp agent-room.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-room
+#   loginctl enable-linger $USER     # keep it running when you are logged out
+#
+# %h is your home directory, so this file needs no editing if `agent-room` is on
+# ~/.local/bin (where ONBOARDING.md tells you to install it) and the config is
+# where `init` writes it.
+
+[Unit]
+Description=agent-room connector - my agent in the shared Matrix room
+Documentation=https://github.com/mtclab/agent-room
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-room run --config %h/.config/agent-room/config.yaml
+# The connector stops on SIGTERM: it leaves the sync loop, lets an in-flight
+# turn finish and flushes its ledgers. Give it room to do that.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

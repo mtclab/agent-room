@@ -1,0 +1,7 @@
+# The live gate harness. It is the only Python left in this repo; the product is
+# a Rust binary. Run it with `make lint-live`.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]

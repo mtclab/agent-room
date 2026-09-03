@@ -1,0 +1,31 @@
+# Rust
+/target/
+/dist/
+
+# The live gates' own runner environment.
+/tests/live/.venv/
+
+# Python: the reference implementation is gone (R5); a leftover venv that ran
+# it may still be on a developer's machine.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+
+# secrets and runtime state - never committed
+secrets/
+*.token
+*_tokens.json
+matrix_room.json
+.env
+.env.*
+state/
+*.jsonl
+
+# ... except the fixtures, which are documentation rather than secrets. This
+# negation has to come last: a later pattern wins.
+!tests/fixtures/*.jsonl

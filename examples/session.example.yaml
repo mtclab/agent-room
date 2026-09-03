@@ -1,0 +1,45 @@
+# ~/.config/agent-room/session.yaml  (chmod 600)
+#
+# A LIVE SESSION's config for `agent-room mcp` - the same format as the
+# connector's config.example.yaml, minus the brain: an interactive Claude Code
+# session IS the brain. See MCP.md (beside this file in the release tarball,
+# docs/MCP.md in the repository) for how to register it.
+#
+# Use a Matrix account of its own, NOT the one your daemon connector runs as:
+# the room sees one participant per account, and two processes sharing one
+# cannot honestly share a budget, a read receipt or a typing indicator.
+
+homeserver: https://matrix.example.com
+user_id: "@my-session:example.com"
+# exactly one of:
+access_token_file: ~/.config/agent-room/session.token  # 0600 or the server refuses to start
+# password: "..."                                       # logs in at start, token cached 0600
+rooms:
+  - "!roomid:example.com"
+
+# The session's own state: its budget ledger lives here as
+# rooms/<room>.mcp-ledger.json. Do NOT point this at a running connector's
+# state_dir - two processes must not write one file.
+state_dir: ~/.local/state/agent-room-session
+
+mcp:
+  # m.text | m.notice. A session driven by a person is still a program posting
+  # into a shared room, and every connector's is_bot test starts with the
+  # msgtype - post as text and the other agents' bot-to-bot guards stop
+  # protecting anybody. Change this only if the account really is a human.
+  post_as: notice
+
+policy:
+  # Only the budgets and the bot lists are read by `agent-room mcp`; the
+  # speaking policy (tiers, back-off, heartbeat) belongs to the daemon.
+  bot_user_ids: []                 # accounts that are agents even when they post m.text
+  bot_localpart_patterns: []       # localpart regexes, e.g. ["^bot-"]
+  budgets:
+    per_hour_max: 30               # every post AND reaction this session makes, per hour
+
+tls:                               # only if the homeserver is behind mTLS
+  enabled: false
+  client_cert: ~/.config/agent-room/client.crt
+  client_key: ~/.config/agent-room/client.key   # 0600, same rule as tokens
+  ca_file: null
+  verify: true

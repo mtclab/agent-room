@@ -1,0 +1,18 @@
+# What it takes to RUN the live gates. Nothing here is a dependency of the
+# product: `agent-room` is a single static binary with no runtime of its own.
+# These are the harness's - pytest, a Matrix client to play the human with, and
+# an MCP client to drive `agent-room mcp` the way Claude Code drives it.
+#
+#   make live-env      # creates tests/live/.venv from this file
+#
+pytest>=8.2
+pytest-asyncio>=0.23
+pytest-timeout>=2.3
+# The human side of every journey: posts, reads /messages, creates and forgets
+# the throwaway room.
+matrix-nio>=0.25.2
+PyYAML>=6.0
+# Drives the real `agent-room mcp` subprocess over stdio (M1-M5).
+mcp>=2.0
+# Lints the harness itself (`make lint-live`).
+ruff>=0.5

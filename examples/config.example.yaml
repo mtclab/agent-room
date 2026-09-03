@@ -1,0 +1,175 @@
+# ~/.config/agent-room/config.yaml  (chmod 600)
+#
+# The DAEMON connector's config (`agent-room run`). `agent-room init` writes one
+# of these for you with the shipped defaults - this file is the annotated
+# version, for when you want to know what a knob does. A live interactive
+# session uses the same format without `brain:` - see session.example.yaml and
+# MCP.md, which are beside this file in the release tarball (and under
+# examples/ and docs/ in the repository).
+homeserver: https://matrix.example.com
+user_id: "@my-agent:example.com"
+# exactly one of:
+access_token_file: ~/.config/agent-room/token   # 0600
+# password: "..."                                # logs in at start, token cached 0600
+rooms:
+  - "!roomid:example.com"
+persona_file: ~/.config/agent-room/persona.md   # written by `agent-room init`
+state_dir: ~/.local/state/agent-room            # per-room JSONL transcript + ledgers
+# Only for rooms that are NOT encrypted: keep running on a device whose keys
+# another state directory published (run otherwise stops with exit 3). See
+# ONBOARDING "Back it up".
+allow_wedged_device: false
+history_limit: 40                               # transcript events handed to the brain
+# The transcript rolls instead of growing for ever. At transcript_keep events
+# (~630 B each, so ~3 MB) <room>.jsonl becomes <room>.jsonl.1, the archives
+# already there shift down one and the oldest is deleted; the new live file
+# starts with the newest transcript_keep / 2 events, so the agent does not lose
+# its memory of the room at the moment the file turns over. The agent only ever
+# READS the live file - the archives are history for you and `jq`.
+transcript_keep: 5000                           # events kept live; 0 = never roll
+transcript_archives: 4                          # <room>.jsonl.1 .. .4; 0 = keep none
+
+tls:                                            # only needed if the homeserver is behind mTLS
+  enabled: false
+  client_cert: ~/.config/agent-room/client.crt  # PEM
+  client_key: ~/.config/agent-room/client.key   # PEM, must be 0600 (same rule as tokens)
+  ca_file: null                                 # optional custom CA bundle for the homeserver
+  verify: true                                  # keep true; false only for local dev
+
+brain:
+  # one of: openai_compat | claude_code | echo
+  kind: openai_compat
+  openai_compat:
+    base_url: http://localhost:8002/v1          # vLLM / ollama / LM Studio / llama.cpp
+    model: qwen3.8-27b
+    api_key: ""                                  # or env AGENT_ROOM_API_KEY
+    cold_start_timeout_s: 600                    # vLLM boots in 3-8 min when idle
+    extra_body:
+      chat_template_kwargs: { enable_thinking: false }   # MANDATORY for Qwen3.8
+    max_tokens: 600
+    judge_model: ""                              # tier-2 judge; "" = the model above
+    judge_max_tokens: 60                         # a verdict is one line
+    # WAKE STRATEGY (owner's choice; independent knobs, any combination).
+    # Three setups, and which is right depends on your GPU - see below.
+    judge_base_url: ""                           # "" = judge on the endpoint above
+    judge_api_key: ""                            # a separate server gets ONLY this key
+    judge_extra_body: {}                         # "" = inherit extra_body, but only on the same endpoint
+    warm_on_intent: false                        # on-demand model: preload when a human starts typing
+    warm_cooldown_s: 120                         # never more than one warm-up per this
+  # The owner's own agent: Claude Code headless, ONE SESSION PER ROOM.
+  # The session id is created on the room's first turn and kept in
+  # <state_dir>/rooms/<room>.claude-session.json, so the agent remembers the
+  # conversation across wakes and restarts.
+  claude_code:
+    claude_bin: claude                 # or an absolute path to the CLI
+    model: sonnet
+    # The tier-2 "should I speak" judge. A separate, deliberately cheaper run:
+    # this model, --max-turns 1, NO tools, no settings, and a throwaway session
+    # that never touches the room's own. Measured on haiku, 2026-09-02: $0.014
+    # per judgement against $0.025 for the same call carrying user settings.
+    judge_model: haiku
+    judge_timeout_s: 90                # a verdict that arrives late is worthless
+    setting_sources: user,project      # carries your CLAUDE.md + memory; "" = CLI default
+    cwd: ~/notes                       # where the agent "stands"; default = state_dir
+    # THE read-only guarantee: `claude -p` is non-interactive, so a tool that is
+    # not on this list has nobody to ask for permission and is simply denied.
+    # Adding Bash/Edit here gives a chat room a shell. Don't.
+    allowed_tools: [Read, Grep, Glob, WebSearch]
+    permission_mode: default           # bypassPermissions is refused by the config
+    max_turns: 3                       # tool-use turns per reply
+    timeout_s: 180                     # per reply; CLI startup is most of it
+    rate_limit_backoff_s: 300          # after a usage limit: stay quiet, spawn nothing
+    extra_args: []                     # verbatim CLI args; any /dangerous/ flag is refused
+    # debug_log: ~/.local/state/agent-room/claude-debug.jsonl
+    #   ^ switches to --output-format stream-json --verbose and records every raw
+    #     line, including tool use. Off by default: it holds the conversation.
+
+policy:
+  reply_to_mentions: true          # tier 1: answer when addressed
+  reply_in_own_threads: true       # tier 1: stay in a thread I am already in
+  # Tier 2: may I answer a line addressed to nobody? Between this switch and an
+  # actual message stand a random back-off, a re-read of the room (stand down if
+  # somebody got there first) and a judge call that must say yes.
+  answer_unaddressed: true
+  backoff_s: [5, 40]               # drawn per message, so agents do not collide
+  # UNPROMPTED SPEECH (S6). Impulses, open loops and inner thoughts, all of
+  # them presence-gated and all of them spending tier2_per_hour_max.
+  # A human is "here" while the homeserver calls them online, or while they
+  # have posted here within this many minutes. 0 = presence only.
+  presence_window_min: 30
+  # How long an impulse / follow-up / inner thought waits for somebody to be
+  # here before giving up on itself.
+  unprompted_max_wait_min: 240
+  # A question I asked that nobody answered (or a [[followup: ...]] the brain
+  # wrote) is followed up once, this long afterwards. Drawn per loop.
+  followup_delay_s: [1200, 10800]
+  # How long an impulse dropped by `agent-room impulse` stays worth saying.
+  impulse_ttl_s: 21600
+  # Ask the judge, on EVERY unaddressed human message, how much it wants to say
+  # something (0-3); at inner_thoughts_threshold it speaks. Free on a resident
+  # small model, which is the point - and REFUSED for brain.kind claude_code,
+  # where it would be a paid call per line of chat in the room.
+  inner_thoughts: false
+  inner_thoughts_threshold: 4
+  # The fallback timer: speak unprompted every N minutes in a room that has been
+  # quiet that long. 0 = off, and off is right - a timer is the least organic
+  # reason to speak there is. The four knobs above are the real thing.
+  heartbeat_minutes: 0
+  bot_to_bot: mentions             # none | mentions | all
+  bot_user_ids: []                 # extra user ids that count as bots
+  bot_localpart_patterns: []       # localpart regexes that count as bots, e.g. ["^bot-"]
+  budgets:
+    per_pair_per_minute: 3
+    pair_cooldown_s: 60
+    per_thread_max: 12
+    per_hour_max: 30               # everything I post, per hour
+    tier2_per_hour_max: 10         # of those, how many may be uninvited (tiers 2+3)
+    # After this many bot-only messages in a thread, tier 2 stays out of it and
+    # a bot's mention there needs the judge as well. Any human post resets it.
+    bot_only_turns_before_decay: 6
+
+# ---------------------------------------------------------------------------
+# The three wake strategies, as they would actually be written
+# ---------------------------------------------------------------------------
+#
+# 1. ALWAYS-ON model (a hosted endpoint, or ollama with a model kept resident).
+#    Nothing extra. The defaults are this.
+#
+#      brain:
+#        kind: openai_compat
+#        openai_compat:
+#          base_url: http://localhost:11434/v1
+#          model: qwen3
+#
+# 2. ON-DEMAND model (llama-swap, ollama with a short keep_alive, LM Studio
+#    JIT). The model loads on the first request, so the loading is moved to the
+#    moment somebody starts typing instead of the moment they expect an answer.
+#
+#      brain:
+#        kind: openai_compat
+#        openai_compat:
+#          base_url: http://10.0.0.5:8002/v1
+#          model: qwen3.8-27b
+#          cold_start_timeout_s: 600
+#          warm_on_intent: true
+#          warm_cooldown_s: 120
+#          extra_body:
+#            chat_template_kwargs: { enable_thinking: false }
+#
+# 3. SMALL RESIDENT JUDGE + BIG SPEAKER. The judge runs on every unaddressed
+#    line, so it is the call that must never cost a model load; the big model
+#    is only ever woken to actually say something. Two endpoints, two keys.
+#
+#      brain:
+#        kind: openai_compat
+#        openai_compat:
+#          base_url: http://10.0.0.5:8002/v1        # the one that speaks
+#          model: qwen3.8-27b
+#          api_key: ""                              # or env AGENT_ROOM_API_KEY
+#          warm_on_intent: true
+#          extra_body:
+#            chat_template_kwargs: { enable_thinking: false }
+#          judge_base_url: http://10.0.0.5:3000/ollama/v1   # the one that judges
+#          judge_model: qwen3:4b
+#          judge_api_key: "..."                     # this server's key, not the other one's
+#          judge_extra_body: {}
