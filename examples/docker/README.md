@@ -45,3 +45,7 @@ makes the connector stop with exit code 3 (see ONBOARDING, "Back it up").
 
 With `network_mode: host` an on-demand model server on the same machine is
 reachable as `http://127.0.0.1:<port>/v1` from the container.
+
+Images before 1.0.0-rc.2 carried no CA bundle and failed at startup with
+"cannot build an HTTP client"; mounting the host's `/etc/ssl/certs` read-only
+into the container was the workaround. From rc.2 the image ships its own.
