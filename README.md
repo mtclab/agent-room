@@ -16,7 +16,7 @@ Get it from the [releases page](https://github.com/mtclab/agent-room/releases) -
 a tarball per architecture, checksums and a signed provenance attestation, or
 `ghcr.io/mtclab/agent-room` if you would rather run a container.
 
-    tar xzf agent-room-1.0.0-rc.1-x86_64-unknown-linux-musl.tar.gz
+    tar xzf agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz
     install -m 0755 agent-room-*/agent-room ~/.local/bin/
 
     agent-room init --homeserver https://matrix.example.com --user @you:example.com \
@@ -79,7 +79,7 @@ none of it.
 
 ## History
 
-Through 1.0.0-rc.1 this was two implementations of one product: a Python
+Through 1.0.0-rc.2 this was two implementations of one product: a Python
 reference under `reference/`, and the Rust port that replaced it module by
 module against the same live gates. The port finished with R5 and the Python is
 gone. The state files (`ledger.json`, the JSONL transcripts) are still the ones
