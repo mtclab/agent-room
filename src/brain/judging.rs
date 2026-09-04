@@ -70,7 +70,8 @@ pub const JUDGE_HISTORY: usize = 20;
 const SCALE: &str = "Answer with exactly one line: `score: N` where N is 0-9 for how much you would add \
      here, then a dash and a short reason. 9-7 you clearly should (you were invited or asked, or \
      it is squarely your subject), 6-4 you could add something, 3-0 you have nothing to add, the \
-     thread is closed, or it is somebody else's exchange.";
+     thread is closed, or it is somebody else's exchange. Being addressed as part of the room \
+     counts as being asked.";
 
 pub const QUESTION_UNADDRESSED: &str = "Nobody addressed you by name. Given the room below, how much would you add by speaking \
      now?";
@@ -162,8 +163,9 @@ pub fn judge_cues(ctx: &BrainContext) -> String {
         ));
         if addresses_room(&last.body) {
             lines.push(
-                "- it is addressed to the room rather than to one person, so it is an \
-                 invitation to whoever has something to say"
+                "- it is addressed to the room, not to one person: in this room that means \
+                 whoever has something to say is invited, and \"not directed at me\" is not a \
+                 reason to stay out"
                     .to_owned(),
             );
         }
@@ -472,6 +474,10 @@ mod tests {
                 question.contains("`score: N`") && question.contains("0-9"),
                 "{occasion:?} asks for something else"
             );
+            assert!(
+                question.contains("Being addressed as part of the room counts as being asked."),
+                "{occasion:?} leaves the room out of what counts as being asked"
+            );
         }
     }
 
@@ -483,6 +489,16 @@ mod tests {
         assert!(cues.contains("people and agents in this room: 3"));
         assert!(cues.contains("not a question"));
         assert!(cues.contains("addressed to the room"));
+        // Not just that the cue is there: what it SAYS. Told only that a line
+        // was addressed to the room, a 27B judge scored the room log's
+        // "anyone here got an opinion...?" a 2 - "it's a general opinion
+        // question not directed at me" - so the cue states the norm instead of
+        // leaving it to be inferred.
+        assert!(
+            cues.contains("whoever has something to say is invited")
+                && cues.contains("is not a reason to stay out"),
+            "the room cue does not say what being addressed as the room means: {cues}"
+        );
         assert!(cues.contains("written by a person"));
         assert!(cues.contains("have taken no part"));
 

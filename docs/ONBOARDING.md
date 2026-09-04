@@ -37,9 +37,9 @@ Two tarballs per release, one per architecture. Take the one for yours:
 
 Both are on the release page, next to a `SHA256SUMS` covering the pair:
 
-    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.4
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.4/agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.4/SHA256SUMS
+    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.5
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.5/agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.5/SHA256SUMS
 
 (`.../releases/latest` is whichever release is newest.) Somebody may have sent
 you the tarball directly instead, with its `SHA256SUMS` line in a separate
@@ -48,18 +48,18 @@ message; that is the same file.
 **Check it before you run it.**
 
     sha256sum -c SHA256SUMS
-    # agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz: OK
+    # agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz: OK
 
 or, if you only got the one line, compare it yourself:
 
-    sha256sum agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
+    sha256sum agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz
 
 A checksum only says the file did not change on the way to you. What says where
 it came FROM is the signed **provenance attestation** every release artefact
 carries - it names the workflow, the commit and the tag the binary was built
 from, and the GitHub CLI checks it against the public transparency log:
 
-    gh attestation verify agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz \
+    gh attestation verify agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz \
         --repo mtclab/agent-room
 
 That either prints the workflow and the commit that produced the file, or it
@@ -68,8 +68,8 @@ else.
 
 Then unpack it and put the binary on your PATH:
 
-    tar xzf agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
-    cd agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl
+    tar xzf agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz
+    cd agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl
     mkdir -p ~/.local/bin && install -m 0755 agent-room ~/.local/bin/
     agent-room --version
 
@@ -92,9 +92,9 @@ directory are untouched by an upgrade.
 (amd64 and arm64) built from these very tarballs - the same binary, not a
 second compilation:
 
-    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.4
-    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.4 --version
-    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.4 \
+    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.5
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.5 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.5 \
         --repo mtclab/agent-room
 
 `examples/docker/` in the repository has the compose service that goes with it:
@@ -334,6 +334,14 @@ from prose: whether the line is a question, whether it was thrown at the room
 your agent is already part of this exchange, and whether the sender is another
 agent.
 
+One line does not reach the model at all: a question your agent's own room was
+asked - "anyone got an opinion on ...?", "tell me what you think" - is answered
+after the pause and the re-read, without a judge. Handing the turn to the room
+is how people offer it to whoever wants it, and a model asked to weigh that
+reads "addressed to nobody in particular" as "not for me" and says nothing
+(`room_invitations`, and it is only ever a PERSON's line: agents inviting each
+other to speak is a loop with nobody in it).
+
 An obvious question does not wait the full forty seconds for any of that.
 Before anything is asked of a model, the line is read for what is free to read -
 a question mark, an invitation to the room, a "you" or an "anyone", the agent's
@@ -409,6 +417,7 @@ In `policy:` in your config:
 | `bare_name_addresses` | `false` | treat a name anywhere in a line as an address |
 | `followup_window_s` | `120` | how long "you spoke to me last" keeps the turn; 0 = off |
 | `answer_unaddressed` | `true` | join in on questions addressed to nobody |
+| `room_invitations` | `true` | answer a question put to the whole room without asking the judge |
 | `backoff_s` | `[5, 40]` | how long it waits before doing so |
 | `small_room_backoff` | `true` | wait less in a room with few people in it |
 | `speak_threshold` | `5` | the enthusiasm (0-9) at which it joins in; 10 = never |

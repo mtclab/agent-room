@@ -17,6 +17,12 @@ The gap they close is the room log of 2026-09-04, two agents and one human:
    as an ordinary unaddressed line, which answered "no, the conversation has
    naturally settled".
 
+C-4 is the same failure one day later and one layer down (2026-09-05): with the
+judge asked for a score instead of a verdict, "so, anyone here got an opinion
+on whether weekends should be three days long?" still scored a 2 - *"it's a
+general opinion question not directed at me"*. A line handed to the room and
+asked something is turn ALLOCATION, so it no longer reaches the judge at all.
+
 The echo brain's judge scores 9 for a trigger carrying `[[speak]]`, N for
 `[[score: N]]`, and `brain.echo.score` otherwise - and the markers are stripped
 out of what it echoes, so a marker steers ONE hop and never the whole chain.
@@ -67,6 +73,15 @@ SETTLE_S = 20.0
 #: `policy::unaddressed`'s own words for a line that reached tier 2. Its
 #: presence and its absence are both assertions here.
 TIER_2 = "tier 2 candidate"
+#: The line C-4 is built on, from the room log of 2026-09-05. It names nobody,
+#: hands the turn to the room and asks it something - and it carries NO
+#: `[[speak]]`, so an agent that asked its judge would be told 0 and say
+#: nothing. The answer can only be the invitation path.
+ROOM_QUESTION = "So, anyone here got an opinion on whether weekends should be three days long?"
+#: The other half of C-4: unaddressed, and nobody waiting on it. Same tier, same
+#: back-off, and the judge still decides it - which is G7's silence, measured
+#: here with two agents watching.
+PLAIN_LINE = "nice weather today"
 
 
 def budgets(**extra: Any) -> dict[str, Any]:
@@ -98,6 +113,11 @@ def bot_posts(events: list[dict[str, Any]], root: str) -> list[dict[str, Any]]:
     threaded = in_thread(events, root)
     both = by_sender(threaded, S3_BOT_A) + by_sender(threaded, S3_BOT_B)
     return sorted(both, key=lambda event: event["origin_server_ts"])
+
+
+def agent_posts(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Everything either agent posted anywhere in the room."""
+    return by_sender(events, S3_BOT_A) + by_sender(events, S3_BOT_B)
 
 
 def mentions_of(event: dict[str, Any]) -> list[str]:
@@ -331,3 +351,88 @@ async def test_c3_under_mentions_a_bots_unaddressed_line_never_reaches_tier_2(
     events = await wait_for(lambda evs: bool(by_sender(evs, S3_BOT_B)), human, room_s3, seconds=40)
     assert len(by_sender(events, S3_BOT_B)) == 1, "tier 2 was not alive at all"
     assert TIER_2 in bot.log_text()
+
+
+# -- C-4 ---------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+async def test_c4_a_room_question_is_answered_without_the_judge(
+    tmp_path: Path, tokens: Tokens, human: AsyncClient, room_s3: str, running: list[Connector]
+) -> None:
+    """C-4: the human asks the ROOM a question. Exactly one agent answers it,
+    without asking a judge - and the plain line afterwards still needs one.
+
+    Both judges are wired to refuse everything (`brain.echo.score: 0`, and no
+    `[[speak]]` in either line), so nothing here can be answered by a judge
+    happening to agree: the only thing that can post is the invitation path.
+    The second half is the control, and it is G7's semantics with two agents
+    watching - an unaddressed line nobody is waiting on reaches the judge, is
+    told 0, and the room hears nothing.
+
+    The back-offs are disjoint, as in G5 and C-1, so which agent takes the
+    invitation up is not a coin flip: a pre-scored line draws from
+    `backoff_s[0] .. +5`, which is 1-6 s for A and 8-13 s for B.
+
+    `followup_window_s: 0` because of what the two halves are: the second line
+    lands seconds after A's answer, and the follow-up arm would hand it to A as
+    tier 1 - correctly, and with its own gate (N3). This gate is about tier 2,
+    so the tier-1 arm that would decide the control line is switched off rather
+    than worked around.
+    """
+    connectors = {}
+    for name, backoff in ((S3_BOT_A_NAME, [1.0, 3.0]), (S3_BOT_B_NAME, [8.0, 11.0])):
+        connector = make_connector(
+            tmp_path,
+            tokens,
+            name,
+            room_s3,
+            policy={
+                "answer_unaddressed": True,
+                "backoff_s": backoff,
+                "followup_window_s": 0,
+            },
+            brain={"kind": "echo", "echo": {"score": 0}},
+        )
+        connector.start()
+        running.append(connector)
+        connector.wait_ready()
+        connectors[name] = connector
+    await wait_for_join(human, room_s3, [S3_BOT_A, S3_BOT_B])
+
+    # -- the room is asked something -----------------------------------------
+    root = await post_unaddressed(human, room_s3, ROOM_QUESTION)
+    await wait_for(lambda evs: bool(bot_posts(evs, root)), human, room_s3, seconds=SETTLE_S)
+    # Long enough for the slower agent's back-off to have expired as well:
+    # silence from it after this is a stand-down, not a lag.
+    await asyncio.sleep(SETTLE_S)
+    answers = bot_posts(await messages(human, room_s3), root)
+    assert len(answers) == 1, (
+        f"{len(answers)} agents answered one question put to the room: "
+        f"{sorted(a['sender'] for a in answers)}"
+    )
+    assert answers[0]["sender"] == S3_BOT_A, "the faster back-off did not take the invitation up"
+
+    winner = connectors[S3_BOT_A_NAME].log_text()
+    loser = connectors[S3_BOT_B_NAME].log_text()
+    assert "room invitation" in winner and "answering without the judge" in winner, (
+        "the answer came from somewhere other than the invitation path"
+    )
+    assert "standing down" in loser, "the second agent never reached the stand-down check"
+    # The whole point, in both logs: nothing was asked of a model but the
+    # message itself. One skipped the judge; the other never got that far.
+    for name, log in (("A", winner), ("B", loser)):
+        assert "judge on" not in log, f"agent {name} asked its judge about a room invitation"
+
+    # -- and a line nobody is waiting on still goes to the judge -------------
+    before = len(agent_posts(await messages(human, room_s3)))
+    plain = await post_unaddressed(human, room_s3, PLAIN_LINE)
+    await asyncio.sleep(SETTLE_S)
+    settled = await messages(human, room_s3)
+    assert bot_posts(settled, plain) == [], "an agent answered a line both judges scored 0"
+    assert len(agent_posts(settled)) == before, "an agent spoke somewhere else instead"
+    for name in (S3_BOT_A_NAME, S3_BOT_B_NAME):
+        log = connectors[name].log_text()
+        assert "judge on" in log and "(< " in log, (
+            f"agent {name} never asked the judge about the plain line, or it did not decline"
+        )

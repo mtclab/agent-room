@@ -656,6 +656,15 @@ pub struct PolicyConfig {
     /// like everybody else.
     #[serde(default)]
     pub topics: Vec<String>,
+    /// A human line that hands the turn to the ROOM and asks it something -
+    /// "anyone here got an opinion on ...?", "tell me what you think" - is
+    /// answered after the back-off and the stand-down, without asking the
+    /// judge. Selecting the floor at large is turn ALLOCATION: whoever wants it
+    /// takes it, and a judge asked about such a line reads "addressed to nobody
+    /// in particular" as "not for me". Off puts it back on the judge with
+    /// everything else.
+    #[serde(default = "yes")]
+    pub room_invitations: bool,
     /// The pre-score at which an unaddressed line takes the SHORT back-off
     /// (`backoff_s.0` to `backoff_s.0` + 5 s, and no timing hazard) instead of
     /// the full one. The judge still decides; this only changes how long
@@ -756,6 +765,7 @@ impl Default for PolicyConfig {
             followup_window_s: default_followup_window(),
             answer_unaddressed: true,
             topics: Vec::new(),
+            room_invitations: true,
             prescore_fast: default_prescore_fast(),
             speak_threshold: default_speak_threshold(),
             chattiness: 0,

@@ -99,7 +99,9 @@ Shipped:
   its own task (the sync loop keeps running), then a stand-down re-read of the
   room - `/messages`, not only the local transcript - then the judge, then a
   budget re-check, then a threaded `m.notice`. ONE deliberation at a time per
-  room, so a burst of chat cannot arm a judge call per message.
+  room, so a burst of chat cannot arm a judge call per message. (Since
+  1.0.0-rc.5 the judge is skipped for one shape of line: a question a PERSON put
+  to the room. See DESIGN, "The room invitation".)
 - `Brain.judge(ctx) -> Judgement(speak, score, why)` with a no-by-default in
   `BaseBrain`; the question, the frame and the strict `score: N` parsing live
   in `brain/judging.rs` so the adapters cannot drift (it was `yes:`/`no:`

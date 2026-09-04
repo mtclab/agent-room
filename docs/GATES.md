@@ -31,8 +31,8 @@ Everything here runs locally. There is no CI (private repo, house rule).
   tests/live/teeth.py [G1 ...]` applies one mutation at a time to `src/`,
   rebuilds the release binary, runs only the gate that guard protects, and
   restores the file with `git checkout` (verified clean). `G1-G12`, `M2/M3/M5`
-  and `D1` are live journeys, `C1`/`C2` live Claude gates, `U8-U10` offline
-  cargo gates.
+  and `D1` are live journeys, `C-1`-`C-4` live conversation journeys, `C1`/`C2`
+  live Claude gates, `U8-U26` offline cargo gates.
 
 The commands in the older sections are the ones that were run at the time; a
 `.venv/bin/pytest` there is the root venv that carried both the Python
@@ -2352,3 +2352,105 @@ not compile - U21's first cut put a `// TEETH` comment inside a function call -
 raised `SystemExit` with the broken Rust still in `src/`. The next thing anybody
 does after a teeth run is build. Fixed: the build is wrapped, and a failed one
 restores the file before it re-raises.
+
+# The room invitation (2026-09-05)
+
+The day after the two-agent slice shipped, in the same room. A person,
+addressing nobody:
+
+> So, anyone here got an opinion on whether weekends should be three days long?
+
+Every part of the machinery did its job. The policy read the line for free and
+put it on the fast path - `verdict=consider (unaddressed: tier 2 candidate
+(pre-score 8: question, asked of the room, an invitation to the room), short
+back-off)`. The back-off was short, the stand-down found nobody had answered,
+and the judge - told in as many words that the line was addressed to the room -
+answered `says 2 (< 5): It's a general opinion question not directed at me`.
+The room heard nothing.
+
+The judge is not wrong about the words; it is wrong about the room. "Addressed
+to nobody in particular" is how people OFFER the turn to whoever wants it, and
+Webb's rule ("current speaker selects next") covers selecting the floor at
+large: the quickest self-selector takes it. That is turn ALLOCATION, and this
+design has said since the addressing slice that allocation must be
+deterministic, free and immediate. A judge asked to weigh it is the same
+mistake as asking one to weigh a typed name.
+
+So a line that came from a **person**, hands the turn to the room and **asks it
+something** is answered after the back-off and the stand-down, and the judge is
+never asked (`policy.room_invitations`, default on). The stand-down is what
+still makes it exactly one agent. Everything else - a bare name, plain
+unaddressed chatter, any line from another agent - keeps the judge.
+
+## Unit gates, 2026-09-05
+
+`make gate`: **377 tests** (275 in the crate, 90 R4 commands, 8 state-compat, 2
+encrypted-room, the publish scrub and the knob-coverage gate), clippy pedantic
+clean with warnings as errors, `cargo fmt --check` clean, no `unwrap()` outside
+tests. `make lint-live`: clean, 14 files.
+`cargo test --test knob_coverage`: **81 knobs in the schema, 81 turned off their
+default by a test** (80 before this slice; the new one is
+`policy.room_invitations`).
+
+| Guard | Gate |
+|---|---|
+| a room question from a human is answered without the judge | `connector::turn::a_room_question_from_a_human_is_answered_without_the_judge` - the real `deliberate()` on the room log's own line, driven with a brain that COUNTS: judge calls 0, replies 1. Its judge refuses everything, so "it replied" and "it never asked" are two readings of one run |
+| the same line from another agent still goes through the judge | `connector::turn::a_room_question_from_a_bot_still_goes_through_the_judge` - word for word the same body, `bot_to_bot: conversational` so it reaches tier 2 at all: judge 1, replies 0 |
+| the knob puts the judge back | `connector::turn::room_invitations_false_restores_the_judge_path` |
+| a plain unaddressed line still needs the judge (G7's semantics, offline) | `connector::turn::a_plain_unaddressed_line_still_needs_the_judge` - "just thinking aloud about the weather": judge 1, replies 0 |
+| what asks the room for an answer, and what only mentions it | `addressing::an_invitation_that_asks_for_an_answer_and_one_that_only_mentions_the_room` - 8 lines that ask (questions and imperatives) against 4 that are handed to the room and ask nothing ("everyone is welcome to weigh in") and 3 questions that were never handed to the room |
+| the judge's room cue states the norm rather than the fact | `judging::the_judge_is_told_what_is_free_to_know_about_the_room` - the cue has to carry "whoever has something to say is invited" and "is not a reason to stay out" |
+| every occasion's scale says being addressed as the room counts | `judging::every_question_ends_on_the_same_scale` |
+| a pre-score with no cues in it still prints a reason | `addressing::a_room_with_no_names_still_scores_the_rest_of_the_line` - `prescore_fast: 0` puts an empty read on the fast path, and `listed()` says "nothing in particular" rather than nothing |
+
+## Live gate C-4, 2026-09-05
+
+`tests/live/test_conversation.py`, on the echo brain, no quota.
+
+| Gate | Journey | Guard it protects |
+|---|---|---|
+| C-4 | Two connectors with disjoint back-offs ([1,3] and [8,11]) and `brain.echo.score: 0`, so both judges refuse everything and no line carries `[[speak]]`. The human posts the room log's own question - unaddressed, room-addressed, no name in it. Exactly ONE agent answers within 20 s; its log says `room invitation ... answering without the judge`, the other's says `standing down`, and NEITHER log contains `judge on`. Then the human posts "nice weather today": 20 s of silence from both, and both logs now say `judge on ... (< 5)` | `turn::room_invitation` and the stand-down that still runs under it; the second half is G7's semantics with two agents watching |
+
+`followup_window_s: 0` in C-4 for a reason worth writing down: the control line
+lands seconds after the first agent's answer, and the follow-up arm (tier 1,
+gate N3) would hand it to that agent as a follow-up - correctly. The gate is
+about tier 2, so the tier-1 arm that would otherwise decide its control line is
+switched off rather than worked around. It was found the honest way, by the
+gate failing on the first live run.
+
+**The live run, 2026-09-05** (`AGENT_ROOM_LIVE=1
+AGENT_ROOM_BIN=target/release/agent-room`): `tests/live/test_conversation.py`
+**4 passed in 120.8 s** - C-1 41.6 s, C-2 3.8 s, C-3 23.9 s, **C-4 47.9 s**; and
+the tier-2 gates this slice moves, `tests/live/test_tier2.py` **4 passed in
+225.5 s** - G5 55.6 s, G6 80.4 s, **G7 23.7 s**, G8 62.3 s. G7 is the one to
+watch: an unaddressed line the judge declines is still left alone, because
+"just thinking aloud about the weather" is nobody's invitation.
+
+G5 is worth reading afterwards, because its three rounds of "anyone around?"
+now reach the judge zero times: `grep -c "judge on"` is 0 in both connectors'
+logs, `room invitation` appears once in the winner's (round 1) and `standing
+down` three times in the loser's. Rounds 2 and 3 never got to tier 2 at all -
+the winner spoke last, so the human's next line is the follow-up arm (3f, tier
+1), which has been true since rc.3. What G5 measures is unchanged and still
+holds: exactly one answer per round, and the other agent saying in its own log
+why it kept quiet.
+
+## Teeth run, 2026-09-05
+
+One mutation at a time in `src/`, rebuilt, and only the gate that guard
+protects run against it (`tests/live/teeth.py`). All four failed with their
+guard removed.
+
+| Gate | Guard removed | Result | Time |
+|---|---|---|---|
+| C-4 | `turn::deliberate`: the branch that answers a room invitation without the judge (`if false && ...`) | FAILED - `0 agents answered one question put to the room: []`, `assert 0 == 1` | 128 s |
+| U24 | the same branch, offline | FAILED - `a_room_question_from_a_human_is_answered_without_the_judge` | 95 s |
+| U25 | `addressing::invites_an_answer`: naming the room is enough, nobody has to be waiting | FAILED - `an_invitation_that_asks_for_an_answer_and_one_that_only_mentions_the_room` | 92 s |
+| U26 | `judging::judge_cues`: the room cue back to naming the fact ("it is addressed to the room rather than to one person") | FAILED - `the_judge_is_told_what_is_free_to_know_about_the_room` | 89 s |
+
+C-4's mutant is the honest one to read: with the branch gone, the room under it
+is EXACTLY the room of 2026-09-05. Both connectors see the question, both
+pre-score it 8, the faster one wakes from its short back-off, finds nobody has
+answered, asks its judge - which scores it 0, because the line carries no
+`[[speak]]` - and says nothing. The gate fails on silence, which is the defect
+it was written for, spelled out in its own assertion.
