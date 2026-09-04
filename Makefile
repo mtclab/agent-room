@@ -40,14 +40,15 @@ lint-live:
 	$(LIVE_VENV)/ruff check tests && $(LIVE_VENV)/ruff format --check tests
 
 # The live journeys, against whatever AGENT_ROOM_BIN names (default:
-# target/release/agent-room). G1-G12 is everything the connector does, N1/N2/N4
-# addressing by name, T1 the transcript rolling under it; M1-M5 the MCP server
-# and D1 the doctor. The Claude gates spend the owner's quota and have a target
-# of their own.
+# target/release/agent-room). G1-G12 is everything the connector does, N1-N4
+# addressing by name, C-1/C-2/C-3 two agents having a conversation, T1 the
+# transcript rolling under it; M1-M5 the MCP server and D1 the doctor. The
+# Claude gates spend the owner's quota and have a target of their own.
 live:
 	AGENT_ROOM_LIVE=1 $(LIVE_VENV)/pytest -q tests/live/test_journeys.py \
 		tests/live/test_tier2.py tests/live/test_unprompted.py \
-		tests/live/test_addressing.py tests/live/test_rotation.py \
+		tests/live/test_addressing.py tests/live/test_conversation.py \
+		tests/live/test_rotation.py \
 		tests/live/test_mcp.py tests/live/test_onboarding.py
 
 # The two R4 commands on their own: a live session in a room, and doctor.

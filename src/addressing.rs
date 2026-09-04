@@ -39,10 +39,14 @@
 //! The module is pure and synchronous, so the whole table of what counts and
 //! what does not is a unit test rather than a live gate's guess.
 //!
-//! One more thing lives here for the same reason: [`pre_score`], the free read
-//! of a line nobody addressed. It is not addressing and it never decides
-//! anything - it says how obviously somebody is waiting for an answer, so that
-//! tier 2 can wait five seconds over a question instead of forty.
+//! Two more things live here for the same reason. [`pre_score`] is the free
+//! read of a line nobody addressed: not addressing, and never a verdict - it
+//! says how obviously somebody is waiting for an answer, so that tier 2 can
+//! wait five seconds over a question instead of forty. [`addresses_room`] is
+//! the one cue inside it that the judge is told about as well: "you two, talk
+//! amongst yourselves" selects nobody, so every guard here reads it as a line
+//! thrown at the room - and a judge asked to infer an invitation out of prose
+//! infers silence instead.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -91,6 +95,50 @@ static SECOND_PERSON: LazyLock<Option<Regex>> = LazyLock::new(|| {
 /// is that somebody is waiting for an answer from whoever has one.
 static OPEN_ADDRESS: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:anyone|someone|who)\b").ok());
+
+/// An invitation handed to the ROOM: "you two", "amongst yourselves",
+/// "everyone". Nobody is selected, so it is not an address - but somebody has
+/// asked for an answer from whoever is here, and the one thing an agent must
+/// not do with that is decide the conversation has settled.
+static ROOM_INVITATION: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    let phrases = [
+        // second person, plural: who is being spoken to is "all of you"
+        r"you[ \t]+(?:all|two|three|both|guys|lot|folks|people)",
+        r"y['\x{2019}]all",
+        r"yall",
+        r"(?:all|both|any|each|some|one|none)[ \t]+of[ \t]+you",
+        // reciprocal: the invitation is to talk to EACH OTHER
+        r"(?:among|amongst|between)[ \t]+yourselves",
+        r"each[ \t]+other",
+        r"one[ \t]+another",
+        // the room as a body
+        r"every(?:one|body)",
+        r"any(?:one|body)",
+        r"some(?:one|body)",
+        r"the[ \t]+room",
+    ];
+    Regex::new(&format!(
+        "(?i){}(?:{}){}",
+        boundary_start(),
+        phrases.join("|"),
+        boundary_end()
+    ))
+    .ok()
+});
+
+/// An imperative thrown at whoever is listening, at the start of a line:
+/// "talk about the weather", "tell me what you think". Only at the start,
+/// because that is where an instruction stands - "I did tell him" is not one.
+static ROOM_IMPERATIVE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    let lead =
+        r"(?:so|ok|okay|now|just|please|hey|hi|and|then|you[ \t]+(?:should|could|can|two|all))";
+    let verbs = r"(?:talk|chat|discuss|tell|say|speak|introduce|carry[ \t]+on|keep[ \t]+(?:going|talking)|go[ \t]+ahead)";
+    Regex::new(&format!(
+        r"(?im)^[ \t]*(?:{lead}[ \t,]+){{0,3}}{verbs}{}",
+        boundary_end()
+    ))
+    .ok()
+});
 
 /// A boundary BEFORE a name: the start of the text, or one character that
 /// cannot be part of a name.
@@ -296,6 +344,27 @@ pub fn named_bare(body: &str, vocab: &Vocab) -> Option<String> {
     first_group(&vocab.bare, body)
 }
 
+/// Whether this line hands the turn to the ROOM rather than to a person.
+///
+/// "you two, talk amongst yourselves", "does anyone know?", "tell me what you
+/// think". Nobody is selected, so it is not an address and it decides no
+/// verdict - what it does is say, deterministically and for free, that somebody
+/// asked for an answer and is waiting for one. Two things read it: the
+/// pre-score, which stops the agent sitting out a long back-off on a line the
+/// room is waiting on, and the judge prompt, which would otherwise have to
+/// infer an invitation from prose and reliably infers silence instead (the room
+/// log, 2026-09-04: "you should just talk amongst yourselves" -> "no, the
+/// conversation has naturally settled").
+#[must_use]
+pub fn addresses_room(body: &str) -> bool {
+    let matches = |pattern: &LazyLock<Option<Regex>>| {
+        pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(body))
+    };
+    matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE)
+}
+
 /// Whether the body says "you" in any of the forms people type.
 #[must_use]
 pub fn second_person(body: &str) -> bool {
@@ -488,6 +557,10 @@ const SCORE_SECOND_PERSON: u8 = 2;
 const SCORE_MY_NAME: u8 = 2;
 /// A word from `policy.topics`: the subject this agent is in the room for.
 const SCORE_TOPIC: u8 = 2;
+/// An invitation handed to the room ("you two, talk amongst yourselves"). The
+/// biggest of the free cues on purpose: it is the one line nobody is going to
+/// repeat, and an agent that waits out a long back-off on it has missed it.
+const SCORE_ROOM_INVITATION: u8 = 3;
 
 /// What a line looks like before anybody has thought about it.
 ///
@@ -536,6 +609,9 @@ pub fn pre_score(ev: &RoomEvent, cues: &Cues<'_>, cfg: &PolicyConfig) -> PreScor
         .is_some_and(|pattern| pattern.is_match(body))
     {
         score.add(SCORE_SECOND_PERSON, "asked of the room");
+    }
+    if addresses_room(body) {
+        score.add(SCORE_ROOM_INVITATION, "an invitation to the room");
     }
     if cues.names.named_me(body).is_some() {
         score.add(SCORE_MY_NAME, "my name");
@@ -763,11 +839,11 @@ mod tests {
     fn the_pre_score_reads_the_cues_that_are_free_to_read() {
         // Every row is a line nobody addressed. The score is not a verdict and
         // never becomes one: it is how long tier 2 waits before asking.
-        let cases: [(&str, u8, &[&str]); 9] = [
+        let cases: [(&str, u8, &[&str]); 12] = [
             (
                 "does anyone know why the build is red?",
-                5,
-                &["question", "asked of the room"],
+                8,
+                &["question", "asked of the room", "an invitation to the room"],
             ),
             (
                 "who is looking at this?",
@@ -777,20 +853,44 @@ mod tests {
             ("what do you think?", 5, &["question", "second person"]),
             ("what do you think", 2, &["second person"]),
             ("the build finished", 0, &[]),
-            ("somebody should ask qwen about it", 2, &["my name"]),
+            (
+                "somebody should ask qwen about it",
+                5,
+                &["an invitation to the room", "my name"],
+            ),
             // "you" wins the two points a room question would also have scored:
             // one cue, one score, and the log says which.
             (
                 "anyone know what you make of it?",
-                5,
-                &["question", "second person"],
+                8,
+                &["question", "second person", "an invitation to the room"],
             ),
             ("I like this queue", 0, &[]),
+            // The line from the room log this whole slice came out of. Nobody
+            // is addressed, nothing is a question, and it is the one line in
+            // the room that must not be sat out.
+            (
+                "you should just talk amongst yourselves",
+                5,
+                &["second person", "an invitation to the room"],
+            ),
+            (
+                "you two, talk amongst yourselves about the weather",
+                5,
+                &["second person", "an invitation to the room"],
+            ),
+            ("tell me what happened", 3, &["an invitation to the room"]),
             // Everything at once, which is also the cap in practice.
             (
                 "qwen, anyone know if the deploy is done?",
-                9,
-                &["question", "asked of the room", "my name", "my subject"],
+                12,
+                &[
+                    "question",
+                    "asked of the room",
+                    "an invitation to the room",
+                    "my name",
+                    "my subject",
+                ],
             ),
         ];
         for (body, score, cues) in cases {
@@ -802,6 +902,53 @@ mod tests {
             let found = scored(body, topics);
             assert_eq!(found.score, score, "{body:?} scored {}", found.listed());
             assert_eq!(found.cues, cues, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn the_lines_that_hand_the_turn_to_the_room_and_the_ones_that_do_not() {
+        // The first column is what an agent must conclude about a line nobody
+        // addressed: was the ROOM asked for an answer? It selects nobody, so it
+        // is never an address - it is the cue the judge was missing when it
+        // read "you should just talk amongst yourselves" and answered "no, the
+        // conversation has naturally settled".
+        let invitations = [
+            "you should just talk amongst yourselves",
+            "you two, talk amongst yourselves about the weather",
+            "so, you all - what now?",
+            "y'all have been quiet",
+            "does anyone have a view on this?",
+            "everyone is welcome to weigh in",
+            "any of you know why the build is red?",
+            "talk to each other for a bit",
+            "tell me what you think",
+            "just discuss it between yourselves",
+            "ok so talk about the weather",
+            "introduce yourselves please",
+            "keep going, this is interesting",
+            "I have a question for the room",
+        ];
+        for body in invitations {
+            assert!(
+                addresses_room(body),
+                "{body:?} is an invitation to the room"
+            );
+        }
+        let not_invitations = [
+            "what do you think?",
+            "the build finished",
+            "I talked to alex about it yesterday",
+            "she told me the deploy was done",
+            "everyones-bot is down",
+            "I like this queue",
+            "qwen, why so quiet?",
+            "and why is that?",
+        ];
+        for body in not_invitations {
+            assert!(
+                !addresses_room(body),
+                "{body:?} addresses nobody in particular, but it is not an invitation either"
+            );
         }
     }
 

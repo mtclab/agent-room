@@ -31,16 +31,6 @@ pub use judging::{judge_prompt, judge_system_prompt, parse_judgement};
 pub use openai_compat::OpenAiCompatBrain;
 pub use rendering::{render_conversation, render_event};
 
-/// A verdict written the way the Python this was ported from wrote it.
-///
-/// The live gates grep the connector's own decision lines (`speak=False` in
-/// G7), and Rust would print `false`. The wording of a decision line is part of
-/// the contract with those gates, not decoration.
-#[must_use]
-pub fn python_bool(value: bool) -> &'static str {
-    if value { "True" } else { "False" }
-}
-
 /// Why a brain is being asked to speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Occasion {
@@ -100,36 +90,93 @@ pub struct BrainContext {
     /// What this occasion is about when the room is not. Empty for `reply` and
     /// `unaddressed`, where the room IS the subject.
     pub note: String,
-    /// Ask the judge for an urgency as well as a verdict (inner thoughts).
+    /// Ask the judge for an urgency as well as a score (inner thoughts).
     pub want_urgency: bool,
+    /// The score at which this agent's judge is a yes
+    /// ([`crate::config::PolicyConfig::effective_speak_threshold`]). The brain
+    /// reports how much it would add; the operator's configuration is what
+    /// turns that into speech.
+    pub speak_threshold: u8,
+    /// How many people and agents are joined to this room, as the member store
+    /// has it. 0 when the member list has not arrived yet. The judge is told,
+    /// because "would anybody else answer this?" has a different answer in a
+    /// room of three than in a room of thirty.
+    pub participants: usize,
+}
+
+impl BrainContext {
+    /// Whether I am already part of this exchange.
+    ///
+    /// The thread when there is one, the room's recent lines when there is not.
+    /// A deterministic cue for the judge: joining in on a conversation I have
+    /// been in is not the same act as walking into somebody else's.
+    #[must_use]
+    pub fn i_took_part(&self) -> bool {
+        let conversation = if self.thread.is_empty() {
+            &self.history
+        } else {
+            &self.thread
+        };
+        conversation.iter().any(|ev| ev.sender == self.me)
+    }
 }
 
 /// The most a judge may claim it wants to speak. The scale is deliberately
 /// tiny: a model asked for 0-100 answers 70 to everything.
 pub const MAX_URGENCY: i32 = 3;
 
-/// A brain's answer to "should I speak here?".
+/// The top of the judge's enthusiasm scale, after Webb: directly addressed is a
+/// 9, and a 9 never reaches the judge because being addressed is tier 1.
+pub const MAX_JUDGE_SCORE: u8 = 9;
+
+/// A brain's answer to "how much would I add here?".
+///
+/// A SCORE, not a verdict, because the verdict is the connector's to make: the
+/// same 7 speaks in a room whose operator asked for a talkative agent and stays
+/// quiet in one that did not (`policy.speak_threshold`, `policy.chattiness`).
+/// The old contract asked "would you add something nobody has said?" and got
+/// "no, the conversation has naturally settled" - a yes/no question about
+/// whether to speak is biased to silence, and a room of agents told to converse
+/// answered it with silence (the room log, 2026-09-04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judgement {
     pub speak: bool,
+    /// 0-9: how much this brain would add here. 0 whenever nothing usable came
+    /// back, which is why silence stays the safe failure.
+    pub score: u8,
     pub why: String,
     /// 0-3: how much this brain wanted to say something, whatever it decided.
     pub urgency: i32,
 }
 
 impl Judgement {
+    /// A scored answer, and the threshold that turns it into a verdict.
     #[must_use]
-    pub fn new(speak: bool, why: impl Into<String>, urgency: i32) -> Self {
+    pub fn scored(score: u8, threshold: u8, why: impl Into<String>, urgency: i32) -> Self {
         Self {
-            speak,
+            speak: score >= threshold,
+            score: score.min(MAX_JUDGE_SCORE),
             why: why.into(),
             urgency,
         }
     }
 
+    /// No, whatever the threshold: nothing usable came back.
     #[must_use]
     pub fn no(why: impl Into<String>) -> Self {
-        Self::new(false, why, 0)
+        Self {
+            speak: false,
+            score: 0,
+            why: why.into(),
+            urgency: 0,
+        }
+    }
+
+    /// How the log says what came back: `7 (>= 5)`, `3 (< 5)`.
+    #[must_use]
+    pub fn says(&self, threshold: u8) -> String {
+        let comparison = if self.speak { ">=" } else { "<" };
+        format!("{} ({comparison} {threshold})", self.score)
     }
 }
 
@@ -139,7 +186,7 @@ pub trait Brain: Send + Sync {
     /// Return the message to post, or None to stay quiet.
     async fn reply(&self, ctx: &BrainContext) -> Option<String>;
 
-    /// Cheap, fresh-context "do I add anything nobody has said?".
+    /// Cheap, fresh-context "how much would I add here?", 0-9.
     ///
     /// The default is silence: an adapter that does not implement it never
     /// speaks unprompted, which is the safe failure everywhere in this project.

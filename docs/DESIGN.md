@@ -427,9 +427,11 @@ MY NAME IN THE BODY (see "Addressing" below), or a thread I already spoke in
 answers "silent" without being a refusal - it is the line going somewhere else.
 
 **Tier 2, may answer** (`policy.answer_unaddressed`, on by default). The trigger
-must be a HUMAN `m.text` that addressed nobody - bots never trigger tier 2,
-because two agents answering each other's unaddressed lines is a loop with no
-human in it. Then, in order:
+must be a line that addressed nobody, and by default a HUMAN one - bots do not
+trigger tier 2, because two agents answering each other's unaddressed lines is a
+loop with no human in it. `bot_to_bot: conversational` is the one mode that
+lifts that, and it is what two agents in a room with a person need (see "Two
+agents in one room" below). Then, in order:
 
 1. Budgets and decay first, in the policy, before anything is spent: the hourly
    cap, the separate `tier2_per_hour_max` (default 10) for uninvited posts, and
@@ -447,9 +449,11 @@ human in it. Then, in order:
    trigger's thread since the trigger. (c) is checked against `/messages` as well
    as the local transcript: the sync loop is a long poll and the question is what
    the room looked like a fraction of a second ago.
-4. `Brain.judge(ctx) -> Judgement(speak, why)`: one cheap call, fresh context,
-   the last ~20 room lines and the persona, answering `yes: <line>` or
-   `no: <line>`. Anything else is read as a no.
+4. `Brain.judge(ctx) -> Judgement(speak, score, why)`: one cheap call, fresh
+   context, the last ~20 room lines, the persona, the deterministic cues, and a
+   scale rather than a verdict - `score: N` with N 0-9 for how much it would
+   add. Anything else scores 0. `speak = score >= policy.speak_threshold -
+   policy.chattiness` (see "The judge scores, the connector decides").
 5. Re-check the budgets (time passed) and post as a threaded `m.notice` on the
    trigger, mentioning its sender, recorded in the ledger as a tier-2 post.
 
@@ -519,7 +523,7 @@ The decision order in `policy::should_reply`, with the two new arms in bold:
 | # | Signal | Verdict | Model call | Log reason |
 |---|---|---|---|---|
 | 1 | sender is me | silent | none | `self-echo: the event is mine` |
-| 2 | bot sender vs `bot_to_bot` | silent / pass | none | `bot_to_bot=...` |
+| 2 | bot sender vs `bot_to_bot` (a TYPED name satisfies `mentions`) | silent / pass | none | `bot_to_bot=mentions: bot @b:server named me (qwen, at)` |
 | 3a | `m.mentions` or a pill names me | reply | speaker | `mentioned` |
 | 3b | rich reply to my event | reply | speaker | `reply to my event $id` |
 | 3c | **a vocative of one of my names** | reply | speaker | `named in the body (qwen, leading)` |
@@ -527,7 +531,7 @@ The decision order in `policy::should_reply`, with the two new arms in bold:
 | 3e | a thread I have posted in | reply | speaker | `thread $id I have posted in` |
 | 3f | **I spoke last here and a human came back inside `followup_window_s`** | reply | speaker | `follow-up: I spoke last here 41 s ago` |
 | 4-5 | budgets, then energy decay | silent / judge | | unchanged |
-| 6 | nobody addressed anybody, and the line pre-scores `prescore_fast` | consider, short back-off | judge | `unaddressed: tier 2 candidate (pre-score 5: question, asked of the room), short back-off` |
+| 6 | nobody addressed anybody, and the line pre-scores `prescore_fast` | consider, short back-off | judge | `unaddressed: tier 2 candidate (pre-score 8: question, asked of the room, an invitation to the room), short back-off` |
 | 7 | nobody addressed anybody | consider | judge | `unaddressed: tier 2 candidate, backing off before I decide` |
 
 3d beats 3e deliberately: being in the thread is a weaker claim than being
@@ -630,6 +634,105 @@ waits minutes to hear nothing.
 
 Knobs: `followup_window_s` (120), `topics` ([]), `prescore_fast` (4),
 `brain.openai_compat.judge_timeout_s` (0 = work it out).
+
+### Two agents in one room (BUILT 2026-09-04)
+
+The room's second real use, and the first with two agents in it - ours and a
+friend's, with one person. Three separate things kept them from ever speaking to
+each other, and all three are in the log of 2026-09-04:
+
+1. **`mentions` read `m.mentions` and nothing else.** No model can make a Matrix
+   mention: a brain returns text, so an agent writing "@Qwen" or "Qwen, what do
+   you think?" is sending plain characters. Every bot-to-bot line was refused
+   with `bot_to_bot=mentions: bot ... did not mention me`, which made every
+   agent unreachable by every other agent BY CONSTRUCTION - the exact failure
+   `reply_mentions` exists to prevent in the other direction.
+2. **"tier 2 never triggers on a bot"** then sealed what was left. With
+   allocation impossible and self-selection forbidden, two agents in a room
+   could not reach each other at all.
+3. **The judge was asked a yes/no question.** The human wrote "you should just
+   talk amongst yourselves" - unaddressed, so tier 2 - and the judge answered
+   *"no: the conversation has naturally settled"*.
+
+**Names count for bots too (arm 2).** `Mentions` is satisfied by `me in
+ev.mentions` OR `addresses_me(body)` - the same PR-1 vocative, the same code,
+the same three-character floor and next-token filter - and the log says which:
+`bot_to_bot=mentions: bot @b:server named me (qwen, at), named in the body
+(qwen, at)`. It is gated on `reply_to_names`, because an operator who turned the
+body off turned it off for everybody. `none` is still none.
+
+**`bot_to_bot: conversational`** (new; the default is still `mentions`). A
+bot's line passes the switch like `all` AND may reach tier 2 - `unaddressed()`
+no longer refuses a bot sender in this mode. Nothing else is relaxed, and the
+bounds are the point:
+
+| bound | what it stops |
+|---|---|
+| pair budget (3/min, then 60 s) | one agent monopolising another |
+| per-thread cap (12) | a thread that never ends |
+| energy decay (`bot_only_turns_before_decay`, 6) | a bot-only thread that never winds down; ANY human line resets it |
+| `tier2_per_hour_max` (10) | uninvited speech in general |
+| the stand-down re-read | two agents answering the same line |
+
+The pair budget and the thread cap now also apply on the TIER-2 path for a bot
+sender, which they did not before - they never needed to, because a bot never
+got there. A loop that ping-pongs through tier 2 is still a loop.
+
+Which to pick: `mentions` for a room where the agents work for different people
+and should answer when spoken to (the default, and what a friend's agent should
+be given); `conversational` when two agents are meant to talk to each other in
+front of somebody; `all` to answer other agents but never join in uninvited;
+`none` to ignore them.
+
+### The judge scores, the connector decides (BUILT 2026-09-04)
+
+A binary "would you add something nobody has said?" is biased to silence,
+because silence is always defensible - and the owner's goal is agents that
+converse like people. So `Judgement` carries a SCORE:
+
+```rust
+Judgement { speak: bool, score: u8 /* 0-9 */, why: String, urgency: i32 }
+```
+
+The contract with the model, in `brain/judging.rs` and shared by every adapter:
+
+    score: 7 - nobody has answered the deploy question
+
+after Webb's multiplayer turn-taking (directly addressed is a 9, which never
+reaches the judge because being addressed is tier 1, so the judge sees only the
+self-selection cases): **9-7** I clearly should (invited, asked, my expertise),
+**6-4** I could add something, **3-0** nothing to add / the thread is closed /
+somebody else's exchange. Parsing is strict - `score: N` on the first non-empty
+line, a single digit, no decimal - and anything else is 0, because a judge that
+answers with a paragraph has not answered.
+
+`speak = score >= policy.speak_threshold - policy.chattiness` (5 and 0 by
+default; `chattiness` is -3..3, and the result is held inside 0..=10, where 10
+is "never speaks unprompted"). The same brain is therefore differently talkative
+in two rooms without being asked a different question, and the log says both
+numbers: `judge on $evt says 7 (>= 5): <why>` / `says 3 (< 5): <why>`.
+
+**The judge is told what is free to know.** Everything a model would otherwise
+have to infer out of prose and reliably infers wrong: whether the line is a
+question, whether it addresses the ROOM (`addressing::addresses_room` - "you
+all", "amongst yourselves", "anyone", "everyone", an imperative "talk"/"tell
+me"), how many people and agents are in the room, whether I have already taken
+part in this exchange, whether the sender is another agent, and the persona.
+None of it decides anything.
+
+`addresses_room` is also worth +3 of pre-score, which collapses the back-off on
+exactly the line nobody is going to repeat.
+
+**The back-off scales with the room.** `participants` (joined humans and bots,
+read from the member store beside the names) multiplies the tier-2 range by
+`clamp((participants - 2) / 4, 0.25, 1.0)`: a quarter of `backoff_s` in a room
+of three, all of it from six up. 0 participants means the member list has not
+arrived, and an unmeasured room waits as long as it always did. The pre-scored
+fast path is untouched - it is already the floor, and the floor is the collision
+avoidance. Knob: `small_room_backoff` (true).
+
+Knobs: `speak_threshold` (5), `chattiness` (0), `small_room_backoff` (true),
+`bot_to_bot: conversational`.
 
 ### Unprompted speech, second design (BUILT 2026-09-02, S6)
 
@@ -759,6 +862,13 @@ sender AND anyone whose user id appears in the reply body, so writing
 "@bot-b:server what do you think?" reaches bot B. Without it every connector
 running `bot_to_bot: mentions` is unreachable by another agent by construction:
 the room could only ever answer humans, which is the opposite of the point.
+
+That covers OUR connectors writing a user id. It does not cover a model writing
+a NAME - "@Qwen", "Qwen, what do you think?" - which is what a model actually
+does, and what a connector that is not this one will send. Since 2026-09-04 the
+`mentions` guard reads the body for names as well (see "Two agents in one
+room"), so the other half of the problem is closed from the receiving end,
+where it has to be: we do not control what the friend's agent writes.
 
 Persona: each connector carries a short persona file (name, what it knows,
 how it talks, whose agent it is, what it must never share). The human's real
@@ -1027,7 +1137,16 @@ these are BUILT and recorded in `docs/GATES.md` with their teeth runs:
 13. E1 A real ENCRYPTED room: the agent decrypts the mention and answers, and
     the reply comes back as `m.room.encrypted` for the room to decrypt - with
     the identical journey in a plain room as its negative control.
-14. Each gate proven to have teeth by reverting the guard it protects.
+14. N1-N4 A typed name is answered at once and costs no judge call; somebody
+    else's name is theirs; the next line is still mine until the window closes;
+    and with two agents in the room, exactly one answers a line naming one of
+    them.
+15. C-1/C-2/C-3 Two agents and a person: the human hands the turn to the room
+    and both agents end up talking, by name, until the thread runs out of
+    energy; another agent's TYPED name is answered under the shipped
+    `bot_to_bot: mentions`; and the same agent naming nobody is refused at the
+    switch, with the human's identical line still answered.
+16. Each gate proven to have teeth by reverting the guard it protects.
 
 ### Two standing rules about INPUTS (2026-09-04)
 

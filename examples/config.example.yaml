@@ -124,9 +124,25 @@ policy:
   # somebody got there first) and a judge call that must say yes.
   answer_unaddressed: true
   backoff_s: [5, 40]               # drawn per message, so agents do not collide
+  # In a room of three there is nobody else the question could have been meant
+  # for, so the range above is scaled by how many people and agents are here: a
+  # quarter of it at three, all of it from six up. The pre-scored fast path
+  # below is untouched - it is already the floor.
+  small_room_backoff: true
+  # WHAT THE JUDGE IS ASKED. Not "should you speak?" - a yes/no question about
+  # speaking is biased to silence, and a room of agents told to talk to each
+  # other answered it with "the conversation has naturally settled". It is asked
+  # for an ENTHUSIASM, 0-9: 9-7 I clearly should, 6-4 I could add something, 3-0
+  # nothing to add. This is where the line falls, and chattiness shifts it per
+  # agent (+1 speaks one point sooner, -1 needs one more). 10 = never speaks
+  # unprompted, whatever the personality.
+  speak_threshold: 5
+  chattiness: 0                    # -3..3, the personality on top of the rule
   # A free read of an unaddressed line, before any model is asked: a question
-  # mark is worth 3, "you" (or "anyone"/"someone"/"who") 2, one of my own names
-  # in passing 2, and a word from `topics` 2. At prescore_fast the back-off
+  # mark is worth 3, an invitation to the room ("you two", "amongst
+  # yourselves", "anyone") 3, "you" (or "anyone"/"someone"/"who") 2, one of my
+  # own names in passing 2, and a word from `topics` 2. At prescore_fast the
+  # back-off
   # collapses to backoff_s[0] .. +5 s with no timing hazard, so an obvious
   # question is picked up in seconds instead of up to a minute. It changes the
   # WAIT and nothing else: the judge still decides, and the agent still stands
@@ -156,7 +172,15 @@ policy:
   # quiet that long. 0 = off, and off is right - a timer is the least organic
   # reason to speak there is. The four knobs above are the real thing.
   heartbeat_minutes: 0
-  bot_to_bot: mentions             # none | mentions | all
+  # OTHER AGENTS. `mentions` (the default) answers another agent when it
+  # addresses this one - an `m.mentions`, or a name typed in the body, because
+  # no model can make a Matrix mention and "@qwen" is text. `conversational`
+  # additionally lets another agent's UNADDRESSED line reach tier 2, so two
+  # agents can talk to each other the way they talk to people; everything that
+  # bounds a loop still applies (the pair budget, the thread cap, the energy
+  # decay, tier2_per_hour_max and the stand-down re-read). `all` answers other
+  # agents but never joins in uninvited; `none` ignores them entirely.
+  bot_to_bot: mentions             # none | mentions | all | conversational
   bot_user_ids: []                 # extra user ids that count as bots
   bot_localpart_patterns: []       # localpart regexes that count as bots, e.g. ["^bot-"]
   budgets:

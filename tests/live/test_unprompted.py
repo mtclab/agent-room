@@ -171,7 +171,11 @@ async def test_g10_a_question_nobody_answers_gets_exactly_one_follow_up(
         S3_BOT_A_NAME,
         room_s3,
         policy=unprompted_policy(followup_delay_s=[5.0, 8.0]),
-        brain={"kind": "echo", "echo": {"ask_back": "did anyone try it?"}},
+        # `score: 9` rather than a marker in the human's line: the markers are
+        # stripped out of what the echo posts (one hop, never a chain), so the
+        # loop's own text carries none - and what has to say yes here is the
+        # judge on the FOLLOW-UP, not the judge on the question.
+        brain={"kind": "echo", "echo": {"ask_back": "did anyone try it?", "score": 9}},
     )
     bot.start()
     running.append(bot)
@@ -179,11 +183,7 @@ async def test_g10_a_question_nobody_answers_gets_exactly_one_follow_up(
     await wait_for_join(human, room_s3, [S3_BOT_A])
 
     # -- the loop nobody closes ----------------------------------------------
-    # `[[speak]]` travels from the human's line into the echo reply, and from
-    # there into the loop's text - which is what the follow-up's judge reads.
-    root = await post(
-        human, room_s3, f"{S3_BOT_A} [[speak]] what is the state of the build?", [S3_BOT_A]
-    )
+    root = await post(human, room_s3, f"{S3_BOT_A} what is the state of the build?", [S3_BOT_A])
     events = await wait_for(lambda evs: bool(bot_posts(evs)), human, room_s3, seconds=40)
     assert len(bot_posts(events)) == 1, "the agent never answered at all"
 
@@ -202,7 +202,7 @@ async def test_g10_a_question_nobody_answers_gets_exactly_one_follow_up(
 
     # -- the loop somebody closes --------------------------------------------
     before = len(bot_posts(await messages(human, room_s3)))
-    second = await post(human, room_s3, f"{S3_BOT_A} [[speak]] and the deploy?", [S3_BOT_A])
+    second = await post(human, room_s3, f"{S3_BOT_A} and the deploy?", [S3_BOT_A])
     events = await wait_for(lambda evs: len(bot_posts(evs)) > before, human, room_s3, seconds=40)
     assert len(bot_posts(events)) == before + 1, "the agent never answered the second question"
 

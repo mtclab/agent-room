@@ -103,6 +103,11 @@ pub struct WorkerState {
     /// member store at startup and whenever somebody joins, leaves or renames -
     /// never per message, because these are compiled regexes.
     pub names: Names,
+    /// How many people and agents are joined here, read from the member store
+    /// beside the names and rebuilt with them. 0 until the first sync has
+    /// filled the store, which is the "I do not know" the back-off treats as a
+    /// full-sized room.
+    pub participants: usize,
     /// Unprompted candidates waiting for somebody to be around.
     pub queue: Vec<Candidate>,
     pub queued: HashSet<String>,
@@ -127,6 +132,7 @@ impl WorkerState {
             last_activity_ts: now,
             last_human_post_ts: 0.0,
             names: Names::empty(),
+            participants: 0,
             queue: Vec::new(),
             queued: HashSet::new(),
             inner_urgency: HashMap::new(),
@@ -620,14 +626,16 @@ impl Connector {
         let Some(room) = self.client.get_room(room_id) else {
             return;
         };
-        let names = self.names_for_room(&room).await;
+        let (names, participants) = self.names_for_room(&room).await;
         info!(
-            "{room_id}: I answer to [{}]; {} other name(s) known: [{}]",
+            "{room_id}: I answer to [{}]; {} other name(s) known: [{}]; {participants} here",
             names.mine().join(", "),
             names.theirs().len(),
             crate::head(&names.theirs().join(", "), 200)
         );
-        worker.state.lock().await.names = names;
+        let mut state = worker.state.lock().await;
+        state.names = names;
+        state.participants = participants;
     }
 
     /// Every name this room can call somebody by.
@@ -638,7 +646,11 @@ impl Connector {
     /// names, their first words and their localparts, plus the localparts of
     /// `policy.bot_user_ids` - which are configured rather than discovered, so
     /// they are known before anybody has spoken or even joined.
-    async fn names_for_room(&self, room: &Room) -> Names {
+    ///
+    /// Returns the room's size with them, because it is the same read of the
+    /// same store and the tier-2 back-off wants it: in a room of three there is
+    /// nobody else a question could have been meant for.
+    async fn names_for_room(&self, room: &Room) -> (Names, usize) {
         let policy = &self.cfg.policy;
         let mut mine: Vec<String> = Vec::new();
         if let Ok(user) = UserId::parse(&self.me)
@@ -679,9 +691,12 @@ impl Connector {
                     Vec::new()
                 }
             };
-        Names::new(
-            &mine,
-            other_names(policy, &self.me, &members, &self.bot_user_ids),
+        (
+            Names::new(
+                &mine,
+                other_names(policy, &self.me, &members, &self.bot_user_ids),
+            ),
+            members.len(),
         )
     }
 
@@ -1066,8 +1081,9 @@ fn other_names(
 pub fn describes_bot_policy(cfg: &Config) -> &'static str {
     match cfg.policy.bot_to_bot {
         BotToBot::None => "never answers other bots",
-        BotToBot::Mentions => "answers other bots only when they mention it",
+        BotToBot::Mentions => "answers other bots when they mention or name it",
         BotToBot::All => "answers other bots",
+        BotToBot::Conversational => "answers other bots, and may join in on what they say",
     }
 }
 

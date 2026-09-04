@@ -845,16 +845,16 @@ impl Brain for ClaudeCodeBrain {
             self.start_cooldown(&ctx.room_id, &outcome);
             return Judgement::no("claude hit a usage limit while judging");
         }
-        let judgement = parse_judgement(outcome.text.as_deref());
+        let judgement = parse_judgement(outcome.text.as_deref(), ctx.speak_threshold);
         info!(
-            "{}: judge ({}) says speak={}: {}",
+            "{}: judge ({}) says {}: {}",
             ctx.room_id,
             if self.cfg.judge_model.is_empty() {
                 &self.cfg.model
             } else {
                 &self.cfg.judge_model
             },
-            crate::brain::python_bool(judgement.speak),
+            judgement.says(ctx.speak_threshold),
             judgement.why
         );
         judgement
@@ -1118,6 +1118,8 @@ print(json.dumps({
             occasion: Occasion::Reply,
             note: String::new(),
             want_urgency: false,
+            speak_threshold: 5,
+            participants: 0,
         }
     }
 
@@ -1631,7 +1633,7 @@ print(json.dumps({
         let fixture = Fixture::new();
         fixture
             .fake
-            .behave(&serde_json::json!({"result": "yes: nobody has mentioned the deadline"}));
+            .behave(&serde_json::json!({"result": "score: 7 - nobody has mentioned the deadline"}));
         let brain = fixture.brain_with(|cfg| {
             cfg.model = "sonnet".to_owned();
             cfg.judge_model = "haiku".to_owned();
@@ -1662,7 +1664,8 @@ print(json.dumps({
             .as_str()
             .expect("stdin")
             .to_owned();
-        assert!(stdin.contains("Would you, as this participant, add something here"));
+        assert!(stdin.contains("how much would you add by speaking"));
+        assert!(stdin.contains("`score: N`"));
         assert!(stdin.contains("anyone around?"));
     }
 
@@ -1820,7 +1823,7 @@ print(json.dumps({
 
         fixture
             .fake
-            .behave(&serde_json::json!({"result": "yes: I am back"}));
+            .behave(&serde_json::json!({"result": "score: 9 - I am back"}));
         fixture.clock.advance(120.0);
         assert!(!brain.judge(&context("hi")).await.speak);
         assert_eq!(

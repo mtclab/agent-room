@@ -4,23 +4,59 @@
 //! without a model in the loop. Markers in the trigger body steer it:
 //!
 //! - `[[silent]]` - reply returns None (the "brain declined to speak" path).
-//! - `[[speak]]`  - the judge says yes; without it the judge says no. That is
-//!   what makes the judged gates deterministic: no model, no coin flips, the
-//!   same verdict every run.
+//! - `[[speak]]`  - the judge scores 9; without it, [`EchoBrainConfig::score`]
+//!   (0 by default). That is what makes the judged gates deterministic: no
+//!   model, no coin flips, the same score every run.
+//! - `[[score: N]]` - the judge scores exactly N, for a gate that needs an
+//!   answer either side of `policy.speak_threshold`.
 //!
-//! Three config options exist for the same reason, because a marker in the body
+//! **The markers never reach the room.** An echo of a marked line used to carry
+//! the marker into its own reply, so in a two-agent gate the next judge saw it
+//! too and every hop said yes for ever - which made "the thread winds down"
+//! untestable next to "the room answered at all". They are the harness's
+//! channel to the brain, and one hop is all they get.
+//!
+//! Five config options exist for the same reason, because a marker in the body
 //! can only say things about THIS message and the gates need standing
 //! behaviour: `mention_back` names a user id every reply ends with (so one echo
-//! bot can address another), `ask_back` ends every reply with a question, and
-//! `urgency` is what the judge reports on the inner-thoughts axis.
+//! bot can address another through `m.mentions`), `name_back` ends every reply
+//! with a NAME instead (`..., qwen?` - the typed form, which is all another
+//! agent's model can actually produce), `ask_back` ends every reply with a
+//! question, `urgency` is what the judge reports on the inner-thoughts axis,
+//! and `score` is what it reports when no marker says otherwise.
+
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use regex::Regex;
 
-use crate::brain::{Brain, BrainContext, Judgement};
+use crate::brain::{Brain, BrainContext, Judgement, MAX_JUDGE_SCORE};
 use crate::config::EchoBrainConfig;
 
 pub const SILENT_MARKER: &str = "[[silent]]";
 pub const SPEAK_MARKER: &str = "[[speak]]";
+/// What [`SPEAK_MARKER`] scores: the top of the scale, so a gate that wants an
+/// agent to speak does not have to know the threshold.
+pub const SPEAK_SCORE: u8 = MAX_JUDGE_SCORE;
+
+/// `[[score: 4]]` anywhere in the trigger or the note.
+static SCORE_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\[\[score:\s*(\d)\]\]").expect("a literal pattern"));
+
+/// Every marker, for stripping them out of what is echoed back.
+static ANY_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[[^\]]*\]\]").expect("a literal pattern"));
+
+/// What the room sees of a marked line: the line, without the harness's
+/// markers and without the double spaces taking one out would leave.
+#[must_use]
+pub fn without_markers(text: &str) -> String {
+    ANY_MARKER
+        .replace_all(text, " ")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
 
 /// The brain used by the live gates: no network, no model, no surprises.
 #[derive(Debug, Clone, Default)]
@@ -48,9 +84,14 @@ impl Brain for EchoBrain {
         } else {
             &ctx.note
         };
-        let mut text = format!("echo: {subject}");
+        let mut text = format!("echo: {}", without_markers(subject));
         if !self.cfg.mention_back.is_empty() && self.cfg.mention_back != ctx.me {
             text = format!("{text} {}", self.cfg.mention_back);
+        }
+        // A vocative, because that is what makes it an address: a name on the
+        // end of a sentence with nothing between them is talk ABOUT somebody.
+        if !self.cfg.name_back.is_empty() {
+            text = format!("{text}, {}?", self.cfg.name_back);
         }
         if !self.cfg.ask_back.is_empty() {
             text = format!("{text} {}", self.cfg.ask_back);
@@ -64,10 +105,36 @@ impl Brain for EchoBrain {
         } else {
             0
         };
-        if ctx.trigger.body.contains(SPEAK_MARKER) || ctx.note.contains(SPEAK_MARKER) {
-            return Judgement::new(true, format!("the trigger carries {SPEAK_MARKER}"), urgency);
+        let threshold = ctx.speak_threshold;
+        for text in [&ctx.trigger.body, &ctx.note] {
+            if let Some(caps) = SCORE_MARKER.captures(text)
+                && let Ok(score) = caps[1].parse::<u8>()
+            {
+                return Judgement::scored(
+                    score,
+                    threshold,
+                    format!("{} said so", &caps[0]),
+                    urgency,
+                );
+            }
         }
-        Judgement::new(false, format!("no {SPEAK_MARKER} in the trigger"), urgency)
+        if ctx.trigger.body.contains(SPEAK_MARKER) || ctx.note.contains(SPEAK_MARKER) {
+            return Judgement::scored(
+                SPEAK_SCORE,
+                threshold,
+                format!("the trigger carries {SPEAK_MARKER}"),
+                urgency,
+            );
+        }
+        Judgement::scored(
+            self.cfg.score,
+            threshold,
+            format!(
+                "no marker in the trigger, so the configured score ({})",
+                self.cfg.score
+            ),
+            urgency,
+        )
     }
 }
 
@@ -103,6 +170,8 @@ mod tests {
             occasion: Occasion::Reply,
             note: String::new(),
             want_urgency: false,
+            speak_threshold: 5,
+            participants: 0,
         }
     }
 
@@ -126,11 +195,53 @@ mod tests {
         let brain = EchoBrain::new(EchoBrainConfig {
             mention_back: "@bot-b:example.com".to_owned(),
             ask_back: "and you?".to_owned(),
-            urgency: 0,
+            ..EchoBrainConfig::default()
         });
         assert_eq!(
             brain.reply(&context("hi")).await.as_deref(),
             Some("echo: hi @bot-b:example.com and you?")
+        );
+    }
+
+    #[tokio::test]
+    async fn name_back_is_a_vocative_and_carries_no_user_id() {
+        // The typed form: what another agent's MODEL can produce, and what
+        // arrives with no `m.mentions` anywhere.
+        let brain = EchoBrain::new(EchoBrainConfig {
+            name_back: "bot-b".to_owned(),
+            ..EchoBrainConfig::default()
+        });
+        let text = brain.reply(&context("hi")).await.expect("a reply");
+        assert_eq!(text, "echo: hi, bot-b?");
+        assert!(
+            crate::events::mentioned_user_ids(&text).is_empty(),
+            "a typed name must not become a mention"
+        );
+        let names = crate::addressing::Names::new(&["bot-b".to_owned()], Vec::new());
+        assert!(
+            names.addresses_me(&text, false).is_some(),
+            "the other agent has to read it as an address"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_markers_never_reach_the_room() {
+        // One hop is all a marker gets: an echo that carried it would answer
+        // for every agent downstream of it as well.
+        let brain = EchoBrain::default();
+        assert_eq!(
+            brain
+                .reply(&context("[[speak]] what is the state of the build?"))
+                .await
+                .as_deref(),
+            Some("echo: what is the state of the build?")
+        );
+        assert_eq!(
+            brain
+                .reply(&context("the deploy [[score: 4]] is done"))
+                .await
+                .as_deref(),
+            Some("echo: the deploy is done")
         );
     }
 
@@ -147,10 +258,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_judge_says_no_unless_the_trigger_asks_for_a_yes() {
+    async fn the_judge_scores_zero_unless_the_trigger_asks_for_more() {
         let brain = EchoBrain::default();
-        assert!(!brain.judge(&context("just talking")).await.speak);
-        assert!(brain.judge(&context("[[speak]] now")).await.speak);
+        let quiet = brain.judge(&context("just talking")).await;
+        assert_eq!(quiet.score, 0);
+        assert!(!quiet.speak);
+        let keen = brain.judge(&context("[[speak]] now")).await;
+        assert_eq!(keen.score, SPEAK_SCORE);
+        assert!(keen.speak);
+    }
+
+    #[tokio::test]
+    async fn a_scored_marker_answers_either_side_of_the_threshold() {
+        // What makes a threshold gate possible without a model: the same brain
+        // answering 4 and 6 to two lines, and the config deciding which speaks.
+        let brain = EchoBrain::default();
+        let four = brain.judge(&context("[[score: 4]] hm")).await;
+        assert_eq!(four.score, 4);
+        assert!(!four.speak, "4 is under the shipped threshold of 5");
+        let six = brain.judge(&context("[[score: 6]] hm")).await;
+        assert_eq!(six.score, 6);
+        assert!(six.speak);
+        // And the threshold is the connector's, not the brain's.
+        let mut chatty = context("[[score: 4]] hm");
+        chatty.speak_threshold = 3;
+        assert!(brain.judge(&chatty).await.speak);
+    }
+
+    #[tokio::test]
+    async fn a_configured_score_is_what_an_unmarked_line_gets() {
+        let brain = EchoBrain::new(EchoBrainConfig {
+            score: 9,
+            ..EchoBrainConfig::default()
+        });
+        let judged = brain.judge(&context("nothing in particular")).await;
+        assert_eq!(judged.score, 9);
+        assert!(judged.speak);
     }
 
     #[tokio::test]
@@ -162,6 +305,10 @@ mod tests {
         assert_eq!(
             brain.reply(&ctx).await.as_deref(),
             Some("echo: [git] merged PR #5")
+        );
+        assert!(
+            !without_markers("[git] merged PR #5").is_empty(),
+            "an impulse's own square brackets are not a marker"
         );
         assert!(
             brain

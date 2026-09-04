@@ -74,8 +74,12 @@ def named_policy(**extra: Any) -> dict[str, Any]:
 
 
 def judged(connector: Connector) -> bool:
-    """Whether this connector ever asked its judge anything."""
-    return "speak=" in connector.log_text()
+    """Whether this connector ever asked its judge anything.
+
+    The judge answers with a score - `judge on $evt says 7 (>= 5): ...` - so
+    what says it was asked at all is the line, not the verdict on it.
+    """
+    return "judge on" in connector.log_text()
 
 
 # -- N1 ----------------------------------------------------------------------

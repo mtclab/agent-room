@@ -16,13 +16,15 @@
 //! test and the reason strings - which the docs and the live gates quote - are
 //! asserted here rather than guessed at.
 //!
-//! Two of the guards read the message BODY, and only for names ([`crate::addressing`]):
-//! a vocative of one of my names is an invitation, and a vocative of somebody
-//! else's is an instruction to stay out of it. A third reads it for nothing but
-//! a pre-score, which decides no verdict at all - only how long tier 2 waits
-//! before asking the judge. Everything they need arrives in [`Cues`], so the
-//! decision stays a pure function of the event, the ledger and what the room is
-//! called.
+//! Three of the guards read the message BODY, and only for names
+//! ([`crate::addressing`]): a vocative of one of my names is an invitation, a
+//! vocative of somebody else's is an instruction to stay out of it, and the
+//! bot-to-bot switch reads the first of those too, because no model can make a
+//! Matrix mention and a name typed by an agent is the same address it is when a
+//! person types it. A fourth reads the body for nothing but a pre-score, which
+//! decides no verdict at all - only how long tier 2 waits before asking the
+//! judge. Everything they need arrives in [`Cues`], so the decision stays a
+//! pure function of the event, the ledger and what the room is called.
 
 use std::collections::HashSet;
 
@@ -173,6 +175,22 @@ fn read_names(ev: &RoomEvent, cfg: &PolicyConfig, cues: &Cues<'_>) -> Named {
     Named::Nobody
 }
 
+/// The vocative of one of MY names in this body, for the log line that has to
+/// say which one.
+///
+/// `None` when the body names me in no position that means it, and whenever
+/// `reply_to_names` is off - an operator who has turned the body off has turned
+/// it off for bots as well, and the guard that reads it (2) and the guard that
+/// acts on it (3c) must never disagree about that.
+fn names_me(ev: &RoomEvent, cfg: &PolicyConfig, cues: &Cues<'_>) -> Option<String> {
+    if !cfg.reply_to_names {
+        return None;
+    }
+    cues.names
+        .addresses_me(&ev.body, cfg.bare_name_addresses)
+        .map(|address| format!("{}, {}", address.matched, address.form.as_str()))
+}
+
 /// Decide whether to answer `ev`, and say why.
 #[must_use]
 pub fn should_reply<S: std::hash::BuildHasher>(
@@ -194,6 +212,7 @@ pub fn should_reply<S: std::hash::BuildHasher>(
     }
 
     // (2) Bot-to-bot switch.
+    let mut bot_note: Option<String> = None;
     if ev.is_bot {
         match cfg.bot_to_bot {
             BotToBot::None => {
@@ -204,11 +223,24 @@ pub fn should_reply<S: std::hash::BuildHasher>(
                 );
             }
             BotToBot::Mentions if !ev.mentions.contains(me) => {
-                return Decision::new(
-                    Verdict::Silent,
-                    format!("bot_to_bot=mentions: bot {} did not mention me", ev.sender),
-                    false,
-                );
+                // A model cannot make a Matrix mention. It writes "@qwen", or
+                // "Qwen, what do you think?", and both arrive as plain text -
+                // so `mentions` reading `m.mentions` alone made every OTHER
+                // agent unreachable by construction (the room log, 2026-09-04:
+                // every bot-to-bot line refused as "did not mention me"). A
+                // name typed by a bot is the same address it is when a person
+                // types it, and it is read by the same code.
+                let Some(named) = names_me(ev, cfg, cues) else {
+                    return Decision::new(
+                        Verdict::Silent,
+                        format!("bot_to_bot=mentions: bot {} did not mention me", ev.sender),
+                        false,
+                    );
+                };
+                bot_note = Some(format!(
+                    "bot_to_bot=mentions: bot {} named me ({named})",
+                    ev.sender
+                ));
             }
             _ => {}
         }
@@ -254,6 +286,13 @@ pub fn should_reply<S: std::hash::BuildHasher>(
     };
     let Some(addressed) = addressed else {
         return unaddressed(ev, ledger, cfg, cues);
+    };
+    // The guard that let this bot in says so in the same line as the arm that
+    // decided, because "another agent typed my name" is the thing an operator
+    // is looking for in the log when they ask why the two of them are talking.
+    let addressed = match bot_note {
+        Some(note) => format!("{note}, {addressed}"),
+        None => addressed,
     };
 
     // (4) Budgets. Checked last so the log says what was refused and why. The
@@ -358,12 +397,30 @@ fn unaddressed(ev: &RoomEvent, ledger: &Ledger, cfg: &PolicyConfig, cues: &Cues<
         return quiet("unaddressed: answer_unaddressed is off".to_owned());
     }
     if ev.is_bot {
-        // Bots never trigger tier 2. Two agents that answer each other's
-        // unaddressed lines are a loop with no human in it.
-        return quiet(format!(
-            "unaddressed: tier 2 never triggers on a bot ({})",
-            ev.sender
-        ));
+        if !cfg.bot_to_bot.tier2_on_bots() {
+            // Bots never trigger tier 2. Two agents that answer each other's
+            // unaddressed lines are a loop with no human in it - unless the
+            // operator has asked for exactly that (`bot_to_bot:
+            // conversational`), which is the one mode that lets two agents
+            // talk to each other the way they talk to people.
+            return quiet(format!(
+                "unaddressed: tier 2 never triggers on a bot ({})",
+                ev.sender
+            ));
+        }
+        // The bounds that make a bot-to-bot conversation a conversation and
+        // not a runaway. They are the same two the addressed path spends
+        // below, checked here as well because this path never reaches it: a
+        // loop that ping-pongs through tier 2 is still a loop.
+        let now = ledger.now();
+        let pair = ledger.pair_allows(&ev.sender, now);
+        if !pair.allowed {
+            return quiet(format!("unaddressed: {}", pair.reason));
+        }
+        let thread = ledger.thread_allows(ev.thread_root_or_self());
+        if !thread.allowed {
+            return quiet(format!("unaddressed: {}", thread.reason));
+        }
     }
     let energy = ledger.energy_allows(ev.thread_root_or_self());
     if !energy.allowed {
@@ -672,6 +729,165 @@ mod tests {
             "{}",
             decision.reason
         );
+    }
+
+    #[test]
+    fn a_bot_that_types_my_name_has_addressed_me() {
+        // No model can make a Matrix mention. The friend's agent wrote "@Qwen"
+        // and ours answered "bot ... did not mention me" to every line of it
+        // (the room log, 2026-09-04) - so `mentions` reads the body for my name
+        // exactly as tier 1 does, and by the same code.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let mut cfg = policy();
+        cfg.bot_to_bot = BotToBot::Mentions;
+
+        let typed = event(bot(EventSpec {
+            body: "hello bot-a, nice to meet you".to_owned(),
+            ..EventSpec::default()
+        }));
+        assert!(
+            typed.mentions.is_empty(),
+            "the point of this line is that it carries no m.mentions"
+        );
+        let answered = decide_named(&typed, &led, &cfg);
+        assert_eq!(answered.verdict, Verdict::Reply);
+        assert!(
+            answered
+                .reason
+                .contains("bot_to_bot=mentions: bot @bot-b:example.com named me (bot-a, leading)"),
+            "the guard that let it in has to say so: {}",
+            answered.reason
+        );
+        assert!(
+            answered.reason.contains("named in the body"),
+            "and so does the arm that decided: {}",
+            answered.reason
+        );
+
+        // Somebody ELSE's name in a bot's line is still not mine.
+        let theirs = event(bot(EventSpec {
+            body: "alex, what do you think?".to_owned(),
+            ..EventSpec::default()
+        }));
+        let refused = decide_named(&theirs, &led, &cfg);
+        assert_eq!(refused.verdict, Verdict::Silent);
+        assert!(
+            refused.reason.contains("did not mention me"),
+            "{}",
+            refused.reason
+        );
+
+        // `none` is none: a name changes nothing about a mode that says no.
+        cfg.bot_to_bot = BotToBot::None;
+        let never = decide_named(&typed, &led, &cfg);
+        assert_eq!(never.verdict, Verdict::Silent);
+        assert!(never.reason.contains("bot_to_bot=none"), "{}", never.reason);
+
+        // And an operator who turned the body off has turned it off here too.
+        cfg.bot_to_bot = BotToBot::Mentions;
+        cfg.reply_to_names = false;
+        assert!(
+            decide_named(&typed, &led, &cfg)
+                .reason
+                .contains("did not mention me")
+        );
+    }
+
+    #[test]
+    fn only_conversational_lets_a_bots_unaddressed_line_reach_tier_two() {
+        // The whole difference between the modes, in one line nobody addressed.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let chatting = event(bot(EventSpec {
+            body: "the deploy finished about an hour ago".to_owned(),
+            ..EventSpec::default()
+        }));
+        let mut cfg = policy();
+
+        for mode in [BotToBot::Mentions, BotToBot::All] {
+            cfg.bot_to_bot = mode;
+            let refused = decide_named(&chatting, &led, &cfg);
+            assert_eq!(refused.verdict, Verdict::Silent, "{mode:?}");
+            assert!(
+                !refused.reason.contains("tier 2 candidate"),
+                "{mode:?} let a bot's line reach tier 2: {}",
+                refused.reason
+            );
+        }
+        // `all` is the one that gets as far as the unaddressed guard, and is
+        // refused BY it rather than by the switch.
+        cfg.bot_to_bot = BotToBot::All;
+        assert!(
+            decide_named(&chatting, &led, &cfg)
+                .reason
+                .contains("tier 2 never triggers on a bot")
+        );
+
+        cfg.bot_to_bot = BotToBot::Conversational;
+        let considered = decide_named(&chatting, &led, &cfg);
+        assert_eq!(considered.verdict, Verdict::Consider);
+        assert!(considered.unaddressed);
+        assert!(
+            considered.reason.contains("tier 2 candidate"),
+            "{}",
+            considered.reason
+        );
+    }
+
+    #[test]
+    fn a_conversation_between_bots_still_answers_to_the_loop_bounds() {
+        // Tier 2 on a bot's line is a new way into the room, so it takes the
+        // same bounds the addressed path spends: the pair budget, the thread
+        // cap and the thread's energy. Without them, `conversational` would be
+        // two agents with a fresh licence to ping-pong.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        let mut cfg = policy();
+        cfg.bot_to_bot = BotToBot::Conversational;
+        let chatting = event(bot(EventSpec {
+            body: "and the build is green again".to_owned(),
+            ..EventSpec::default()
+        }));
+        assert_eq!(
+            decide_named(&chatting, &led, &cfg).verdict,
+            Verdict::Consider
+        );
+
+        // The pair budget: three answers to this bot inside a minute.
+        for i in 0..cfg.budgets.per_pair_per_minute {
+            led.record_post(&format!("$pair{i}"), "$other", OTHER_BOT, None, 2);
+        }
+        let spent = decide_named(&chatting, &led, &cfg);
+        assert_eq!(spent.verdict, Verdict::Silent);
+        assert!(spent.reason.contains("pair budget"), "{}", spent.reason);
+        assert!(spent.unaddressed, "it is still a line nobody addressed");
+
+        // The thread cap, on a fresh ledger so the pair budget is not what
+        // answers (a ledger is a file, and these two share a clock, not a
+        // state).
+        let capped = tempfile::tempdir().expect("tmpdir");
+        let mut led = ledger(capped.path(), &clock);
+        for i in 0..cfg.budgets.per_thread_max {
+            led.record_post(&format!("$thread{i}"), "$evt", HUMAN, None, 1);
+        }
+        let full = decide_named(&chatting, &led, &cfg);
+        assert_eq!(full.verdict, Verdict::Silent);
+        assert!(full.reason.contains("thread budget"), "{}", full.reason);
+
+        // And the energy: a thread that has run out stops taking new lines
+        // from bots at all, which is what winds a bot-only exchange down.
+        let flat_dir = tempfile::tempdir().expect("tmpdir");
+        let mut led = ledger(flat_dir.path(), &clock);
+        for _ in 0..cfg.budgets.bot_only_turns_before_decay {
+            led.note_event("$evt", true);
+        }
+        let flat = decide_named(&chatting, &led, &cfg);
+        assert_eq!(flat.verdict, Verdict::Silent);
+        assert!(flat.reason.contains("energy decay"), "{}", flat.reason);
     }
 
     #[test]
@@ -1446,11 +1662,11 @@ mod tests {
             &policy(),
         );
         assert_eq!(obvious.verdict, Verdict::Consider);
-        assert_eq!(obvious.prescore, 5);
+        assert_eq!(obvious.prescore, 8);
         assert_eq!(
             obvious.reason,
-            "unaddressed: tier 2 candidate (pre-score 5: question, asked of the room), short \
-             back-off"
+            "unaddressed: tier 2 candidate (pre-score 8: question, asked of the room, an \
+             invitation to the room), short back-off"
         );
 
         // Below the threshold nothing about the line changed: same verdict,

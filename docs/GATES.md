@@ -2241,3 +2241,114 @@ time out on real seconds, so nothing else may be building while they run.
 `make gate` on the same tree: **357 tests** (255 in the crate, 90 R4 commands, 8
 state-compat, 2 encrypted-room, the publish scrub and the knob-coverage gate),
 clippy pedantic clean with warnings as errors. `make lint-live`: clean, 13 files.
+
+# Two agents in one room (2026-09-04)
+
+The first day the room held two agents - ours and a friend's, with one person -
+and the log of it is the specification for this slice. Three separate things
+kept the two of them from ever speaking to each other, and each one is a gate
+below.
+
+1. **A model cannot make a Matrix mention.** The friend's agent wrote "@Qwen",
+   which is TEXT, so every bot-to-bot line was refused with
+   `bot_to_bot=mentions: bot ... did not mention me`. `mentions` now reads the
+   body for names as well - the same vocative tier 1 has read since the day
+   before, gated on the same `reply_to_names`.
+2. **"tier 2 never triggers on a bot"** sealed what was left: allocation
+   impossible, self-selection forbidden, nothing either agent said reachable by
+   the other. `bot_to_bot: conversational` (new, not the default) lifts that one
+   rule and nothing else.
+3. **The judge was asked a yes/no question.** "you should just talk amongst
+   yourselves" reached it as an ordinary unaddressed line and it answered *"no:
+   the conversation has naturally settled"*. It is now asked for an enthusiasm,
+   0-9, and the connector decides where the line falls.
+
+## Unit gates, 2026-09-04
+
+`make gate`: **372 tests** (270 in the crate, 90 R4 commands, 8 state-compat,
+the publish scrub and the knob-coverage gate), clippy pedantic clean with
+warnings as errors, `cargo fmt --check` clean, no `unwrap()` outside tests.
+`make lint-live`: clean, 14 files.
+`cargo test --test knob_coverage`: **80 knobs in the schema, 80 turned off their
+default by a test** (75 before this slice; the five new ones are
+`policy.speak_threshold`, `policy.chattiness`, `policy.small_room_backoff`,
+`brain.echo.name_back` and `brain.echo.score`).
+
+| Guard | Gate |
+|---|---|
+| a bot's TYPED name satisfies `mentions`, and the log says which guard let it in | `policy::a_bot_that_types_my_name_has_addressed_me` - the exact reason (`bot_to_bot=mentions: bot @bot-b:example.com named me (bot-a, leading), named in the body (...)`), plus somebody else's name still refused, `none` still none, and `reply_to_names: false` turning it off for bots as well |
+| only `conversational` lets a bot's unaddressed line reach tier 2 | `policy::only_conversational_lets_a_bots_unaddressed_line_reach_tier_two` - `mentions` refused at the switch, `all` refused by the unaddressed guard itself (`tier 2 never triggers on a bot`), `conversational` reaching `consider` |
+| a bot-to-bot conversation still answers to the loop bounds | `policy::a_conversation_between_bots_still_answers_to_the_loop_bounds` - the pair budget, the per-thread cap and the energy decay, each on the TIER-2 path, where a bot never used to get |
+| the judge's answer is read strictly, and anything else is 0 | `judging::a_scored_line_is_read_as_written`, `the_score_is_case_insensitive_and_takes_the_first_real_line`, `anything_that_is_not_a_score_is_a_zero` (10 rows: off-scale, decimal, the old `yes:`/`no:` contract, markdown, prose, nothing at all) |
+| the threshold is the connector's, not the model's | `judging::the_threshold_is_what_turns_a_score_into_a_verdict` - one answer, three agents; and 10 = never, 0 = always |
+| the log line says the score and what it was measured against | `judging::the_log_line_says_the_score_and_what_it_was_measured_against` |
+| every occasion asks for the same scale | `judging::every_question_ends_on_the_same_scale` |
+| the judge is told what is free to know | `judging::the_judge_is_told_what_is_free_to_know_about_the_room` - question, room-addressed, sender, whether I took part, room size; and `an_unprompted_occasion_is_told_the_room_size_and_nothing_about_the_last_line`, because an impulse's trigger is an anchor and nobody is waiting on it |
+| `chattiness` shifts the threshold and cannot push it off the scale | `config::chattiness_shifts_the_threshold_and_never_off_the_scale`, plus the three configurations the schema refuses |
+| what hands the turn to the ROOM, and what does not | `addressing::the_lines_that_hand_the_turn_to_the_room_and_the_ones_that_do_not` - 14 invitations against 8 lines that are unaddressed but not invitations ("I talked to alex about it yesterday", "everyones-bot is down") |
+| the invitation is worth three points of pre-score | `addressing::the_pre_score_reads_the_cues_that_are_free_to_read` - 12 rows now, including both lines from the room log |
+| a small room draws from a shorter back-off | `connector::unprompted::a_small_room_draws_from_a_shorter_back_off` - a quarter at three and at two, all of it from six, the hazard still multiplying, the knob off, an unmeasured room unchanged, and the pre-scored fast path untouched |
+| the typed name an echo bot writes is an address and never a mention | `echo::name_back_is_a_vocative_and_carries_no_user_id` - the product's own `mentioned_user_ids` finds nothing in it, and the product's own `Names::addresses_me` finds an address |
+| the harness's markers never reach the room | `echo::the_markers_never_reach_the_room` |
+| the echo judge answers either side of the threshold | `echo::a_scored_marker_answers_either_side_of_the_threshold`, `a_configured_score_is_what_an_unmarked_line_gets` |
+
+## Live gates C-1, C-2 and C-3, 2026-09-04
+
+`tests/live/test_conversation.py`. NOT the Claude-brain gates C1-C3: these are
+the hyphenated conversation gates, they spend no quota, and they run on the echo
+brain like every other S3 journey.
+
+| Gate | Journey | Guard it protects |
+|---|---|---|
+| C-1 | Two connectors on `bot_to_bot: conversational` with disjoint back-offs ([1,3] and [8,11]) and `name_back` naming each other. The human posts "you two, talk amongst yourselves about the weather" - unaddressed, room-addressed. Both agents are talking within 30 s: the faster one answers the human (mentioning only the human) and NAMES the other, which is what draws the other in (`named in the body` in its log). The exchange runs to at least four posts, every one of them addressing the other by name, stops inside the decay ceiling, stays stopped for 30 s, and the loser of the invitation stands down. Then connector A is stopped and its ACCOUNT posts a line naming nobody: B reaches `verdict=consider (unaddressed: tier 2 candidate ...)` on it and answers | `policy::unaddressed`'s `conversational` arm, `ledger::energy_allows`, and the whole path a bot's line takes into tier 2 |
+| C-2 | The same agent ACCOUNT, with no connector behind it, posts an `m.notice` reading "Hello <name>, nice to meet you" - no `m.mentions` anywhere, which is what a model's output actually looks like. A connector on the shipped `bot_to_bot: mentions` answers within 30 s, with `bot_to_bot=mentions: bot ... named me` and `named in the body` in its log and no tier-2 candidate | the bot-to-bot switch's name arm (`policy::names_me`) |
+| C-3 | The same account posts `[[speak]] just thinking out loud about the weather` - names nobody. Under `mentions` the connector is silent, its log says `did not mention me`, and `tier 2 candidate` never appears. Then the human posts the same shape of line and it IS answered | the name arm being a name CHECK: a guard that let every bot line through would pass C-2 |
+
+C-3 carries `[[speak]]`, so a connector that let that line reach tier 2 would
+answer it; C-2 carries none, so a connector that fell through to tier 2 would
+score 0 and stay quiet. Neither gate can be satisfied by the judge happening to
+agree.
+
+**The live run, 2026-09-04** (`AGENT_ROOM_LIVE=1
+AGENT_ROOM_BIN=target/release/agent-room pytest -q tests/live/test_addressing.py
+tests/live/test_conversation.py`): **7 passed in 191.2 s** - N1 4.2 s, N2 24.8
+s, N3 61.4 s, N4 25.2 s, **C-1 42.1 s, C-2 3.8 s, C-3 23.9 s**. And the tier-2
+gates, which every part of this slice moves (the judge contract, the back-off
+range, the marker stripping): `pytest -q tests/live/test_tier2.py` - **4 passed
+in 225.1 s**, G5 53.6 s, G6 80.4 s, G7 23.7 s, G8 63.8 s.
+
+## Teeth run, 2026-09-04
+
+One mutation at a time in `src/`, rebuilt, and only the gate that guard protects
+run against it (`tests/live/teeth.py`). All eight failed with their guard
+removed.
+
+| Gate | Guard removed | Result | Time |
+|---|---|---|---|
+| C-1 | `policy::unaddressed`: no mode ever lets a bot's line reach tier 2 (`if true`) | FAILED - "B never joined in on another agent's unaddressed line - which is the whole of what `bot_to_bot: conversational` is for" | 120 s |
+| C-2 | `policy`: the bot-to-bot name arm, so a typed name never counts | FAILED - the greeting was refused and nothing was posted | 123 s |
+| C-3 | `policy`: the same arm made vacuous (`.or(Some("TEETH"))`), so every bot line gets in | FAILED - the log said `tier 2 never triggers on a bot` instead of `did not mention me`: the switch had stopped being a name check | 103 s |
+| U19 | the name arm again, offline | FAILED - `a_bot_that_types_my_name_has_addressed_me` | 91 s |
+| U20 | `conversational` opens nothing, offline | FAILED - `only_conversational_lets_a_bots_unaddressed_line_reach_tier_two` | 89 s |
+| U21 | `judging::SCORE_LINE`: the digit's boundary dropped, so `score: 10` reads as 1 | FAILED - `anything_that_is_not_a_score_is_a_zero` | 89 s |
+| U22 | `unprompted::room_factor`: every room is a crowd | FAILED - `a_small_room_draws_from_a_shorter_back_off` | 93 s |
+| U23 | `addressing::addresses_room`: nothing is ever an invitation | FAILED - `the_lines_that_hand_the_turn_to_the_room_and_the_ones_that_do_not` | 105 s |
+
+C-1's mutant is the one worth reading twice, because the ROOM under it looks
+almost right: the human's invitation is still taken up, the two agents still
+talk to each other by name, and the thread still winds down - all of that is
+tier 1 and the mutation does not touch it. What disappears is the last phase,
+where one connector is stopped and its account says something to nobody in
+particular: under `mentions` that line is refused at the switch, and under the
+mutant it is refused at the unaddressed guard, and either way nobody answers it.
+The gate was written with that phase in it precisely because the rest of the
+journey passes without the guard. Re-run by hand against the same mutant to
+pin the assertion: `assert 3 == (3 + 1)` at "B never joined in", 80.9 s.
+
+### A defect the teeth run found in itself
+
+`teeth.py` built the mutant BEFORE its `try`/`finally`, so a mutation that did
+not compile - U21's first cut put a `// TEETH` comment inside a function call -
+raised `SystemExit` with the broken Rust still in `src/`. The next thing anybody
+does after a teeth run is build. Fixed: the build is wrapped, and a failed one
+restores the file before it re-raises.
