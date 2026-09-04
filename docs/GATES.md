@@ -1779,13 +1779,51 @@ U11 and U12 are the first entries in `teeth.py` that run the crate's OWN unit
 tests (`cargo test --lib`) rather than an integration binary; the runner grew a
 `cargo_lib` flag for it.
 
+## Live teeth run, 2026-09-04
+
+| Gate | Guard removed | Result | Time |
+|---|---|---|---|
+| N1 | `policy::read_names`: my own name never counts (`.filter(\|_\| false)` on `addresses_me`) | FAILED - the room stayed silent for the full 30 s deadline: the line went to tier 2 and its judge said no | 113 s |
+| N2 | `policy::read_names`: somebody else's name never counts (the same on `addresses_other`) | FAILED - the agent answered a line addressed to somebody else, inside the 20 s silence | 109 s |
+| N4 | the same mutation, with both agents in the room | FAILED - "the other agent kept quiet for some other reason": its log said `tier 2 candidate`, not `addressed to ..., not me` | 110 s |
+
+### Gate defect the teeth run found: N4 passed its own mutant
+
+The first cut of N4 asserted only that the room saw one answer, that the quiet
+agent's log contained `not me`, and that it never asked its judge. All three
+held with 3d removed, and the run recorded **PASSED (BAD)** in 106 s. Two
+separate reasons, both worth writing down:
+
+1. **The room cannot tell the two silences apart.** Without 3d the un-named
+   agent reaches tier 2, draws its back-off, re-reads the room, finds the answer
+   already posted and stands down - G5's mechanism, doing its job. The room
+   looks identical either way, and the judge is never reached either, so
+   "no `speak=` line" holds as well. Only the LOG can say whether the line was
+   never the agent's or whether it merely lost the race.
+2. **`not me` is a substring of `did not mention me`.** The `bot_to_bot=mentions`
+   refusal - which that agent logs for the other's echo reply seconds later -
+   contains it, so the assertion matched a completely different guard.
+
+Both are fixed in the gate rather than worked around: it now asserts the
+unambiguous `, not me` WITH its comma, and that the phrase `tier 2 candidate`
+never appears in that agent's log at all, which is the thing that is only true
+when 3d decided the line. N2 gained the same two assertions. Re-run above: both
+mutants now fail.
+
+The lesson is the one the house rule already says and this is the second time
+this repository has paid for: a gate whose failure mode is "some other guard
+produced the same visible outcome" is not a gate until a mutant has been run
+against it. It is also an argument for asserting on the reason STRINGS rather
+than on the shape of the room - which is why `policy.rs` unit-tests those
+strings.
+
 ## The gates that were re-run because the policy moved, 2026-09-04
 
 Two guards were inserted into `should_reply`, so the tier-2 gates that run
 through it were re-run on the same binary:
 `AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room pytest -q
-tests/live/test_tier2.py` - **4 passed in 225.1 s**: G5 51.6 s, G6 81.8 s, G7
-25.3 s, G8 62.3 s. Nothing in them changed except the two lines noted below.
+tests/live/test_tier2.py` - **4 passed in 231.6 s**: G5 58.1 s, G6 83.4 s, G7
+23.7 s, G8 62.3 s. Nothing in them changed except the two lines noted below.
 
 ## What the harness gained, and why
 
@@ -1820,7 +1858,7 @@ several agents in it from answering the same question three times. A gate for
 
 ## Unit gates, 2026-09-04
 
-`make gate`: 326 tests (228 in the crate, 87 R4 commands, 8 state-compat, 2
+`make gate`: 328 tests (228 in the crate, 89 R4 commands, 8 state-compat, 2
 encrypted-room and the publish scrub), clippy pedantic clean with warnings as
 errors, no `unwrap()` outside tests. `make lint-live`: clean, 13 files.
 
@@ -1875,9 +1913,10 @@ N3, the follow-up gate ("I spoke last here 41 s ago"), belongs to the follow-up
 arm and is not built yet.
 
 Measured 2026-09-04 (`AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room
-pytest -q tests/live/test_addressing.py`): **3 passed in 67.3 s** - N1 6.4 s, N2
-27.3 s, N4 28.2 s. N1 is the shape of the whole change: six seconds, no model
-call at all, for a line that used to draw a 5-40 s back-off and then a judge.
+pytest -q tests/live/test_addressing.py`): **3 passed in 54.8 s** - N1 3.7 s, N2
+23.8 s, N4 26.4 s. N1 is the shape of the whole change: under four seconds, no
+model call at all, for a line that used to draw a 5-40 s back-off and then a
+judge on a model that can take minutes to load.
 
 ## What the harness gained, and why
 

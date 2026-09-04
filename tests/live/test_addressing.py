@@ -55,6 +55,9 @@ FAST_BACKOFF = [1.0, 3.0]
 SETTLE_S = 20.0
 #: The echo brain's judge says yes to anything carrying this.
 SPEAK = "[[speak]]"
+#: The reason `policy::unaddressed` gives a line nobody addressed. Its ABSENCE
+#: is what says the name guards decided a line rather than tier 2.
+TIER_2 = "tier 2 candidate"
 
 
 def named_policy(**extra: Any) -> dict[str, Any]:
@@ -133,7 +136,11 @@ async def test_n2_a_name_that_is_not_mine_is_somebody_elses_turn(
     events = await messages(human, room_s3)
     assert by_sender(events, S3_BOT_A) == [], "the agent answered a line addressed to somebody else"
     log = bot.log_text()
-    assert "addressed to" in log and "not me" in log, "some other guard kept it quiet"
+    # ", not me" with the comma, never the bare "not me": "did not mention me"
+    # contains that, and a gate that matched it would report the bot_to_bot
+    # guard as this one (found by the N4 teeth run, 2026-09-04).
+    assert "addressed to" in log and ", not me" in log, "some other guard kept it quiet"
+    assert TIER_2 not in log, "the line reached tier 2 instead of being decided at once"
     assert not judged(bot), "a line addressed to somebody else must cost nothing"
 
     # Silence proves nothing unless it was alive to break it.
@@ -152,9 +159,12 @@ async def test_n4_two_agents_one_name_and_exactly_one_answer(
     """N4: both agents in the room, one of them named. Exactly one answers, and
     the other says in its own log that the line was somebody else's.
 
-    `[[speak]]` again: without the guard both agents answer - the named one on
-    tier 1, the other one on tier 2 with its judge saying yes - which is the
-    pile-on the guard exists to stop.
+    `[[speak]]` again, so the un-named agent's own judge would say yes if it
+    ever got that far. What it must NOT do is get that far: the room is only
+    half the gate here, because a tier-2 back-off followed by the stand-down
+    re-read produces the same silence for a completely different reason. The
+    log is the other half, and it is what tells "that line was not mine" apart
+    from "somebody beat me to it".
     """
     connectors = {}
     for name in (S3_BOT_A_NAME, S3_BOT_B_NAME):
@@ -175,6 +185,16 @@ async def test_n4_two_agents_one_name_and_exactly_one_answer(
     assert len(by_sender(events, S3_BOT_A)) == 1, "the named agent answered more than once"
     assert by_sender(events, S3_BOT_B) == [], "both agents answered a line naming one of them"
 
-    quiet = connectors[S3_BOT_B_NAME]
-    assert "not me" in quiet.log_text(), "the other agent kept quiet for some other reason"
-    assert not judged(quiet), "the other agent paid for a judge call it did not need"
+    quiet = connectors[S3_BOT_B_NAME].log_text()
+    assert "addressed to" in quiet and ", not me" in quiet, (
+        "the other agent kept quiet for some other reason"
+    )
+    # The one that gives this gate teeth. Without the guard the other agent
+    # reaches tier 2, draws its back-off, re-reads the room, finds the answer
+    # that is already there and stands down - so the ROOM looks the same and
+    # only the log can tell "that line was not mine" from "somebody beat me to
+    # it" (measured 2026-09-04: the first cut of this gate passed its mutant).
+    assert TIER_2 not in quiet, "the other agent went to tier 2: 3d did not decide it"
+    assert not judged(connectors[S3_BOT_B_NAME]), (
+        "the other agent paid for a judge call it did not need"
+    )
