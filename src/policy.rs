@@ -18,13 +18,15 @@
 //!
 //! Two of the guards read the message BODY, and only for names ([`crate::addressing`]):
 //! a vocative of one of my names is an invitation, and a vocative of somebody
-//! else's is an instruction to stay out of it. Everything they need arrives in
-//! [`Cues`], so the decision stays a pure function of the event, the ledger and
-//! what the room is called.
+//! else's is an instruction to stay out of it. A third reads it for nothing but
+//! a pre-score, which decides no verdict at all - only how long tier 2 waits
+//! before asking the judge. Everything they need arrives in [`Cues`], so the
+//! decision stays a pure function of the event, the ledger and what the room is
+//! called.
 
 use std::collections::HashSet;
 
-use crate::addressing::Names;
+use crate::addressing::{Names, pre_score};
 use crate::config::{BotToBot, PolicyConfig};
 use crate::events::RoomEvent;
 use crate::ledger::Ledger;
@@ -55,6 +57,10 @@ pub struct Decision {
     pub reason: String,
     /// True when nobody was talking to me. Tier 2 lives here.
     pub unaddressed: bool,
+    /// The free read of the body ([`crate::addressing::pre_score`]), and zero
+    /// everywhere it was never taken. It decides no verdict: all it changes is
+    /// how long tier 2 backs off before asking the judge.
+    pub prescore: u8,
 }
 
 impl Decision {
@@ -63,7 +69,13 @@ impl Decision {
             verdict,
             reason,
             unaddressed,
+            prescore: 0,
         }
+    }
+
+    fn with_prescore(mut self, prescore: u8) -> Self {
+        self.prescore = prescore;
+        self
     }
 
     /// True only for an unconditional tier-1 answer.
@@ -81,10 +93,9 @@ impl Decision {
 
 /// Who spoke last in one conversation, and when.
 ///
-/// Nothing sets this yet: it is what the follow-up guard (arm 3f, "I was the
-/// last speaker here and the human came back within the window") will be built
-/// on, and it lives here so that adding the guard changes one function rather
-/// than every call site.
+/// What arm 3f ("I was the last speaker here and the human came back within the
+/// window") is built on. Built from the transcript by the caller, because that
+/// is where the room's own order of events is; the guard here only reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LastSpeaker {
     pub sender: String,
@@ -103,7 +114,7 @@ pub struct LastSpeaker {
 pub struct Cues<'a> {
     /// What the people in this room are called.
     pub names: &'a Names,
-    /// Who spoke last here (arm 3f; always `None` today).
+    /// Who spoke last here (arm 3f). None when the room has no history yet.
     pub last_speaker: Option<LastSpeaker>,
 }
 
@@ -235,13 +246,14 @@ pub fn should_reply<S: std::hash::BuildHasher>(
                         ev.thread_root.as_deref().unwrap_or_default()
                     ))
                 } else {
-                    None
+                    // (3f) The human came straight back to something I said.
+                    follow_up(ev, me, ledger, cfg, cues)
                 }
             }
         }
     };
     let Some(addressed) = addressed else {
-        return unaddressed(ev, ledger, cfg);
+        return unaddressed(ev, ledger, cfg, cues);
     };
 
     // (4) Budgets. Checked last so the log says what was refused and why. The
@@ -282,12 +294,65 @@ pub fn should_reply<S: std::hash::BuildHasher>(
     Decision::new(Verdict::Reply, addressed, false)
 }
 
+/// Arm 3f: the human came straight back to something I said.
+///
+/// "and why is that?" is a whole turn in a conversation and it names nobody,
+/// quotes nothing and starts no thread, so every other guard reads it as a line
+/// thrown at the room. What makes it mine is that I am the one who spoke last
+/// here, and it arrived while that was still true. People take turns this way -
+/// the prior art calls it follow-up recognition, and it is the one turn
+/// allocation signal that is in the ORDER of the conversation rather than in
+/// its words.
+///
+/// Three things keep it from becoming a licence to answer everything:
+///
+/// - only a HUMAN line, because two agents following each other up is a loop
+///   with no human in it;
+/// - only inside `followup_window_s`, and `0` turns the arm off entirely;
+/// - and only when the LEDGER agrees I posted in that conversation: the
+///   transcript records what the room said, the ledger records what I sent.
+///
+/// Anybody else speaking in between defeats it by construction - the last
+/// speaker is then not me - and the budgets below still apply, because being
+/// answered is not the same as being owed an answer.
+fn follow_up(
+    ev: &RoomEvent,
+    me: &str,
+    ledger: &Ledger,
+    cfg: &PolicyConfig,
+    cues: &Cues<'_>,
+) -> Option<String> {
+    #[allow(clippy::cast_precision_loss)]
+    let window = cfg.followup_window_s as f64;
+    if window <= 0.0 || ev.is_bot {
+        return None;
+    }
+    let last = cues.last_speaker.as_ref()?;
+    if last.sender != me {
+        return None;
+    }
+    // Clock skew, not time travel: the transcript's ORDER is what says this
+    // event came afterwards, and the two timestamps are read off two clocks.
+    let dt = (ev.ts - last.ts).max(0.0);
+    if dt > window {
+        return None;
+    }
+    if !ledger
+        .posts
+        .iter()
+        .any(|post| post.thread_root == last.conversation)
+    {
+        return None;
+    }
+    Some(format!("follow-up: I spoke last here {dt:.0} s ago"))
+}
+
 /// Tier 2: nobody addressed me. May I even consider speaking?
 ///
 /// Order matters: the cheap, certain refusals come first, so an agent never
 /// draws a back-off, wakes up and calls a model only to find out it had no
 /// budget to speak anyway.
-fn unaddressed(ev: &RoomEvent, ledger: &Ledger, cfg: &PolicyConfig) -> Decision {
+fn unaddressed(ev: &RoomEvent, ledger: &Ledger, cfg: &PolicyConfig, cues: &Cues<'_>) -> Decision {
     let quiet = |reason: String| Decision::new(Verdict::Silent, reason, true);
     if !cfg.answer_unaddressed {
         return quiet("unaddressed: answer_unaddressed is off".to_owned());
@@ -313,11 +378,33 @@ fn unaddressed(ev: &RoomEvent, ledger: &Ledger, cfg: &PolicyConfig) -> Decision 
     if !tier2.allowed {
         return quiet(format!("unaddressed: {}", tier2.reason));
     }
+    // The free read of the line. It decides nothing - the judge still does,
+    // and the stand-down re-read still runs - but a question with "you" in it
+    // is one somebody is waiting on, and waiting forty seconds to start
+    // thinking about it is the difference between a conversation and a form.
+    let pre = pre_score(ev, cues, cfg);
+    if pre.score >= cfg.prescore_fast {
+        let cues = if pre.cues.is_empty() {
+            "nothing in particular".to_owned()
+        } else {
+            pre.listed()
+        };
+        return Decision::new(
+            Verdict::Consider,
+            format!(
+                "unaddressed: tier 2 candidate (pre-score {}: {cues}), short back-off",
+                pre.score
+            ),
+            true,
+        )
+        .with_prescore(pre.score);
+    }
     Decision::new(
         Verdict::Consider,
         "unaddressed: tier 2 candidate, backing off before I decide".to_owned(),
         true,
     )
+    .with_prescore(pre.score)
 }
 
 #[cfg(test)]
@@ -336,6 +423,12 @@ mod tests {
     const HUMAN: &str = "@human:example.com";
     const OTHER_BOT: &str = "@bot-b:example.com";
     const ROOM_ID: &str = "!room:example.com";
+    /// The homeserver timestamp every event built here carries, in seconds:
+    /// the follow-up arm measures against the EVENT's clock, not the ledger's.
+    const EVENT_TS: f64 = 1_700_000_000.0;
+    /// The conversation the follow-up tests speak in: the thread my answer to
+    /// the first question opened, which is what `record_post` stores.
+    const CONVERSATION: &str = "$conv";
 
     #[derive(Clone)]
     struct FakeClock(Arc<Mutex<f64>>);
@@ -459,6 +552,30 @@ mod tests {
             ..Cues::default()
         };
         should_reply(ev, ME, led, &led.thread_roots(), cfg, &cues)
+    }
+
+    /// The same decision, in a room where somebody spoke last (arm 3f).
+    fn decide_after(
+        ev: &RoomEvent,
+        led: &Ledger,
+        cfg: &PolicyConfig,
+        last: LastSpeaker,
+    ) -> Decision {
+        let names = room_names();
+        let cues = Cues {
+            names: &names,
+            last_speaker: Some(last),
+        };
+        should_reply(ev, ME, led, &led.thread_roots(), cfg, &cues)
+    }
+
+    /// `who` spoke `ago` seconds before the event under test, in `$conv`.
+    fn spoke_last(who: &str, ago: f64) -> LastSpeaker {
+        LastSpeaker {
+            sender: who.to_owned(),
+            ts: EVENT_TS - ago,
+            conversation: CONVERSATION.to_owned(),
+        }
     }
 
     /// Me, the other bot and the human, by the names a room would know them by.
@@ -1186,6 +1303,176 @@ mod tests {
             "{}",
             decision.reason
         );
+    }
+
+    // -- 3f: the follow-up, and the pre-score below it --------------------
+
+    #[test]
+    fn a_follow_up_within_the_window_is_mine_after_it_is_not() {
+        // The second half of a conversation: I answered, and the human came
+        // straight back with a line that names nobody and quotes nothing.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, HUMAN, None, 1);
+        let ev = event(EventSpec {
+            body: "and why is that?".to_owned(),
+            ..EventSpec::default()
+        });
+
+        let mine = decide_after(&ev, &led, &policy(), spoke_last(ME, 41.0));
+        assert_eq!(mine.verdict, Verdict::Reply);
+        assert_eq!(mine.reason, "follow-up: I spoke last here 41 s ago");
+        assert!(
+            !mine.needs_judge(),
+            "a follow-up is tier 1: no judge, no wait"
+        );
+        assert!(!mine.unaddressed);
+
+        // Past the window it is an ordinary line thrown at the room, which is
+        // what it looks like to every other guard.
+        let stale = decide_after(&ev, &led, &policy(), spoke_last(ME, 121.0));
+        assert_eq!(stale.verdict, Verdict::Consider);
+        assert!(stale.unaddressed);
+    }
+
+    #[test]
+    fn a_follow_up_is_broken_by_any_other_speaker() {
+        // Somebody else spoke in between, so the human was answering them and
+        // not me. There is no window in which that is my line.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, HUMAN, None, 1);
+        let ev = event(EventSpec {
+            body: "and why is that?".to_owned(),
+            ..EventSpec::default()
+        });
+        for other in [OTHER_BOT, HUMAN] {
+            let decision = decide_after(&ev, &led, &policy(), spoke_last(other, 5.0));
+            assert_eq!(decision.verdict, Verdict::Consider, "{other}");
+            assert!(decision.unaddressed, "{other}");
+        }
+
+        // I spoke last, but somewhere else: the ledger is the record of what I
+        // actually sent, and it has nothing in THIS conversation.
+        let elsewhere = LastSpeaker {
+            conversation: "$another".to_owned(),
+            ..spoke_last(ME, 5.0)
+        };
+        assert_eq!(
+            decide_after(&ev, &led, &policy(), elsewhere).verdict,
+            Verdict::Consider
+        );
+
+        // And a bot following up on my line is a loop with no human in it.
+        let mut cfg = policy();
+        cfg.bot_to_bot = BotToBot::All;
+        let from_a_bot = decide_after(
+            &event(bot(EventSpec {
+                body: "and why is that?".to_owned(),
+                ..EventSpec::default()
+            })),
+            &led,
+            &cfg,
+            spoke_last(ME, 5.0),
+        );
+        assert_eq!(from_a_bot.verdict, Verdict::Silent);
+        assert!(
+            from_a_bot.reason.contains("never triggers on a bot"),
+            "{}",
+            from_a_bot.reason
+        );
+    }
+
+    #[test]
+    fn followup_window_zero_turns_the_arm_off() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, HUMAN, None, 1);
+        let ev = event(EventSpec {
+            body: "and why is that?".to_owned(),
+            ..EventSpec::default()
+        });
+        let mut cfg = policy();
+        cfg.followup_window_s = 0;
+        let decision = decide_after(&ev, &led, &cfg, spoke_last(ME, 1.0));
+        assert_eq!(
+            decision.verdict,
+            Verdict::Consider,
+            "with the window off the line is tier 2's, {}",
+            decision.reason
+        );
+        assert!(decision.unaddressed);
+    }
+
+    #[test]
+    fn guard_order_other_vocative_before_the_follow_up() {
+        // 3f sits AFTER 3d: a line naming somebody else, arriving right after I
+        // spoke, is still theirs. The follow-up window is not a way round the
+        // one guard that keeps several agents off one line.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, HUMAN, None, 1);
+        let theirs = decide_after(
+            &event(EventSpec {
+                body: "alex, what do you think?".to_owned(),
+                ..EventSpec::default()
+            }),
+            &led,
+            &policy(),
+            spoke_last(ME, 5.0),
+        );
+        assert_eq!(theirs.verdict, Verdict::Silent);
+        assert!(theirs.reason.contains(", not me"), "{}", theirs.reason);
+    }
+
+    #[test]
+    fn a_pre_scored_line_says_so_and_takes_the_short_back_off() {
+        // Nothing here decides to speak - the verdict is `consider` either way
+        // and the judge still answers it. What the pre-score changes is the
+        // reason string the log carries and the back-off drawn from it.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let obvious = decide_named(
+            &event(EventSpec {
+                body: "does anyone know why the build is red?".to_owned(),
+                ..EventSpec::default()
+            }),
+            &led,
+            &policy(),
+        );
+        assert_eq!(obvious.verdict, Verdict::Consider);
+        assert_eq!(obvious.prescore, 5);
+        assert_eq!(
+            obvious.reason,
+            "unaddressed: tier 2 candidate (pre-score 5: question, asked of the room), short \
+             back-off"
+        );
+
+        // Below the threshold nothing about the line changed: same verdict,
+        // same reason as every unaddressed line before the pre-score existed.
+        let flat = event(EventSpec {
+            body: "the build finished".to_owned(),
+            ..EventSpec::default()
+        });
+        let quiet = decide_named(&flat, &led, &policy());
+        assert_eq!(quiet.verdict, Verdict::Consider);
+        assert_eq!(quiet.prescore, 0);
+        assert_eq!(
+            quiet.reason,
+            "unaddressed: tier 2 candidate, backing off before I decide"
+        );
+
+        // ... and a topic is worth two points without reaching the threshold.
+        let cfg = PolicyConfig {
+            topics: vec!["build".to_owned()],
+            ..policy()
+        };
+        assert_eq!(decide_named(&flat, &led, &cfg).prescore, 2);
     }
 
     #[test]

@@ -18,7 +18,11 @@
 //!   request per keystroke burst.
 //! - `judge_base_url` / `judge_model` / `judge_api_key` / `judge_extra_body`:
 //!   the judge runs somewhere else entirely - a small resident model - so the
-//!   big one is only ever loaded to actually speak.
+//!   big one is only ever loaded to actually speak. Such a judge gets its own,
+//!   much shorter timeout (`judge_timeout_s`, or 30 s worked out from the shape
+//!   of the config): waiting a cold start for "is there anything here worth
+//!   saying?" is minutes of silence over a question the answer to which is
+//!   usually no.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,7 +195,19 @@ impl OpenAiCompatBrain {
         merge(payload, &self.cfg.extra_body)
     }
 
-    async fn post(&self, payload: &Value, url: &str, judge: bool) -> Option<String> {
+    /// One request, with the timeout the CALLER decides.
+    ///
+    /// The timeout is a parameter rather than one number on the config because
+    /// the two calls are not the same call: a reply is worth waiting a cold
+    /// start for, and a judge asking "is there anything here worth saying?" is
+    /// not - see [`OpenAiCompatBrainConfig::resolved_judge_timeout`].
+    async fn post(
+        &self,
+        payload: &Value,
+        url: &str,
+        judge: bool,
+        timeout_s: f64,
+    ) -> Option<String> {
         let api_key = if judge {
             self.cfg.resolved_judge_api_key()
         } else {
@@ -200,7 +216,7 @@ impl OpenAiCompatBrain {
         let mut request = self
             .http
             .post(url)
-            .timeout(Duration::from_secs_f64(self.cfg.cold_start_timeout_s))
+            .timeout(Duration::from_secs_f64(timeout_s))
             .json(payload);
         if !api_key.is_empty() {
             request = request.bearer_auth(api_key);
@@ -208,10 +224,7 @@ impl OpenAiCompatBrain {
         let response = match request.send().await {
             Ok(response) => response,
             Err(exc) if exc.is_timeout() => {
-                error!(
-                    "brain {url} timed out after {:.0} s (cold start?)",
-                    self.cfg.cold_start_timeout_s
-                );
+                error!("brain {url} timed out after {timeout_s:.0} s (cold start?)");
                 return None;
             }
             Err(exc) => {
@@ -289,12 +302,23 @@ impl OpenAiCompatBrain {
 #[async_trait]
 impl Brain for OpenAiCompatBrain {
     async fn reply(&self, ctx: &BrainContext) -> Option<String> {
-        self.post(&self.build_payload(ctx), &self.url, false).await
+        self.post(
+            &self.build_payload(ctx),
+            &self.url,
+            false,
+            self.cfg.cold_start_timeout_s,
+        )
+        .await
     }
 
     async fn judge(&self, ctx: &BrainContext) -> Judgement {
         let answer = self
-            .post(&self.build_judge_payload(ctx), &self.judge_url, true)
+            .post(
+                &self.build_judge_payload(ctx),
+                &self.judge_url,
+                true,
+                self.cfg.resolved_judge_timeout(),
+            )
             .await;
         let judgement = parse_judgement(answer.as_deref());
         info!(
@@ -498,6 +522,7 @@ mod tests {
             judge_base_url: String::new(),
             judge_api_key: String::new(),
             judge_extra_body: BTreeMap::new(),
+            judge_timeout_s: 0,
             warm_on_intent: false,
             warm_cooldown_s: 120.0,
         }

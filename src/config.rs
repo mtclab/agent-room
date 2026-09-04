@@ -158,6 +158,13 @@ pub struct OpenAiCompatBrainConfig {
     /// server's 400.
     #[serde(default)]
     pub judge_extra_body: BTreeMap<String, Value>,
+    /// Request timeout for the JUDGE call, in whole seconds. 0 = work it out
+    /// (see [`Self::resolved_judge_timeout`]): a judge with an endpoint or a
+    /// model of its own is a small resident model, and giving it the reply
+    /// model's cold start means a room that stays quiet for minutes over a
+    /// question the judge would have answered in a second.
+    #[serde(default)]
+    pub judge_timeout_s: u64,
     /// On-demand models: fire one throwaway 1-token completion when a human
     /// starts typing, so the load happens while nobody is waiting.
     #[serde(default)]
@@ -165,6 +172,11 @@ pub struct OpenAiCompatBrainConfig {
     #[serde(default = "default_warm_cooldown")]
     pub warm_cooldown_s: f64,
 }
+
+/// What a judge with its own endpoint or its own model is given when
+/// `judge_timeout_s` is not set: long enough for a resident model to answer,
+/// short enough that no room is held open by a judge call.
+pub const RESIDENT_JUDGE_TIMEOUT_S: f64 = 30.0;
 
 fn default_cold_start() -> f64 {
     600.0
@@ -198,6 +210,7 @@ impl OpenAiCompatBrainConfig {
             judge_base_url: String::new(),
             judge_api_key: String::new(),
             judge_extra_body: BTreeMap::new(),
+            judge_timeout_s: 0,
             warm_on_intent: false,
             warm_cooldown_s: default_warm_cooldown(),
         }
@@ -234,6 +247,26 @@ impl OpenAiCompatBrainConfig {
         } else {
             self.judge_api_key.clone()
         }
+    }
+
+    /// How long to wait for the judge, in seconds.
+    ///
+    /// `judge_timeout_s` when it is set. Otherwise the shape of the config
+    /// answers it: a judge with an endpoint or a model of its own is a small
+    /// resident model that answers in a second or two, and giving it the reply
+    /// model's cold start turns "is there anything worth saying?" into minutes
+    /// of silence. A judge sharing the big model's endpoint AND model IS the
+    /// cold start, so it keeps the full timeout.
+    #[must_use]
+    pub fn resolved_judge_timeout(&self) -> f64 {
+        if self.judge_timeout_s > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            return self.judge_timeout_s as f64;
+        }
+        if self.judge_base_url.is_empty() && self.judge_model.is_empty() {
+            return self.cold_start_timeout_s;
+        }
+        RESIDENT_JUDGE_TIMEOUT_S
     }
 
     /// Request-body extras for the judge call.
@@ -554,9 +587,29 @@ pub struct PolicyConfig {
     /// a line that also says "you" is talk TO them.
     #[serde(default)]
     pub bare_name_addresses: bool,
+    /// Tier 1, arm 3f: a human line that lands this soon after MY last message
+    /// in the same conversation is a follow-up to it ("and why is that?"), and
+    /// is answered as if it had named me. 0 = off.
+    #[serde(default = "default_followup_window")]
+    pub followup_window_s: u64,
     /// Tier 2: may I answer a human message that addressed nobody?
     #[serde(default = "yes")]
     pub answer_unaddressed: bool,
+    /// What this agent is FOR, in words that appear in chat ("deploys",
+    /// "postgres"). One of them in an unaddressed line is worth two points of
+    /// pre-score - it says nothing about whether the line is worth answering,
+    /// only that this agent is the likely answerer, so the wait before asking
+    /// the judge is shorter. Empty by default: an agent with no subject waits
+    /// like everybody else.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// The pre-score at which an unaddressed line takes the SHORT back-off
+    /// (`backoff_s.0` to `backoff_s.0` + 5 s, and no timing hazard) instead of
+    /// the full one. The judge still decides; this only changes how long
+    /// somebody waits to find out. 0 means every unaddressed line is in a
+    /// hurry, which is not the same thing as off.
+    #[serde(default = "default_prescore_fast")]
+    pub prescore_fast: u8,
     #[serde(default = "default_backoff")]
     pub backoff_s: (f64, f64),
     #[serde(default)]
@@ -592,6 +645,12 @@ fn yes() -> bool {
 fn default_backoff() -> (f64, f64) {
     (5.0, 40.0)
 }
+fn default_followup_window() -> u64 {
+    120
+}
+fn default_prescore_fast() -> u8 {
+    4
+}
 fn default_presence_window() -> i64 {
     30
 }
@@ -620,7 +679,10 @@ impl Default for PolicyConfig {
             addressed_names: Vec::new(),
             other_names_from_members: true,
             bare_name_addresses: false,
+            followup_window_s: default_followup_window(),
             answer_unaddressed: true,
+            topics: Vec::new(),
+            prescore_fast: default_prescore_fast(),
             backoff_s: default_backoff(),
             heartbeat_minutes: 0,
             presence_window_min: default_presence_window(),
@@ -681,6 +743,14 @@ impl PolicyConfig {
                     "policy.addressed_names {name:?} must be at least {MIN_NAME_CHARS} \
                      characters: a shorter name would match syllables in the middle of words"
                 )));
+            }
+        }
+        for topic in &self.topics {
+            if topic.trim().is_empty() {
+                return Err(ConfigError::msg(
+                    "policy.topics cannot contain an empty word: it would match every line \
+                     and put every message in a hurry",
+                ));
             }
         }
         for pattern in &self.bot_localpart_patterns {
@@ -1438,6 +1508,7 @@ mod tests {
             judge_base_url: "http://small:3000/v1".to_owned(),
             judge_api_key: "small-key".to_owned(),
             judge_extra_body: BTreeMap::new(),
+            judge_timeout_s: 0,
             warm_on_intent: false,
             warm_cooldown_s: 120.0,
         };
@@ -1466,6 +1537,7 @@ mod tests {
             judge_base_url: String::new(),
             judge_api_key: String::new(),
             judge_extra_body: BTreeMap::new(),
+            judge_timeout_s: 0,
             warm_on_intent: false,
             warm_cooldown_s: 120.0,
         };
@@ -1475,5 +1547,46 @@ mod tests {
         );
         assert_eq!(brain.resolved_judge_api_key(), "big-key");
         assert_eq!(brain.resolved_judge_body().len(), 1);
+    }
+
+    #[test]
+    fn the_judge_timeout_follows_the_endpoint_it_asks() {
+        // A judge that shares the big model's endpoint AND model IS the cold
+        // start: it has to keep the full timeout, because it is what loads the
+        // model.
+        let shared = OpenAiCompatBrainConfig {
+            cold_start_timeout_s: 600.0,
+            ..OpenAiCompatBrainConfig::shipped("http://big:8002/v1", "qwen3.8-27b")
+        };
+        assert!((shared.resolved_judge_timeout() - 600.0).abs() < f64::EPSILON);
+
+        // Its own endpoint, or its own model on the same endpoint (llama-swap
+        // swaps on the model name): a small resident model, so waiting ten
+        // minutes for it is ten minutes of a room being quiet for nothing.
+        let elsewhere = OpenAiCompatBrainConfig {
+            judge_base_url: "http://small:3000/v1".to_owned(),
+            ..shared.clone()
+        };
+        assert!(
+            (elsewhere.resolved_judge_timeout() - RESIDENT_JUDGE_TIMEOUT_S).abs() < f64::EPSILON
+        );
+        let smaller_model = OpenAiCompatBrainConfig {
+            judge_model: "qwen3:4b".to_owned(),
+            ..shared.clone()
+        };
+        assert!(
+            (smaller_model.resolved_judge_timeout() - RESIDENT_JUDGE_TIMEOUT_S).abs()
+                < f64::EPSILON
+        );
+
+        // And an operator who says a number gets that number, wherever the
+        // judge runs.
+        for base in [&shared, &elsewhere] {
+            let told = OpenAiCompatBrainConfig {
+                judge_timeout_s: 45,
+                ..base.clone()
+            };
+            assert!((told.resolved_judge_timeout() - 45.0).abs() < f64::EPSILON);
+        }
     }
 }

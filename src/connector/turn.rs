@@ -28,7 +28,9 @@ use crate::policy::{Cues, Verdict, should_reply};
 use crate::presence::PresenceBook;
 
 use super::unprompted::{self, Candidate};
-use super::{RoomWorker, WorkerState, normalise_event, rules_from};
+use super::{
+    LAST_SPEAKER_TAIL, RoomWorker, WorkerState, last_speaker, normalise_event, rules_from,
+};
 
 /// How often the typing indicator is refreshed while a brain is thinking. The
 /// server-side notice expires, so a slow turn has to say so more than once.
@@ -95,9 +97,10 @@ impl Runner {
                 );
             }
             let roots = state.ledger.thread_roots();
+            let recent = worker.transcript.recent(LAST_SPEAKER_TAIL);
             let cues = Cues {
                 names: &state.names,
-                ..Cues::default()
+                last_speaker: last_speaker(&recent, &latest),
             };
             let decision = should_reply(
                 &latest,
@@ -396,7 +399,7 @@ impl Runner {
         if decision.verdict == Verdict::Consider {
             let delay = {
                 let state = worker.state.lock().await;
-                self.backoff_delay(&state)
+                self.tier2_delay(&state, decision.prescore)
             };
             info!(
                 "{room_id}: tier 2 on {}: waiting {delay:.1} s before re-reading the room",

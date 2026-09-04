@@ -1,4 +1,4 @@
-"""Live gates for addressing by name (N1, N2, N4).
+"""Live gates for addressing by name and by turn (N1, N2, N3, N4).
 
 The gap these close, found the first time the room was used in anger: "Qwen,
 why are you so quiet?" got nothing, "@Qwen hello" got an answer. A typed name
@@ -39,6 +39,7 @@ from conftest import (
     make_connector,
     messages,
     post,
+    post_unaddressed,
     relates_to,
     wait_for,
     wait_for_join,
@@ -58,6 +59,12 @@ SPEAK = "[[speak]]"
 #: The reason `policy::unaddressed` gives a line nobody addressed. Its ABSENCE
 #: is what says the name guards decided a line rather than tier 2.
 TIER_2 = "tier 2 candidate"
+#: N3's follow-up window. Short on purpose: the gate has to sit out a window
+#: that has CLOSED as well as one that is open, and 20 s is long enough to
+#: swallow the clock skew between this box and the homeserver.
+FOLLOWUP_WINDOW_S = 20
+#: What `policy::follow_up` puts in the log when it decides a line.
+FOLLOW_UP = "follow-up: I spoke last here"
 
 
 def named_policy(**extra: Any) -> dict[str, Any]:
@@ -147,6 +154,71 @@ async def test_n2_a_name_that_is_not_mine_is_somebody_elses_turn(
     await post(human, room_s3, f"{S3_BOT_A_NAME}, and you?")
     events = await wait_for(lambda evs: bool(by_sender(evs, S3_BOT_A)), human, room_s3, seconds=30)
     assert len(by_sender(events, S3_BOT_A)) == 1, "the agent was not alive to answer its own name"
+
+
+# -- N3 ----------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+async def test_n3_the_next_line_is_still_mine_until_the_window_closes(
+    tmp_path: Path, tokens: Tokens, human: AsyncClient, room_s3: str, running: list[Connector]
+) -> None:
+    """N3: the human names the agent, gets an answer, and then types the rest of
+    the thought - unthreaded, naming nobody, quoting nothing. That line is still
+    theirs to answer while they were the last thing said here, and stops being
+    theirs once the window has closed.
+
+    Neither of the two unaddressed lines carries `[[speak]]`, so tier 2 would be
+    told no and would say nothing: an answer to the second line can only be the
+    follow-up arm, and silence on the third can only be the window having
+    closed. The window is set short so the gate can sit out both.
+    """
+    bot = make_connector(
+        tmp_path,
+        tokens,
+        S3_BOT_A_NAME,
+        room_s3,
+        policy=named_policy(followup_window_s=FOLLOWUP_WINDOW_S),
+    )
+    bot.start()
+    running.append(bot)
+    bot.wait_ready()
+    await wait_for_join(human, room_s3, [S3_BOT_A])
+
+    # 1. N1's line: a typed name, answered as tier 1.
+    await post(human, room_s3, f"{S3_BOT_A_NAME}, why so quiet?")
+    events = await wait_for(lambda evs: bool(by_sender(evs, S3_BOT_A)), human, room_s3, seconds=30)
+    assert len(by_sender(events, S3_BOT_A)) == 1, "the typed name was not answered"
+
+    # 2. The rest of the thought, five seconds later: no name, no thread, no
+    # reply, no marker. Inside the window it is still the agent's turn.
+    await asyncio.sleep(5)
+    await post_unaddressed(human, room_s3, "and why is that?")
+    events = await wait_for(
+        lambda evs: len(by_sender(evs, S3_BOT_A)) > 1, human, room_s3, seconds=30
+    )
+    assert len(by_sender(events, S3_BOT_A)) == 2, (
+        "the follow-up was not answered: an unaddressed line right after its own "
+        "message is the arm this gate exists for"
+    )
+    log = bot.log_text()
+    assert FOLLOW_UP in log, "something other than the follow-up arm answered it"
+    assert TIER_2 not in log, "the follow-up went to tier 2 instead of being answered at once"
+    assert not judged(bot), "a follow-up is tier 1: it must cost no judge call"
+
+    # 3. Past the window the conversation is over, and the same shape of line is
+    # an ordinary one for the room: tier 2, a judge that says no, silence.
+    await asyncio.sleep(FOLLOWUP_WINDOW_S + 10)
+    await post_unaddressed(human, room_s3, "the coffee here is terrible")
+    await asyncio.sleep(SETTLE_S)
+
+    events = await messages(human, room_s3)
+    assert len(by_sender(events, S3_BOT_A)) == 2, (
+        "it answered a line the follow-up window had closed on"
+    )
+    log = bot.log_text()
+    assert TIER_2 in log, "the line past the window never reached tier 2"
+    assert log.count(FOLLOW_UP) == 1, "the closed window still claimed a line"
 
 
 # -- N4 ----------------------------------------------------------------------

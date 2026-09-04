@@ -55,6 +55,11 @@ pub const HAZARD_LIVELY_FACTOR: f64 = 0.5;
 pub const HAZARD_QUIET_S: f64 = 3600.0;
 pub const HAZARD_QUIET_FACTOR: f64 = 2.0;
 
+/// How wide the back-off stays for a line that scored `policy.prescore_fast`.
+/// Not zero: two agents that both answer at once answer on top of each other,
+/// and a few seconds of jitter is what keeps one of them from having to.
+pub const PRESCORE_FAST_WINDOW_S: f64 = 5.0;
+
 /// An inner-thought accumulator is dropped after this long without a message in
 /// that thread. Wanting to say something is about a conversation; when the
 /// conversation is over, so is the urge.
@@ -177,6 +182,28 @@ pub fn hazard_factor(now: f64, last_human_post_ts: f64, last_activity_ts: f64) -
         return HAZARD_QUIET_FACTOR;
     }
     1.0
+}
+
+/// The range a TIER-2 back-off is drawn from, before anything is drawn.
+///
+/// Two shapes, and the second one is the whole point of the pre-score. Below
+/// `prescore_fast` it is the configured range scaled by [`hazard_factor`],
+/// exactly as it has always been. At or above it, the line is one somebody is
+/// visibly waiting on - a question, a "you", my name, my subject - and the
+/// range collapses to the configured floor plus [`PRESCORE_FAST_WINDOW_S`],
+/// with NO hazard at all: the hazard is about the mood of a room, and a
+/// question put to it is not a mood.
+///
+/// It still leaves the floor in place, because the floor is the collision
+/// avoidance: two agents that both answer instantly answer on top of each
+/// other. What it removes is the waiting somebody can feel.
+#[must_use]
+pub fn tier2_range(cfg: &crate::config::PolicyConfig, prescore: u8, hazard: f64) -> (f64, f64) {
+    let (low, high) = cfg.backoff_s;
+    if prescore >= cfg.prescore_fast {
+        return (low, low + PRESCORE_FAST_WINDOW_S);
+    }
+    (low * hazard, high * hazard)
 }
 
 /// Read the inlet directory: fresh impulses in, stale ones deleted.
@@ -521,6 +548,14 @@ impl Runner {
         let (low, high) = self.cfg.policy.backoff_s;
         let factor = hazard_factor(self.now(), state.last_human_post_ts, state.last_activity_ts);
         uniform(low * factor, high * factor)
+    }
+
+    /// The same wait, for a tier-2 line that carries a pre-score.
+    #[must_use]
+    pub(crate) fn tier2_delay(&self, state: &WorkerState, prescore: u8) -> f64 {
+        let factor = hazard_factor(self.now(), state.last_human_post_ts, state.last_activity_ts);
+        let (low, high) = tier2_range(&self.cfg.policy, prescore, factor);
+        uniform(low, high)
     }
 
     // -- one unprompted turn ------------------------------------------------
@@ -883,6 +918,29 @@ mod tests {
             (hazard_factor(now, now - 60.0, now - 60.0) - HAZARD_LIVELY_FACTOR).abs()
                 < f64::EPSILON
         );
+    }
+
+    #[test]
+    fn a_pre_scored_line_collapses_the_back_off_and_skips_the_hazard() {
+        let cfg = crate::config::PolicyConfig::default();
+        assert_eq!(cfg.prescore_fast, 4, "the shipped threshold");
+
+        // Below the threshold: the configured range, scaled by the hazard,
+        // exactly as it was before the pre-score existed.
+        let (low, high) = tier2_range(&cfg, 3, HAZARD_QUIET_FACTOR);
+        assert!((low - 10.0).abs() < f64::EPSILON, "{low}");
+        assert!((high - 80.0).abs() < f64::EPSILON, "{high}");
+
+        // At it: the floor plus a few seconds of jitter, and the hazard does
+        // not get a say - a question with "you" in it is not a mood.
+        for hazard in [HAZARD_LIVELY_FACTOR, 1.0, HAZARD_QUIET_FACTOR] {
+            let (low, high) = tier2_range(&cfg, 4, hazard);
+            assert!((low - cfg.backoff_s.0).abs() < f64::EPSILON, "{low}");
+            assert!(
+                (high - (cfg.backoff_s.0 + PRESCORE_FAST_WINDOW_S)).abs() < f64::EPSILON,
+                "{high}"
+            );
+        }
     }
 
     #[test]

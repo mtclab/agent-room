@@ -525,8 +525,10 @@ The decision order in `policy::should_reply`, with the two new arms in bold:
 | 3c | **a vocative of one of my names** | reply | speaker | `named in the body (qwen, leading)` |
 | 3d | **a vocative of another member's name** | silent | none | `addressed to alex (@alex:server), not me` |
 | 3e | a thread I have posted in | reply | speaker | `thread $id I have posted in` |
+| 3f | **I spoke last here and a human came back inside `followup_window_s`** | reply | speaker | `follow-up: I spoke last here 41 s ago` |
 | 4-5 | budgets, then energy decay | silent / judge | | unchanged |
-| 6 | nobody addressed anybody | consider | judge | `unaddressed: tier 2 candidate ...` |
+| 6 | nobody addressed anybody, and the line pre-scores `prescore_fast` | consider, short back-off | judge | `unaddressed: tier 2 candidate (pre-score 5: question, asked of the room), short back-off` |
+| 7 | nobody addressed anybody | consider | judge | `unaddressed: tier 2 candidate, backing off before I decide` |
 
 3d beats 3e deliberately: being in the thread is a weaker claim than being
 named, and without that ordering two agents in one thread both answer a line
@@ -578,11 +580,56 @@ the next-token filter - and the escape hatch is
 Knobs: `reply_to_names` (true), `addressed_names` ([]),
 `other_names_from_members` (true), `bare_name_addresses` (false).
 
-NOT BUILT YET, and the next thing here: the FOLLOW-UP arm (3f) - "I was the last
-speaker in this conversation and the human came back within two minutes" - which
-is why `policy::Cues` carries a `last_speaker` field that nothing sets. With it
-come the warm-on-the-human-line and the deterministic pre-score that collapses
-the tier-2 back-off for an obvious question.
+**The follow-up (3f, BUILT 2026-09-04).** A name is not repeated every sentence.
+People ask, get an answer, and carry on: "and why is that?" names nobody, quotes
+nothing and starts no thread, so every guard above reads it as a line thrown at
+the room - which is how the agent that had just been talking to somebody made
+them type its name again. What makes that line mine is the ORDER of the
+conversation: I spoke last here, and it arrived while that was still true. The
+prior art calls it follow-up recognition and it is the one turn-allocation
+signal that is not in the words.
+
+`policy::Cues` carries a `LastSpeaker { sender, ts, conversation }` built per
+message in `connector::last_speaker` out of `transcript.recent(8)` - the room's
+own record of what happened in what order, rather than a second piece of
+bookkeeping to keep in step with it. The event that just arrived is skipped by
+event id. A THREADED line's conversation is its thread root; an UNTHREADED
+line's is the room, so the newest message anywhere counts - because my answer to
+an unthreaded question is itself threaded ON that question, and the human typing
+underneath it is answering me in the room.
+
+Four things bound it: only a human line (two agents following each other up is a
+loop with no human in it), only inside `followup_window_s` (120 s; `0` turns the
+arm off), only when the LEDGER agrees I posted in that conversation - the
+transcript records what the room said, the ledger records what I sent - and the
+budgets, unchanged. Anybody else speaking in between defeats it by
+construction: the last speaker is then not me. It sits after 3d, so a line
+naming somebody else is still theirs, whoever spoke last.
+
+**The pre-score (row 6).** Tier 2 is a back-off and then a judge call, and 40
+seconds of back-off on "does anyone know why the build is red?" is the
+difference between a conversation and a form. `addressing::pre_score` reads the
+line for what is free to read - a question mark (+3), a second person or an
+`anyone`/`someone`/`who` (+2), one of my own names in a position that did not
+address me (+2), a word from `policy.topics` (+2) - and at `prescore_fast` (4)
+the back-off is drawn from `backoff_s.0 .. backoff_s.0 + 5` with the timing
+hazard skipped, because the hazard is about the mood of a room and a question
+put to it is not a mood. The floor stays, because the floor is the collision
+avoidance. Nothing else changes: the judge still decides, the stand-down re-read
+still runs, and the score is in the log line so an operator can see why a line
+was in a hurry.
+
+**Warming on the human's line.** Three warm-ups now, all the same
+fire-and-forget call behind the same cooldown: the typing notice (before a line
+exists), the human's finished line when the verdict needs a judge, and the start
+of the back-off. The middle one is the one that matters for somebody who types a
+whole question before hitting enter. And the judge gets a timeout of its own
+(`judge_timeout_s`, or 30 s worked out from the config's shape): a judge on a
+small resident model must never be given the big model's cold start, or the room
+waits minutes to hear nothing.
+
+Knobs: `followup_window_s` (120), `topics` ([]), `prescore_fast` (4),
+`brain.openai_compat.judge_timeout_s` (0 = work it out).
 
 ### Unprompted speech, second design (BUILT 2026-09-02, S6)
 

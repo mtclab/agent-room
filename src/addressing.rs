@@ -38,13 +38,20 @@
 //!
 //! The module is pure and synchronous, so the whole table of what counts and
 //! what does not is a unit test rather than a live gate's guess.
+//!
+//! One more thing lives here for the same reason: [`pre_score`], the free read
+//! of a line nobody addressed. It is not addressing and it never decides
+//! anything - it says how obviously somebody is waiting for an answer, so that
+//! tier 2 can wait five seconds over a question instead of forty.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::events::localpart;
+use crate::config::PolicyConfig;
+use crate::events::{RoomEvent, localpart};
+use crate::policy::Cues;
 
 /// The shortest name that may address anybody. Two characters would find
 /// initials and syllables; three is the floor the display-name risk is bought
@@ -78,6 +85,12 @@ static SECOND_PERSON: LazyLock<Option<Regex>> = LazyLock::new(|| {
     ))
     .ok()
 });
+
+/// Words that ask the ROOM rather than a person: "anyone around?", "who knows
+/// this?". Not an address - nobody was selected - but the strongest hint there
+/// is that somebody is waiting for an answer from whoever has one.
+static OPEN_ADDRESS: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:anyone|someone|who)\b").ok());
 
 /// A boundary BEFORE a name: the start of the text, or one character that
 /// cannot be part of a name.
@@ -431,6 +444,16 @@ impl Names {
         Some((user_id.as_str(), address))
     }
 
+    /// One of MY names anywhere in the body, in any position at all.
+    ///
+    /// NOT an address - that is [`Self::addresses_me`], which is about
+    /// position and is the thing tier 1 acts on. This is what the pre-score
+    /// means by "my name came up in it".
+    #[must_use]
+    pub fn named_me(&self, body: &str) -> Option<String> {
+        named_bare(body, self.me.as_ref()?)
+    }
+
     /// The names I answer to, longest first. Empty when I have none.
     #[must_use]
     pub fn mine(&self) -> &[String] {
@@ -453,6 +476,110 @@ pub fn names_for(user_id: &str, display: Option<&str>) -> Vec<String> {
         names.extend(names_from_display(display));
     }
     names
+}
+
+// -- the pre-score: how quickly is this line worth getting to? -------------
+
+/// A question mark. The single strongest free signal that somebody is waiting.
+const SCORE_QUESTION: u8 = 3;
+/// "you", or a line asked of the room ("anyone around?").
+const SCORE_SECOND_PERSON: u8 = 2;
+/// One of my names came up, in a position that did not address me.
+const SCORE_MY_NAME: u8 = 2;
+/// A word from `policy.topics`: the subject this agent is in the room for.
+const SCORE_TOPIC: u8 = 2;
+
+/// What a line looks like before anybody has thought about it.
+///
+/// Tier 2 is a back-off and then a judge call, and the back-off is there so
+/// that several agents do not answer at once. It costs nothing to notice that
+/// a line is a QUESTION, that it says "you", that it named me in passing, or
+/// that it is about the thing this agent is here for - and a line with those
+/// in it is worth getting to sooner.
+///
+/// Nothing here decides whether to speak. The judge still does, exactly as
+/// before, and the stand-down re-read still runs: this only decides how long
+/// the room waits to find out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreScore {
+    pub score: u8,
+    /// The cues that were found, in the order they are scored - the log has to
+    /// be able to say WHY a line was in a hurry.
+    pub cues: Vec<&'static str>,
+}
+
+impl PreScore {
+    fn add(&mut self, points: u8, cue: &'static str) {
+        self.score = self.score.saturating_add(points);
+        self.cues.push(cue);
+    }
+
+    /// The cues as the decision's reason string prints them.
+    #[must_use]
+    pub fn listed(&self) -> String {
+        self.cues.join(", ")
+    }
+}
+
+/// Score one unaddressed line. Deterministic, free, and never a verdict.
+#[must_use]
+pub fn pre_score(ev: &RoomEvent, cues: &Cues<'_>, cfg: &PolicyConfig) -> PreScore {
+    let body = ev.body.as_str();
+    let mut score = PreScore::default();
+    if body.contains('?') {
+        score.add(SCORE_QUESTION, "question");
+    }
+    if second_person(body) {
+        score.add(SCORE_SECOND_PERSON, "second person");
+    } else if OPEN_ADDRESS
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(body))
+    {
+        score.add(SCORE_SECOND_PERSON, "asked of the room");
+    }
+    if cues.names.named_me(body).is_some() {
+        score.add(SCORE_MY_NAME, "my name");
+    }
+    if topic_word(body, &cfg.topics) {
+        score.add(SCORE_TOPIC, "my subject");
+    }
+    score
+}
+
+/// Whether any `policy.topics` word stands as a word in the body.
+fn topic_word(body: &str, topics: &[String]) -> bool {
+    if topics.is_empty() {
+        return false;
+    }
+    let haystack = body.to_lowercase();
+    topics.iter().any(|topic| {
+        let needle = topic.trim().to_lowercase();
+        !needle.is_empty() && word_present(&haystack, &needle)
+    })
+}
+
+/// `needle` as a whole word in `haystack`, both already lowercased.
+///
+/// The same boundary rule the names use, hyphen included as a word character:
+/// a topic of "deploy" is not found in "deploy-bot", for the same reason a
+/// member called "gate" is not addressed by a line naming `gate-bot-a`.
+fn word_present(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(needle) {
+        let start = from + found;
+        let end = start + needle.len();
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[end..].chars().next();
+        if !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char) {
+            return true;
+        }
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '\u{2013}' || c == '\u{2014}'
 }
 
 #[cfg(test)]
@@ -595,6 +722,122 @@ mod tests {
                 .is_none(),
             "a bare name plus \"you\" must never silence me"
         );
+    }
+
+    // -- the pre-score ---------------------------------------------------
+
+    /// One human line, as the homeserver sends it.
+    fn line(body: &str) -> RoomEvent {
+        crate::events::from_source(
+            &serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$evt",
+                "sender": "@human:example.com",
+                "origin_server_ts": 1_700_000_000_000u64,
+                "room_id": "!room:example.com",
+                "content": { "msgtype": "m.text", "body": body },
+            }),
+            "!room:example.com",
+            None,
+            crate::events::BotRules {
+                bot_user_ids: &[],
+                bot_localpart_patterns: &[],
+            },
+        )
+    }
+
+    fn scored(body: &str, topics: &[&str]) -> PreScore {
+        let all = names();
+        let cues = Cues {
+            names: &all,
+            ..Cues::default()
+        };
+        let cfg = PolicyConfig {
+            topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+            ..PolicyConfig::default()
+        };
+        pre_score(&line(body), &cues, &cfg)
+    }
+
+    #[test]
+    fn the_pre_score_reads_the_cues_that_are_free_to_read() {
+        // Every row is a line nobody addressed. The score is not a verdict and
+        // never becomes one: it is how long tier 2 waits before asking.
+        let cases: [(&str, u8, &[&str]); 9] = [
+            (
+                "does anyone know why the build is red?",
+                5,
+                &["question", "asked of the room"],
+            ),
+            (
+                "who is looking at this?",
+                5,
+                &["question", "asked of the room"],
+            ),
+            ("what do you think?", 5, &["question", "second person"]),
+            ("what do you think", 2, &["second person"]),
+            ("the build finished", 0, &[]),
+            ("somebody should ask qwen about it", 2, &["my name"]),
+            // "you" wins the two points a room question would also have scored:
+            // one cue, one score, and the log says which.
+            (
+                "anyone know what you make of it?",
+                5,
+                &["question", "second person"],
+            ),
+            ("I like this queue", 0, &[]),
+            // Everything at once, which is also the cap in practice.
+            (
+                "qwen, anyone know if the deploy is done?",
+                9,
+                &["question", "asked of the room", "my name", "my subject"],
+            ),
+        ];
+        for (body, score, cues) in cases {
+            let topics: &[&str] = if body.contains("deploy") {
+                &["deploy"]
+            } else {
+                &[]
+            };
+            let found = scored(body, topics);
+            assert_eq!(found.score, score, "{body:?} scored {}", found.listed());
+            assert_eq!(found.cues, cues, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_topic_is_a_word_and_not_a_substring() {
+        assert_eq!(scored("the deploy is stuck", &["deploy"]).score, 2);
+        assert_eq!(scored("the DEPLOY is stuck", &["Deploy"]).score, 2);
+        assert_eq!(
+            scored("the deployment is stuck", &["deploy"]).score,
+            0,
+            "a topic must not match inside a longer word"
+        );
+        assert_eq!(
+            scored("ask deploy-bot about it", &["deploy"]).score,
+            0,
+            "the hyphen is a word character here too"
+        );
+        assert_eq!(
+            scored("nothing at all", &["  "]).score,
+            0,
+            "a blank topic matches nothing (config refuses it as well)"
+        );
+    }
+
+    #[test]
+    fn a_room_with_no_names_still_scores_the_rest_of_the_line() {
+        // Before the first sync nobody has a name. The question mark and the
+        // second person are still free to read, and still worth reading.
+        let nobody = Names::empty();
+        let cues = Cues {
+            names: &nobody,
+            ..Cues::default()
+        };
+        let found = pre_score(&line("what do you think?"), &cues, &PolicyConfig::default());
+        assert_eq!(found.score, 5);
+        assert_eq!(found.listed(), "question, second person");
     }
 
     #[test]
