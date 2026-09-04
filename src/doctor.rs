@@ -365,7 +365,9 @@ impl<'a> Doctor<'a> {
         };
         match brain.kind {
             BrainKind::OpenaiCompat => match &brain.openai_compat {
-                Some(openai) => check_openai(&openai.base_url, &openai.model).await,
+                Some(openai) => {
+                    check_openai(&openai.base_url, &openai.model, &openai.resolved_api_key()).await
+                }
                 None => Check::skip("brain", "no openai_compat section to check"),
             },
             BrainKind::ClaudeCode => match &brain.claude_code {
@@ -518,7 +520,7 @@ fn mode_check(name: &str, path: &Path, why: &str) -> Check {
 }
 
 /// `GET {base_url}/models` - the cheapest question an endpoint answers.
-async fn check_openai(base_url: &str, model: &str) -> Check {
+async fn check_openai(base_url: &str, model: &str, api_key: &str) -> Check {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(BRAIN_TIMEOUT_S))
@@ -529,7 +531,11 @@ async fn check_openai(base_url: &str, model: &str) -> Check {
             return Check::fail("brain", format!("cannot build an HTTP client: {exc}"), "");
         }
     };
-    let response = match client.get(&url).send().await {
+    let mut request = client.get(&url);
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(exc) => {
             return Check::fail(

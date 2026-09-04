@@ -454,25 +454,49 @@ impl Drop for ModelsEndpoint {
 
 impl ModelsEndpoint {
     async fn start() -> Self {
+        Self::start_with_key(None).await
+    }
+
+    /// Like `start`, but 401s any request that does not carry
+    /// `Authorization: Bearer <required_key>` - so a test can prove the
+    /// doctor's brain check actually sends the configured key.
+    async fn start_with_key(required_key: Option<&str>) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");
         let port = listener.local_addr().expect("bound").port();
+        let required_key = required_key.map(str::to_owned);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _peer)) = listener.accept().await else {
                     return;
                 };
+                let required_key = required_key.clone();
                 tokio::spawn(async move {
                     let mut buffer = [0_u8; 2048];
-                    let _read = socket.read(&mut buffer).await;
-                    let body = r#"{"object":"list","data":[{"id":"qwen3","object":"model"}]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let authorized = required_key.as_deref().is_none_or(|key| {
+                        request.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!("authorization: bearer {key}"))
+                        })
+                    });
+                    let response = if authorized {
+                        let body = r#"{"object":"list","data":[{"id":"qwen3","object":"model"}]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        let body = r#"{"error":"missing or wrong bearer token"}"#;
+                        format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
                     let _written = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -533,6 +557,38 @@ async fn a_brain_that_is_not_running_fails_with_its_url() {
             .detail
             .contains("http://127.0.0.1:1/v1/models")
     );
+}
+
+#[tokio::test]
+async fn a_key_protected_endpoint_passes_when_the_key_is_configured() {
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start_with_key(Some("s3cr3t")).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    cfg.brain
+        .as_mut()
+        .and_then(|brain| brain.openai_compat.as_mut())
+        .expect("openai_compat section")
+        .api_key = "s3cr3t".to_owned();
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["brain"].status, Status::Pass);
+}
+
+#[tokio::test]
+async fn a_key_protected_endpoint_fails_without_the_key() {
+    // Regression test: the doctor's brain check used to build its GET
+    // /models request with no Authorization header at all, so it always
+    // failed 401 against an endpoint that requires one - even with the
+    // right key configured.
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start_with_key(Some("s3cr3t")).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["brain"].status, Status::Fail);
+    assert!(checks["brain"].detail.contains("401"));
 }
 
 fn write_fake_claude(dir: &Path, version: &str, code: i32) -> PathBuf {
