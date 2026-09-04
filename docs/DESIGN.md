@@ -532,6 +532,7 @@ The decision order in `policy::should_reply`, with the two new arms in bold:
 | 3f | **I spoke last here and a human came back inside `followup_window_s`** | reply | speaker | `follow-up: I spoke last here 41 s ago` |
 | 4-5 | budgets, then energy decay | silent / judge | | unchanged |
 | 6 | nobody addressed anybody, and the line pre-scores `prescore_fast` | consider, short back-off | judge | `unaddressed: tier 2 candidate (pre-score 8: question, asked of the room, an invitation to the room), short back-off` |
+| 6a | **a HUMAN line that hands the turn to the room AND asks it something** | consider, short back-off, then reply | **speaker only - no judge** | `room invitation on $evt: answering without the judge (pre-score 8: question, asked of the room, an invitation to the room)` |
 | 7 | nobody addressed anybody | consider | judge | `unaddressed: tier 2 candidate, backing off before I decide` |
 
 3d beats 3e deliberately: being in the thread is a weaker claim than being
@@ -733,6 +734,55 @@ avoidance. Knob: `small_room_backoff` (true).
 
 Knobs: `speak_threshold` (5), `chattiness` (0), `small_room_backoff` (true),
 `bot_to_bot: conversational`.
+
+### The room invitation (BUILT 2026-09-05)
+
+One day later, the same failure one layer down. A person, addressing nobody:
+*"So, anyone here got an opinion on whether weekends should be three days
+long?"* Everything worked: `verdict=consider (pre-score 8: question, asked of
+the room, an invitation to the room)`, a short back-off, the judge told in as
+many words that the line was addressed to the room - and the 27B model answered
+`says 2 (< 5): It's a general opinion question not directed at me`. Silence.
+
+The model is not being stupid; it is reading "addressed to nobody in
+particular" the way it reads. People read the same line as *"whoever wants to,
+go"*. Webb's rule is that the current speaker selects the next, and selecting
+the FLOOR AT LARGE is one of the ways they do it: the quickest self-selector
+takes the turn. That is turn ALLOCATION, and the whole design says allocation
+is deterministic, free and immediate - a judge asked to weigh it is the same
+mistake as asking one to weigh a typed name.
+
+So a line that (a) came from a **human**, (b) hands the turn to the room and
+(c) asks it something is answered after the back-off and the stand-down, with
+no judge call at all. `addressing::invites_an_answer` is the deterministic
+half: `addresses_room` AND (a question mark OR an imperative thrown at whoever
+is listening - "tell me what you think"). A line that merely names the room
+("everyone is welcome to weigh in") is not one; nobody is waiting.
+
+Four things bound it, and each one is a unit gate:
+
+| bound | why |
+|---|---|
+| `policy.room_invitations` (true) | the operator can put it back on the judge |
+| verdict is `consider` | the back-off AND the stand-down re-read have both run, so only ONE agent answers |
+| the sender is a person | two agents inviting each other to speak is a loop with no human in it; a bot's line keeps the judge in every mode |
+| `invites_an_answer` | thrown at the room is not enough; somebody has to be waiting |
+
+The stand-down is the load-bearing one. Two things used to keep a room of
+agents from all answering the same line: the random back-off with the re-read
+after it, and the judge that most of them talked out of speaking. Skipping the
+judge removes the second, so the first has to still be there - which is why the
+verdict has to be `consider` and why C-4 asserts the loser standing down in the
+same breath as the winner answering.
+
+**And the judge is told what it was getting wrong**, because it still decides
+every other unaddressed line: the room cue now states the norm rather than the
+fact - *"it is addressed to the room, not to one person: in this room that
+means whoever has something to say is invited, and 'not directed at me' is not
+a reason to stay out"* - and the scale ends on *"Being addressed as part of the
+room counts as being asked."*
+
+Knobs: `room_invitations` (true).
 
 ### Unprompted speech, second design (BUILT 2026-09-02, S6)
 
@@ -1146,7 +1196,10 @@ these are BUILT and recorded in `docs/GATES.md` with their teeth runs:
     energy; another agent's TYPED name is answered under the shipped
     `bot_to_bot: mentions`; and the same agent naming nobody is refused at the
     switch, with the human's identical line still answered.
-16. Each gate proven to have teeth by reverting the guard it protects.
+16. C-4 A question the human puts to the ROOM is answered by exactly one agent
+    with no judge call anywhere, the other standing down; and a plain
+    unaddressed line after it is still the judge's to decline.
+17. Each gate proven to have teeth by reverting the guard it protects.
 
 ### Two standing rules about INPUTS (2026-09-04)
 

@@ -5,6 +5,13 @@
 //! the connector receiving events - for this room or for any other. That is
 //! also what makes the stand-down re-read meaningful: while a tier-2 back-off
 //! sleeps, the room keeps arriving, and somebody else may answer first.
+//!
+//! One decision lives here rather than in [`crate::policy`], and only because
+//! it is about the SHAPE of the turn: whether the judge is asked at all
+//! ([`Runner::room_invitation`]). A line a person handed to the room and asked
+//! something on is turn allocation, so the agent that survives the back-off
+//! and the re-read answers it - and the policy is left saying what it always
+//! said about that line, which is that nobody addressed anybody.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,13 +25,14 @@ use regex::Regex;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::addressing::invites_an_answer;
 use crate::brain::{Brain, BrainContext, Occasion};
 use crate::config::Config;
 use crate::events::{NOTICE_MSGTYPE, Relation, RoomEvent, build_reply_content, mentioned_user_ids};
 use crate::head;
 use crate::ledger::Clock;
 use crate::loops::{extract_followup, is_open_question, loop_text};
-use crate::policy::{Cues, Verdict, should_reply};
+use crate::policy::{Cues, Decision, Verdict, should_reply};
 use crate::presence::PresenceBook;
 
 use super::unprompted::{self, Candidate};
@@ -392,6 +400,28 @@ impl Runner {
 
     // -- tier 2: nobody addressed me --------------------------------------
 
+    /// Whether this turn may answer without asking the judge.
+    ///
+    /// Four things at once, and every one of them is load-bearing:
+    ///
+    /// - the operator left `policy.room_invitations` on;
+    /// - the verdict is `consider`, so the back-off and the STAND-DOWN re-read
+    ///   have both run - which is what keeps two agents from both answering;
+    /// - a PERSON wrote it. Agents inviting each other to speak is a loop with
+    ///   no human in it, and a bot's line keeps the judge in every mode;
+    /// - and the line handed the turn to the room and asked it something
+    ///   ([`invites_an_answer`]).
+    ///
+    /// It is the same rule tier 1 already runs on a typed name, applied to the
+    /// other way people hand over the turn: a name selects one speaker, the
+    /// open floor selects whoever gets there first.
+    fn room_invitation(&self, decision: &Decision, ev: &RoomEvent) -> bool {
+        self.cfg.policy.room_invitations
+            && decision.verdict == Verdict::Consider
+            && !ev.is_bot
+            && invites_an_answer(&ev.body)
+    }
+
     /// Back off (tier 2 only), re-read the room, ask the judge, maybe speak.
     ///
     /// The back-off is awaited here, in a task of its own, so the sync loop
@@ -402,14 +432,14 @@ impl Runner {
         self,
         worker: Arc<RoomWorker>,
         ev: RoomEvent,
-        decision: crate::policy::Decision,
+        decision: Decision,
     ) {
         let started = self.now();
         let room_id = worker.room_id.clone();
         if decision.verdict == Verdict::Consider {
             let delay = {
                 let state = worker.state.lock().await;
-                self.tier2_delay(&state, decision.prescore)
+                self.tier2_delay(&state, decision.prescore.score)
             };
             info!(
                 "{room_id}: tier 2 on {}: waiting {delay:.1} s before re-reading the room",
@@ -430,27 +460,43 @@ impl Runner {
             }
         }
 
-        let ctx = self.context(
-            &worker,
-            &ev,
-            Occasion::Unaddressed,
-            String::new(),
-            ev.thread_root.as_deref(),
-            self.participants(&worker).await,
-        );
-        let judgement = self.brain.judge(&ctx).await;
-        info!(
-            "{room_id}: judge on {} says {}: {}",
-            ev.event_id,
-            judgement.says(ctx.speak_threshold),
-            judgement.why
-        );
-        self.note_urgency(&worker, &ev, judgement.urgency, &judgement.why)
-            .await;
+        // A line the room was handed AND asked something on is not a borderline
+        // case for a judge to weigh: the turn was allocated to whoever wants
+        // it, and I am the one still standing here after the back-off and the
+        // re-read. Asking anyway is what put "it's a general opinion question
+        // not directed at me" between a person and an answer.
+        let speak = if self.room_invitation(&decision, &ev) {
+            info!(
+                "{room_id}: room invitation on {}: answering without the judge (pre-score {}: {})",
+                ev.event_id,
+                decision.prescore.score,
+                decision.prescore.listed()
+            );
+            true
+        } else {
+            let ctx = self.context(
+                &worker,
+                &ev,
+                Occasion::Unaddressed,
+                String::new(),
+                ev.thread_root.as_deref(),
+                self.participants(&worker).await,
+            );
+            let judgement = self.brain.judge(&ctx).await;
+            info!(
+                "{room_id}: judge on {} says {}: {}",
+                ev.event_id,
+                judgement.says(ctx.speak_threshold),
+                judgement.why
+            );
+            self.note_urgency(&worker, &ev, judgement.urgency, &judgement.why)
+                .await;
+            judgement.speak
+        };
 
         let go = {
             let mut state = worker.state.lock().await;
-            if !judgement.speak {
+            if !speak {
                 state.ledger.mark_consumed(&ev.event_id);
                 state.deliberating = false;
                 false
@@ -701,4 +747,229 @@ pub fn uniform(low: f64, high: f64) -> f64 {
         return low.max(0.0);
     }
     rand::random_range(low.max(0.0)..high)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one decision in this file that is not about posting: whether a
+    //! tier-2 turn asks the judge at all.
+    //!
+    //! Driven through the real [`Runner::deliberate`] with a brain that counts
+    //! what it was asked, because the assertion is a JOURNEY - "the room got an
+    //! answer and nobody paid a judge for it" - and a test of the predicate
+    //! alone would pass just as happily with the branch wired to nothing. The
+    //! client is a real one pointed at a port nothing listens on: everything
+    //! that posts fails and says so, which is exactly the part a live gate
+    //! owns, and every brain call still happens.
+
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::brain::Judgement;
+    use crate::config::PolicyConfig;
+    use crate::connector::testkit::{self, FakeClock};
+    use crate::events::{RoomEvent, from_source};
+    use crate::policy::{Cues, Decision, should_reply};
+    use crate::transcript::Transcript;
+
+    const ME: &str = "@bot-a:example.com";
+    const HUMAN: &str = "@human:example.com";
+    /// The line from the room log this whole path exists for: it selects
+    /// nobody, hands the turn to the room, and asks it something.
+    const ROOM_QUESTION: &str =
+        "So, anyone here got an opinion on whether weekends should be three days long?";
+
+    /// A brain that says one thing and counts everything it was asked.
+    ///
+    /// Its judge REFUSES, so a turn that reaches it cannot post: "reply once"
+    /// and "judge never" are then two readings of the same run rather than two
+    /// hopes about it.
+    struct CountingBrain {
+        judged: AtomicUsize,
+        replied: AtomicUsize,
+    }
+
+    impl CountingBrain {
+        fn new() -> Self {
+            Self {
+                judged: AtomicUsize::new(0),
+                replied: AtomicUsize::new(0),
+            }
+        }
+        fn judgements(&self) -> usize {
+            self.judged.load(Ordering::SeqCst)
+        }
+        fn replies(&self) -> usize {
+            self.replied.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Brain for CountingBrain {
+        async fn reply(&self, _ctx: &BrainContext) -> Option<String> {
+            self.replied.fetch_add(1, Ordering::SeqCst);
+            Some("three days sounds right to me".to_owned())
+        }
+        async fn judge(&self, _ctx: &BrainContext) -> Judgement {
+            self.judged.fetch_add(1, Ordering::SeqCst);
+            Judgement::no("this judge refuses everything")
+        }
+    }
+
+    fn config(policy: PolicyConfig, state_dir: &Path) -> Config {
+        Config {
+            homeserver: "http://127.0.0.1:1".to_owned(),
+            user_id: ME.to_owned(),
+            access_token_file: None,
+            password: None,
+            rooms: vec![testkit::ROOM_ID.to_owned()],
+            persona_file: None,
+            state_dir: state_dir.to_path_buf(),
+            brain: None,
+            policy,
+            mcp: crate::config::McpConfig::default(),
+            tls: crate::config::TlsConfig::default(),
+            history_limit: crate::config::default_history_limit(),
+            transcript_keep: crate::transcript::DEFAULT_KEEP,
+            transcript_archives: crate::transcript::DEFAULT_ARCHIVES,
+            allow_wedged_device: false,
+        }
+    }
+
+    /// One line in the room, from a person or from another agent.
+    fn event(body: &str, sender: &str, is_bot: bool) -> RoomEvent {
+        let msgtype = if is_bot { NOTICE_MSGTYPE } else { "m.text" };
+        from_source(
+            &serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$trigger",
+                "sender": sender,
+                "origin_server_ts": 1_700_000_000_000_u64,
+                "room_id": testkit::ROOM_ID,
+                "content": { "msgtype": msgtype, "body": body },
+            }),
+            testkit::ROOM_ID,
+            None,
+            rules_from(&[], &[]),
+        )
+    }
+
+    /// Run one tier-2 turn on `ev` and report what the brain was asked.
+    ///
+    /// The verdict is the PRODUCT's, out of `should_reply`, so a change that
+    /// stopped these lines reaching tier 2 at all would break this test rather
+    /// than sail past it on a hand-written decision.
+    async fn deliberate_on(policy: PolicyConfig, ev: &RoomEvent) -> (Decision, Arc<CountingBrain>) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let clock = FakeClock::new();
+        let state = testkit::state(dir.path(), &clock);
+        let cfg = Arc::new(config(policy, dir.path()));
+        let decision = should_reply(
+            ev,
+            ME,
+            &state.ledger,
+            &HashSet::new(),
+            &cfg.policy,
+            &Cues::default(),
+        );
+        let brain = Arc::new(CountingBrain::new());
+        let client = Client::builder()
+            .homeserver_url(&cfg.homeserver)
+            .build()
+            .await
+            .expect("a client that has never spoken to a homeserver");
+        let runner = Runner {
+            cfg,
+            client,
+            brain: Arc::clone(&brain) as Arc<dyn Brain>,
+            me: ME.to_owned(),
+            persona: String::new(),
+            clock: clock.as_clock(),
+            presence: Arc::new(Mutex::new(PresenceBook::new())),
+            bot_user_ids: Vec::new(),
+            bot_patterns: Vec::new(),
+        };
+        let worker = Arc::new(RoomWorker {
+            room_id: RoomId::parse(testkit::ROOM_ID).expect("a room id"),
+            transcript: Transcript::new(dir.path().join("room.jsonl")),
+            state: Mutex::new(state),
+        });
+        runner
+            .deliberate(Arc::clone(&worker), ev.clone(), decision.clone())
+            .await;
+        (decision, brain)
+    }
+
+    /// `conversational`, so a bot's unaddressed line reaches tier 2 at all -
+    /// which is the only way "a bot still gets the judge" can be measured.
+    fn conversational() -> PolicyConfig {
+        PolicyConfig {
+            bot_to_bot: crate::config::BotToBot::Conversational,
+            ..PolicyConfig::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_room_question_from_a_human_is_answered_without_the_judge() {
+        let (decision, brain) =
+            deliberate_on(PolicyConfig::default(), &event(ROOM_QUESTION, HUMAN, false)).await;
+        assert_eq!(decision.verdict, Verdict::Consider, "{}", decision.reason);
+        assert_eq!(
+            brain.judgements(),
+            0,
+            "the judge was asked about a line the room threw open: {}",
+            decision.reason
+        );
+        assert_eq!(
+            brain.replies(),
+            1,
+            "nobody answered the room's own question (this judge refuses everything)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_room_question_from_a_bot_still_goes_through_the_judge() {
+        // Two agents inviting each other to speak is a loop with no human in
+        // it. The line is word for word the one above.
+        let (decision, brain) = deliberate_on(
+            conversational(),
+            &event(ROOM_QUESTION, "@bot-b:example.com", true),
+        )
+        .await;
+        assert_eq!(decision.verdict, Verdict::Consider, "{}", decision.reason);
+        assert_eq!(brain.judgements(), 1, "a bot's line skipped the judge");
+        assert_eq!(brain.replies(), 0, "and the refusal did not stop it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn room_invitations_false_restores_the_judge_path() {
+        let off = PolicyConfig {
+            room_invitations: false,
+            ..PolicyConfig::default()
+        };
+        let (_, brain) = deliberate_on(off, &event(ROOM_QUESTION, HUMAN, false)).await;
+        assert_eq!(brain.judgements(), 1, "the knob did not put the judge back");
+        assert_eq!(brain.replies(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_unaddressed_line_still_needs_the_judge() {
+        // G7's own line, offline: unaddressed, nobody waiting, judge says no,
+        // the room hears nothing. Everything this slice does has to leave that
+        // exactly as it was.
+        let (decision, brain) = deliberate_on(
+            PolicyConfig::default(),
+            &event("just thinking aloud about the weather", HUMAN, false),
+        )
+        .await;
+        assert_eq!(decision.verdict, Verdict::Consider, "{}", decision.reason);
+        assert_eq!(
+            brain.judgements(),
+            1,
+            "a line nobody was waiting on skipped the judge"
+        );
+        assert_eq!(brain.replies(), 0, "and it was answered anyway");
+    }
 }

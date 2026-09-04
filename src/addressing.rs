@@ -47,6 +47,12 @@
 //! amongst yourselves" selects nobody, so every guard here reads it as a line
 //! thrown at the room - and a judge asked to infer an invitation out of prose
 //! infers silence instead.
+//!
+//! [`invites_an_answer`] is the half of that which is turn allocation rather
+//! than a cue: the room was thrown open AND asked something. Selecting the
+//! floor at large is how people hand the turn to whoever wants it, so that
+//! line is answered by the first agent to reach it - deterministically, with
+//! no judge in the way (`policy.room_invitations`).
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -357,12 +363,42 @@ pub fn named_bare(body: &str, vocab: &Vocab) -> Option<String> {
 /// conversation has naturally settled").
 #[must_use]
 pub fn addresses_room(body: &str) -> bool {
-    let matches = |pattern: &LazyLock<Option<Regex>>| {
-        pattern
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_match(body))
-    };
-    matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE)
+    matched(&ROOM_INVITATION, body) || matched(&ROOM_IMPERATIVE, body)
+}
+
+/// Whether this line hands the turn to the room AND asks it for an answer.
+///
+/// [`addresses_room`] says the turn was thrown open; this says somebody is
+/// waiting at the end of it. Two shapes qualify, and both are already
+/// recognised above:
+///
+/// - a line thrown at the room that is a QUESTION - "so, anyone here got an
+///   opinion on whether weekends should be three days long?";
+/// - an imperative handed to whoever is listening - "tell me what you think",
+///   "you two, talk amongst yourselves" - which is a request with no question
+///   mark on it.
+///
+/// A line that merely mentions the room ("everyone is welcome to weigh in") is
+/// not one: nobody is waiting, so nobody has to answer.
+///
+/// This is turn ALLOCATION, not self-selection. Webb's rule is that the current
+/// speaker selects the next, and selecting the floor at large is one of the
+/// ways they do it: whoever wants it takes it, and the quickest self-selector
+/// gets it. A judge asked about such a line reads "addressed to nobody in
+/// particular" as "not for me" and scores it out (the room log, 2026-09-05: a
+/// 27B model on "anyone here got an opinion...?" answered *"2: it's a general
+/// opinion question not directed at me"*), which is exactly the inference the
+/// deterministic tier exists to stop anybody making.
+#[must_use]
+pub fn invites_an_answer(body: &str) -> bool {
+    addresses_room(body) && (body.contains('?') || matched(&ROOM_IMPERATIVE, body))
+}
+
+/// One of the room patterns against a body, `false` when it did not compile.
+fn matched(pattern: &LazyLock<Option<Regex>>, body: &str) -> bool {
+    pattern
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(body))
 }
 
 /// Whether the body says "you" in any of the forms people type.
@@ -587,9 +623,16 @@ impl PreScore {
         self.cues.push(cue);
     }
 
-    /// The cues as the decision's reason string prints them.
+    /// The cues as the reason strings print them.
+    ///
+    /// A line can reach the fast path with nothing in it at all - that is what
+    /// `prescore_fast: 0` means - and a log line reading "(pre-score 0: )" is
+    /// a log line with a hole in it, so the empty list says so in words.
     #[must_use]
     pub fn listed(&self) -> String {
+        if self.cues.is_empty() {
+            return "nothing in particular".to_owned();
+        }
         self.cues.join(", ")
     }
 }
@@ -953,6 +996,62 @@ mod tests {
     }
 
     #[test]
+    fn an_invitation_that_asks_for_an_answer_and_one_that_only_mentions_the_room() {
+        // The line the room log was written around, and the shape of every
+        // other line an agent must answer without asking a model first: the
+        // turn was thrown open AND somebody is waiting at the end of it.
+        let asked = [
+            "so, anyone here got an opinion on whether weekends should be three days long?",
+            "does anyone have a view on this?",
+            "any of you know why the build is red?",
+            "what do you all think?",
+            // The imperative forms carry no question mark and are still a
+            // request put to whoever is listening.
+            "tell me what you think",
+            "you two, talk amongst yourselves about the weather",
+            "ok so talk about the weather",
+            "introduce yourselves please",
+        ];
+        for body in asked {
+            assert!(addresses_room(body), "{body:?} is thrown at the room");
+            assert!(
+                invites_an_answer(body),
+                "{body:?} asks the room for an answer"
+            );
+        }
+        // Thrown at the room, but nobody is waiting: a statement about
+        // everybody is not a turn handed to anybody.
+        let unasked = [
+            "everyone is welcome to weigh in",
+            "y'all have been quiet",
+            "someone has been busy in here",
+            "I have a question for the room",
+        ];
+        for body in unasked {
+            assert!(
+                addresses_room(body),
+                "{body:?} still mentions the room as a body"
+            );
+            assert!(
+                !invites_an_answer(body),
+                "{body:?} asks nobody for anything, so it is not an invitation to answer"
+            );
+        }
+        // And a question that selects nobody and hands nothing to the room is
+        // an ordinary tier-2 line: the judge still decides those.
+        for body in [
+            "what do you think?",
+            "and why is that?",
+            "is the build red?",
+        ] {
+            assert!(
+                !invites_an_answer(body),
+                "{body:?} is a question, but it was not handed to the room"
+            );
+        }
+    }
+
+    #[test]
     fn a_topic_is_a_word_and_not_a_substring() {
         assert_eq!(scored("the deploy is stuck", &["deploy"]).score, 2);
         assert_eq!(scored("the DEPLOY is stuck", &["Deploy"]).score, 2);
@@ -985,6 +1084,9 @@ mod tests {
         let found = pre_score(&line("what do you think?"), &cues, &PolicyConfig::default());
         assert_eq!(found.score, 5);
         assert_eq!(found.listed(), "question, second person");
+        // `prescore_fast: 0` puts a line with no cues at all on the fast path,
+        // and the reason string it prints has to say something.
+        assert_eq!(PreScore::default().listed(), "nothing in particular");
     }
 
     #[test]

@@ -1232,7 +1232,7 @@ mod tests {
             verdict,
             reason: "for the test".to_owned(),
             unaddressed: verdict == Verdict::Consider,
-            prescore: 0,
+            prescore: crate::addressing::PreScore::default(),
         }
     }
 

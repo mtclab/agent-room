@@ -123,6 +123,16 @@ policy:
   # actual message stand a random back-off, a re-read of the room (stand down if
   # somebody got there first) and a judge call that must say yes.
   answer_unaddressed: true
+  # A question put to the ROOM - "anyone got an opinion on ...?", "tell me what
+  # you think" - is answered after that back-off and that re-read, and the judge
+  # is never asked. Handing the turn to the room is how people offer it to
+  # whoever wants it; a model asked to weigh such a line reads "addressed to
+  # nobody in particular" as "not for me" and says nothing. Only a PERSON's line
+  # ever counts (agents inviting each other to speak is a loop with nobody in
+  # it), and only one where somebody is actually waiting: "everyone is welcome
+  # to weigh in" asks nothing. Off puts it back on the judge with everything
+  # else.
+  room_invitations: true
   backoff_s: [5, 40]               # drawn per message, so agents do not collide
   # In a room of three there is nobody else the question could have been meant
   # for, so the range above is scaled by how many people and agents are here: a

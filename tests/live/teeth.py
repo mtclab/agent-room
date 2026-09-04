@@ -89,6 +89,21 @@ BOT_NAME_ARM = "                let Some(named) = names_me(ev, cfg, cues) else {
 #: The one line that separates `conversational` from every other mode.
 BOT_TIER2_ARM = "        if !cfg.bot_to_bot.tier2_on_bots() {"
 
+#: The branch that answers a room invitation without a judge. Two mutations use
+#: it: C-4 live, and its offline half U24.
+ROOM_INVITATION_BRANCH = "        let speak = if self.room_invitation(&decision, &ev) {"
+
+#: The judge's cue for a line thrown at the room, as it now states the norm.
+#: The mutant puts back the wording that only NAMED the fact, which is what a
+#: 27B judge read as "not directed at me" (the room log, 2026-09-05).
+ROOM_CUE = (
+    '                "- it is addressed to the room, not to one person: in this room'
+    " that means \\\n"
+    '                 whoever has something to say is invited, and \\"not directed at'
+    ' me\\" is not a \\\n'
+    '                 reason to stay out"'
+)
+
 #: `room_factor`'s early return, as one piece: the mutation has to replace the
 #: whole guard, because leaving the body unreachable is what makes it compile.
 ROOM_FACTOR_GUARD = """    if !cfg.small_room_backoff || participants == 0 {
@@ -504,6 +519,17 @@ MUTATIONS = [
         cargo_lib=True,
     ),
     # -- PR 3: the conversation, offline -------------------------------------
+    # -- PR 4: the room invitation (live) -------------------------------------
+    Mutation(
+        gate="C-4",
+        guard="turn: a room question answered without the judge",
+        path=RUST_SRC / "connector" / "turn.rs",
+        old=ROOM_INVITATION_BRANCH,
+        new="        let speak = if false && self.room_invitation(&decision, &ev) {  "
+        "// TEETH: the judge decides it after all",
+        test="tests/live/test_conversation.py::"
+        "test_c4_a_room_question_is_answered_without_the_judge",
+    ),
     Mutation(
         gate="U19",
         guard="policy: a bot's typed name satisfies `bot_to_bot: mentions`, offline",
@@ -554,6 +580,39 @@ MUTATIONS = [
         old="    matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE)",
         new="    false && (matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE))  // TEETH",
         test="addressing::tests::the_lines_that_hand_the_turn_to_the_room_and_the_ones_that_do_not",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    # -- PR 4: the room invitation, offline ----------------------------------
+    Mutation(
+        gate="U24",
+        guard="turn: the branch that skips the judge for a room invitation",
+        path=RUST_SRC / "connector" / "turn.rs",
+        old=ROOM_INVITATION_BRANCH,
+        new="        let speak = if false && self.room_invitation(&decision, &ev) {  "
+        "// TEETH: the judge decides it after all",
+        test="connector::turn::tests::a_room_question_from_a_human_is_answered_without_the_judge",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U25",
+        guard="addressing: an invitation has to ASK something, not just name the room",
+        path=RUST_SRC / "addressing.rs",
+        old="    addresses_room(body) && (body.contains('?') || matched(&ROOM_IMPERATIVE, body))",
+        new="    addresses_room(body)  // TEETH: naming the room is enough",
+        test="addressing::tests::"
+        "an_invitation_that_asks_for_an_answer_and_one_that_only_mentions_the_room",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U26",
+        guard="judging: the room cue states the norm instead of leaving it to be inferred",
+        path=RUST_SRC / "brain" / "judging.rs",
+        old=ROOM_CUE,
+        new='                "- it is addressed to the room rather than to one person"',
+        test="brain::judging::tests::the_judge_is_told_what_is_free_to_know_about_the_room",
         marker="offline",
         cargo_lib=True,
     ),

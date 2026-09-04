@@ -79,19 +79,19 @@ installs its own pinned zig and `cargo-zigbuild` and does not touch yours.
    timings, and anything that was looked at and deliberately left alone.
 7. Commit, push, and **tag**. This is the whole publish:
 
-       git tag v1.0.0-rc.4
+       git tag v1.0.0-rc.5
        git push origin main
-       git push origin v1.0.0-rc.4
+       git push origin v1.0.0-rc.5
 
    The tag has a leading `v`; the version inside it must equal the one in
    `Cargo.toml`, and the first thing the workflow does is refuse the tag if it
    does not ("tag v1.2.3 but Cargo.toml says 1.2.4"). A tag with a hyphen in it
-   (`v1.0.0-rc.4`) is published as a **pre-release** and does not move the
+   (`v1.0.0-rc.5`) is published as a **pre-release** and does not move the
    image's `latest`.
 8. Watch it, and check what came out:
 
        gh run watch
-       gh release view v1.0.0-rc.4
+       gh release view v1.0.0-rc.5
 
    The four jobs are `build` (once per target), `smoke`, `release` and `image`.
    `smoke` is the one that matters most: it runs BOTH binaries, and it is the
@@ -101,12 +101,12 @@ installs its own pinned zig and `cargo-zigbuild` and does not touch yours.
 **Verify the published release** the way a reader would, from a directory that
 holds nothing of yours:
 
-    gh release download v1.0.0-rc.4
+    gh release download v1.0.0-rc.5
     sha256sum -c SHA256SUMS
-    gh attestation verify agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz \
+    gh attestation verify agent-room-1.0.0-rc.5-x86_64-unknown-linux-musl.tar.gz \
         --repo mtclab/agent-room
-    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.4 --version
-    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.4 \
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.5 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.5 \
         --repo mtclab/agent-room
 
 The image is built FROM the tarballs the same run produced, so a friend pulling
@@ -122,7 +122,7 @@ shell (`docker logout ghcr.io`) the first time.
 **If the tag was wrong**, delete it and tag again - the workflow only ever runs
 on a tag being pushed, so nothing happens until one is:
 
-    git push origin :refs/tags/v1.0.0-rc.4 && git tag -d v1.0.0-rc.4
+    git push origin :refs/tags/v1.0.0-rc.5 && git tag -d v1.0.0-rc.5
 
 If the release was already created, delete that too (`gh release delete`); a
 release GitHub still holds is one somebody can download.

@@ -28,7 +28,7 @@
 
 use std::collections::HashSet;
 
-use crate::addressing::{Names, pre_score};
+use crate::addressing::{Names, PreScore, pre_score};
 use crate::config::{BotToBot, PolicyConfig};
 use crate::events::RoomEvent;
 use crate::ledger::Ledger;
@@ -59,10 +59,13 @@ pub struct Decision {
     pub reason: String,
     /// True when nobody was talking to me. Tier 2 lives here.
     pub unaddressed: bool,
-    /// The free read of the body ([`crate::addressing::pre_score`]), and zero
-    /// everywhere it was never taken. It decides no verdict: all it changes is
-    /// how long tier 2 backs off before asking the judge.
-    pub prescore: u8,
+    /// The free read of the body ([`crate::addressing::pre_score`]), and empty
+    /// everywhere it was never taken. It decides no verdict: what it changes is
+    /// how long tier 2 backs off before asking the judge, and - when the cues
+    /// say the room was asked something - whether the judge is asked at all.
+    /// The cues travel with the score because the log line that acts on them
+    /// has to say which ones they were.
+    pub prescore: PreScore,
 }
 
 impl Decision {
@@ -71,11 +74,11 @@ impl Decision {
             verdict,
             reason,
             unaddressed,
-            prescore: 0,
+            prescore: PreScore::default(),
         }
     }
 
-    fn with_prescore(mut self, prescore: u8) -> Self {
+    fn with_prescore(mut self, prescore: PreScore) -> Self {
         self.prescore = prescore;
         self
     }
@@ -441,27 +444,19 @@ fn unaddressed(ev: &RoomEvent, ledger: &Ledger, cfg: &PolicyConfig, cues: &Cues<
     // thinking about it is the difference between a conversation and a form.
     let pre = pre_score(ev, cues, cfg);
     if pre.score >= cfg.prescore_fast {
-        let cues = if pre.cues.is_empty() {
-            "nothing in particular".to_owned()
-        } else {
+        let reason = format!(
+            "unaddressed: tier 2 candidate (pre-score {}: {}), short back-off",
+            pre.score,
             pre.listed()
-        };
-        return Decision::new(
-            Verdict::Consider,
-            format!(
-                "unaddressed: tier 2 candidate (pre-score {}: {cues}), short back-off",
-                pre.score
-            ),
-            true,
-        )
-        .with_prescore(pre.score);
+        );
+        return Decision::new(Verdict::Consider, reason, true).with_prescore(pre);
     }
     Decision::new(
         Verdict::Consider,
         "unaddressed: tier 2 candidate, backing off before I decide".to_owned(),
         true,
     )
-    .with_prescore(pre.score)
+    .with_prescore(pre)
 }
 
 #[cfg(test)]
@@ -1662,7 +1657,7 @@ mod tests {
             &policy(),
         );
         assert_eq!(obvious.verdict, Verdict::Consider);
-        assert_eq!(obvious.prescore, 8);
+        assert_eq!(obvious.prescore.score, 8);
         assert_eq!(
             obvious.reason,
             "unaddressed: tier 2 candidate (pre-score 8: question, asked of the room, an \
@@ -1677,7 +1672,7 @@ mod tests {
         });
         let quiet = decide_named(&flat, &led, &policy());
         assert_eq!(quiet.verdict, Verdict::Consider);
-        assert_eq!(quiet.prescore, 0);
+        assert_eq!(quiet.prescore.score, 0);
         assert_eq!(
             quiet.reason,
             "unaddressed: tier 2 candidate, backing off before I decide"
@@ -1688,7 +1683,7 @@ mod tests {
             topics: vec!["build".to_owned()],
             ..policy()
         };
-        assert_eq!(decide_named(&flat, &led, &cfg).prescore, 2);
+        assert_eq!(decide_named(&flat, &led, &cfg).prescore.score, 2);
     }
 
     #[test]
