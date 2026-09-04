@@ -43,8 +43,12 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "aws_lc_rs"] }
+# A TLS SERVER, for the one gate that needs a real handshake to prove
+# `tls.verify` decides anything (`config::verification_is_on_until_...`).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tempfile = "3"
 tokio = { version = "1.53", features = ["test-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 [profile.release]
 strip = true

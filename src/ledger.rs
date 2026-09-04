@@ -673,6 +673,37 @@ mod tests {
     }
 
     #[test]
+    fn the_pair_cooldown_lasts_as_long_as_the_config_says() {
+        // The cooldown and the three-a-minute rule are two different things:
+        // the rule lets go after 60 s on its own, so a cooldown is only worth
+        // configuring when it outlasts the window. This one does, and the
+        // shipped 60 s would have let the pair start again at 61 s.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let budgets = BudgetsConfig {
+            pair_cooldown_s: 600.0,
+            ..BudgetsConfig::default()
+        };
+        let mut led = ledger(dir.path(), &clock, budgets);
+        for index in 0..3 {
+            led.record_post(&format!("$mine{index}"), "$root", OTHER_BOT, None, 1);
+        }
+        clock.advance(61.0);
+        let refused = led.pair_allows(OTHER_BOT, clock.now());
+        assert!(
+            !refused.allowed,
+            "a 600 s cooldown was over after 61 s: it is not the config's"
+        );
+        assert!(
+            refused.reason.contains("pair cooldown"),
+            "the three-a-minute rule is what refused, not the cooldown: {}",
+            refused.reason
+        );
+        clock.advance(600.0);
+        assert!(led.pair_allows(OTHER_BOT, clock.now()).allowed);
+    }
+
+    #[test]
     fn the_thread_budget_counts_every_post_in_the_thread() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let clock = FakeClock::new();

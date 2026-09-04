@@ -1029,6 +1029,29 @@ these are BUILT and recorded in `docs/GATES.md` with their teeth runs:
     the identical journey in a plain room as its negative control.
 14. Each gate proven to have teeth by reverting the guard it protects.
 
+### Two standing rules about INPUTS (2026-09-04)
+
+Both were added after a green suite missed two defects in a row, and both are
+about what the tests FEED the product rather than what they assert about it.
+
+**Knob coverage.** Every field in the config schema is set to a non-default
+value by at least one test, and `tests/knob_coverage.rs` fails the build when
+one is not - with the inventory derived from the config types themselves, so it
+cannot go stale. A knob nobody ever turns is a knob no test can tell the
+presence of: `doctor` shipped without ever sending the configured `api_key`
+because every gate pointed at a keyless endpoint, so the knob had never been set
+to anything but `""` anywhere in the repository. The gate's first run found
+fourteen more of the same shape, including `tls.verify` and `tls.ca_file`, which
+turned out to do nothing at all unless `tls.enabled` was also set.
+
+**Client realism.** The human in a live gate posts what a person's client posts:
+`m.text` with a body and nothing else. `m.mentions` and `m.relates_to` are
+machine-level signals a client writes only for a pill, a reply or a thread, so
+passing one to `post()` is a deliberate statement that the gate is about that
+signal, and `post_typed_name()` is how an agent is addressed the way people
+really do it. Addressing by name reached a real room broken while every gate was
+green, because every gate but one attached a pill the sender never typed.
+
 ## Open questions for owner
 
 - **Distribution: public repo, or tarballs the owner sends? OPEN.** The tarball

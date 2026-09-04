@@ -67,6 +67,13 @@ has.
     make build     # target/release/agent-room, for developing against
     make release   # static musl tarballs for x86-64 and arm64, in dist/
 
+`make gate` includes two standing rules about what the tests feed the product:
+every knob in the config schema must be set to a non-default value by some test
+(`tests/knob_coverage.rs`), and no tracked file may name a deployment or an
+account (`tests/publish_clean.rs`). The live harness has the third: its human
+posts what a real client posts, and every machine-level signal (`m.mentions`, a
+thread) is opt-in and deliberate - see CLIENT REALISM in `tests/conftest.py`.
+
     make live-env  # the live harness's own Python (tests/live/README.md)
     make live      # the live journeys against a real homeserver
 

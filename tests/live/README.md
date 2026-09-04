@@ -61,6 +61,16 @@ Which real accounts those are is a deployment detail: it lives in
 E1 is a Rust test rather than a pytest one, because the Python client here has
 no crypto store and could not tell an encrypted reply from a plain one.
 
+## What the human posts
+
+The human here posts what a person's client posts: `m.text` with a body and
+nothing else. `m.mentions` is written only when the sender picks a name out of
+the completion list, and `m.relates_to` only when they use the reply or thread
+affordance - so those are opt-in (`post(..., mentions=[...])`,
+`thread_root=...`), and passing one says the gate is about that signal.
+`post_typed_name()` addresses an agent the way people actually do, by typing its
+name. The rule and the reason are at the top of `tests/conftest.py`.
+
 ## Running them
 
     make live          # G1-G12, M1-M5, D1

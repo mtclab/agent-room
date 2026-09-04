@@ -47,7 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::addressing::{Names, names_for};
 use crate::brain::Brain;
-use crate::config::{BotToBot, Config};
+use crate::config::{BotToBot, Config, PolicyConfig};
 use crate::events::{BotRules, RoomEvent, from_source, is_bot_user, localpart};
 use crate::ledger::{Clock, Ledger};
 use crate::matrix;
@@ -659,34 +659,30 @@ impl Connector {
         mine.push(localpart(&self.me).to_owned());
         mine.extend(policy.addressed_names.iter().cloned());
 
-        let mut others: Vec<(String, Vec<String>)> = Vec::new();
-        if policy.other_names_from_members {
+        let members: Vec<(String, Option<String>)> =
             match room.members_no_sync(RoomMemberships::JOIN).await {
-                Ok(members) => {
-                    for member in members {
-                        let user_id = member.user_id().as_str();
-                        if user_id == self.me {
-                            continue;
-                        }
-                        others.push((
-                            user_id.to_owned(),
-                            names_for(user_id, member.display_name()),
-                        ));
-                    }
+                Ok(joined) => joined
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.user_id().as_str().to_owned(),
+                            member.display_name().map(ToOwned::to_owned),
+                        )
+                    })
+                    .collect(),
+                Err(exc) => {
+                    warn!(
+                        "{}: cannot read the member list ({exc}); other names come from the \
+                         config alone",
+                        room.room_id()
+                    );
+                    Vec::new()
                 }
-                Err(exc) => warn!(
-                    "{}: cannot read the member list ({exc}); other names come from the config \
-                     alone",
-                    room.room_id()
-                ),
-            }
-        }
-        for user_id in &self.bot_user_ids {
-            if user_id != &self.me && !others.iter().any(|(known, _)| known == user_id) {
-                others.push((user_id.clone(), names_for(user_id, None)));
-            }
-        }
-        Names::new(&mine, others)
+            };
+        Names::new(
+            &mine,
+            other_names(policy, &self.me, &members, &self.bot_user_ids),
+        )
     }
 
     /// Normalise one raw timeline event, or None when it is not a message.
@@ -1031,6 +1027,39 @@ impl Connector {
     }
 }
 
+/// Everybody ELSE's names: one entry per user id, with every name that user
+/// answers to.
+///
+/// `members` is the room's member list, and `policy.other_names_from_members`
+/// decides whether it is read at all: an agent whose display name is a common
+/// word turns it off, and then only what the config NAMES is somebody else's.
+/// The configured `bot_user_ids` are added either way - they are known before
+/// anybody has joined or spoken, which is what makes "that line was addressed
+/// to the other agent" decidable on the first message in a room.
+#[must_use]
+fn other_names(
+    policy: &PolicyConfig,
+    me: &str,
+    members: &[(String, Option<String>)],
+    bot_user_ids: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut others: Vec<(String, Vec<String>)> = Vec::new();
+    if policy.other_names_from_members {
+        for (user_id, display) in members {
+            if user_id == me {
+                continue;
+            }
+            others.push((user_id.clone(), names_for(user_id, display.as_deref())));
+        }
+    }
+    for user_id in bot_user_ids {
+        if user_id != me && !others.iter().any(|(known, _)| known == user_id) {
+            others.push((user_id.clone(), names_for(user_id, None)));
+        }
+    }
+    others
+}
+
 /// Whether this config's policy would ever answer a bot at all. Used by the
 /// startup log so an operator can see the shape of the agent they started.
 #[must_use]
@@ -1052,6 +1081,41 @@ mod tests {
 
     const ME: &str = "@bot-a:example.com";
     const HUMAN: &str = "@human:example.com";
+
+    #[test]
+    fn the_member_list_is_read_for_names_only_while_the_policy_says_so() {
+        // What the knob is FOR: an agent whose display name is a common word
+        // turns it off, and then a member called "Alex" is no longer somebody
+        // this agent will stand down for - only what `bot_user_ids` names is.
+        let members = vec![(HUMAN.to_owned(), Some("Alex".to_owned()))];
+        let bots = vec!["@bot-b:example.com".to_owned()];
+        let mine = vec!["bot-a".to_owned()];
+
+        let learning = PolicyConfig::default();
+        let names =
+            crate::addressing::Names::new(&mine, other_names(&learning, ME, &members, &bots));
+        let (whose, _) = names
+            .addresses_other("alex, what do you think?", false)
+            .expect("the member list is where the human's name comes from");
+        assert_eq!(whose, HUMAN);
+
+        let deaf = PolicyConfig {
+            other_names_from_members: false,
+            ..PolicyConfig::default()
+        };
+        let names = crate::addressing::Names::new(&mine, other_names(&deaf, ME, &members, &bots));
+        assert!(
+            names
+                .addresses_other("alex, what do you think?", false)
+                .is_none(),
+            "the member list was read with other_names_from_members off"
+        );
+        // The configured bots are known either way, which is what N2 rests on.
+        let (whose, _) = names
+            .addresses_other("bot-b, what do you think?", false)
+            .expect("a configured bot id is a name whatever the member list says");
+        assert_eq!(whose, "@bot-b:example.com");
+    }
 
     /// One event as the homeserver sends it, threaded or not.
     fn event(event_id: &str, sender: &str, ts: f64, thread_root: Option<&str>) -> RoomEvent {

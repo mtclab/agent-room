@@ -374,8 +374,7 @@ impl Runner {
     pub(crate) async fn unprompted_tick(&self, worker: &Arc<RoomWorker>) {
         let now = self.now();
         let directory = impulse_dir(&self.cfg.state_dir, worker.room_id.as_str());
-        #[allow(clippy::cast_precision_loss)]
-        let limit_s = self.cfg.policy.unprompted_max_wait_min as f64 * 60.0;
+        let limit_s = self.cfg.policy.unprompted_wait_limit_s();
         let (waiting, last_human_post_ts) = {
             let mut state = worker.state.lock().await;
             collect_impulses(
@@ -944,6 +943,67 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_score_threshold_is_the_configured_one() {
+        // The shipped threshold is 4; an operator who wants their agent quicker
+        // off the mark lowers it, and a build that kept its own number would
+        // leave every such line waiting the full back-off.
+        let cfg = crate::config::PolicyConfig {
+            prescore_fast: 2,
+            ..crate::config::PolicyConfig::default()
+        };
+        let (low, high) = tier2_range(&cfg, 2, HAZARD_QUIET_FACTOR);
+        assert!((low - cfg.backoff_s.0).abs() < f64::EPSILON, "{low}");
+        assert!(
+            (high - (cfg.backoff_s.0 + PRESCORE_FAST_WINDOW_S)).abs() < f64::EPSILON,
+            "a line scoring 2 did not take the short back-off at prescore_fast 2: {high}"
+        );
+
+        // And below it, nothing has moved: the configured range, hazard and all.
+        let (low, high) = tier2_range(&cfg, 1, HAZARD_QUIET_FACTOR);
+        assert!((low - 10.0).abs() < f64::EPSILON, "{low}");
+        assert!((high - 80.0).abs() < f64::EPSILON, "{high}");
+    }
+
+    #[test]
+    fn the_wait_a_thought_gives_up_after_is_the_configured_one() {
+        // `unprompted_max_wait_min` is minutes in the file and seconds in the
+        // code, which is exactly the kind of conversion that goes wrong
+        // silently: at the shipped 240 minutes nothing here would be dropped.
+        let cfg = crate::config::PolicyConfig {
+            unprompted_max_wait_min: 5,
+            ..crate::config::PolicyConfig::default()
+        };
+        assert!((cfg.unprompted_wait_limit_s() - 300.0).abs() < f64::EPSILON);
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let clock = FakeClock::new();
+        let mut state = state(dir.path(), &clock);
+        let candidate = Candidate::new(Occasion::InnerThought, "something".to_owned(), clock.now());
+        assert!(queue_candidate(&mut state, &room(), candidate));
+
+        clock.advance(4.0 * 60.0);
+        expire_waiting(
+            &mut state,
+            &room(),
+            clock.now(),
+            cfg.unprompted_wait_limit_s(),
+        );
+        assert_eq!(state.queue.len(), 1, "it gave up inside its own window");
+
+        clock.advance(2.0 * 60.0);
+        expire_waiting(
+            &mut state,
+            &room(),
+            clock.now(),
+            cfg.unprompted_wait_limit_s(),
+        );
+        assert!(
+            state.queue.is_empty(),
+            "six minutes into a five-minute wait, the thought is a notification"
+        );
+    }
+
+    #[test]
     fn the_hazard_doubles_the_wait_in_a_room_nobody_has_touched() {
         let now = 10_000.0;
         // No human for hours, and nothing at all for over an hour.
@@ -1096,6 +1156,38 @@ mod tests {
         forget_candidate(&mut state, "loop:$mine");
         assert!(state.queue.is_empty());
         assert!(state.queued.is_empty());
+    }
+
+    #[test]
+    fn the_inner_thought_threshold_is_the_configured_one() {
+        // Two lines of an agent wanting to say something is a candidate at a
+        // threshold of 2, and silence at the shipped 4. The knob IS how talkative
+        // an agent is, so a build that kept its own number would ignore the one
+        // setting that governs it.
+        let cfg = crate::config::PolicyConfig {
+            inner_thoughts_threshold: 2,
+            ..crate::config::PolicyConfig::default()
+        };
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let clock = FakeClock::new();
+        let mut state = state(dir.path(), &clock);
+        let raised = note_urgency(
+            &mut state,
+            &room(),
+            None,
+            2,
+            "wanted to",
+            cfg.inner_thoughts_threshold,
+            clock.now(),
+        )
+        .expect("2 of 2 is over the line the config drew");
+        assert_eq!(raised.kind, Occasion::InnerThought);
+        assert_eq!(raised.note, "wanted to");
+        assert_eq!(
+            state.inner_urgency.get(MAIN_TIMELINE),
+            None,
+            "the accumulator did not reset when it fired"
+        );
     }
 
     #[test]

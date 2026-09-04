@@ -42,6 +42,11 @@ installs its own pinned zig and `cargo-zigbuild` and does not touch yours.
 1. Set the version in `Cargo.toml`. It is what `agent-room --version` prints and
    what every artefact is named after.
 2. `make gate` - fmt, clippy pedantic with warnings as errors, the unit tests.
+   Two of those are standing rules rather than tests of a behaviour: no tracked
+   file names a deployment or an account (`tests/publish_clean.rs`), and every
+   knob in the config schema is set to a non-default value by some test
+   (`tests/knob_coverage.rs`) - a knob nobody turns is a knob nothing is
+   testing. Both fail with the `file:line` to fix.
 3. **Stop editing.** From here the tree is frozen, because everything below
    gates one particular build.
 4. `make release`. It builds `x86_64-unknown-linux-musl` and

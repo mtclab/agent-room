@@ -2033,3 +2033,211 @@ and the gate catches it because the SECOND line is the one under test and its
 answer is what times out. The third line's silence, which is the other half of
 the gate, is what the mutant produces everywhere: a gate asserting only that
 would have passed its own mutant, which is the trap N4 fell into the day before.
+
+# Coverage gates (2026-09-04)
+
+Two misses in a row, both found by somebody other than the suite, and both of
+the same shape: a green suite that had never once exercised the thing that was
+broken.
+
+1. **`doctor` never sent the configured `api_key`.** An outside contributor
+   found it (PR #4). The brain check built its `GET /models` with no
+   `Authorization` header at all, so an endpoint that wants a key failed 401
+   with the right key sitting in the config. Nothing caught it because every
+   gate in the repository pointed at a keyless endpoint: `api_key` had never
+   been set to anything but `""` ANYWHERE, so no test could have noticed whether
+   it was sent.
+2. **A typed name was never typed.** Addressing by name shipped with unit gates
+   and three live gates, but every OTHER live gate that said "a human addresses
+   the agent" attached an `m.mentions` - which a Matrix client writes only when
+   the sender picks the name out of a completion list. The form people actually
+   use in Element was the one form the harness never sent.
+
+Neither is a missing assertion. Both are a missing INPUT: a knob nobody ever
+turned, and a message shape nobody ever sent. So the two gates below are about
+inputs rather than outcomes, and they are standing rules rather than tests of
+one behaviour.
+
+## Gate 1: knob coverage - `tests/knob_coverage.rs` (`cargo test`)
+
+**The rule: every field in the config schema is set to a NON-DEFAULT value by at
+least one test in the repository.** A knob left at its default in every test is
+a knob no test can tell the presence of.
+
+The inventory is derived from the types, never listed: two baseline configs -
+differing in every value an operator must supply, identical everywhere else -
+are loaded through the product's own `load_config`, serialised with `serde_json`
+and walked key by key. A field with the same value in both HAS a schema default,
+and that value is it; a field that differs has none and only has to be set at
+all. Add a knob to `config.rs` and it is in the inventory on the next run; add a
+REQUIRED one and both baselines stop loading, which fails the gate with the
+parser's own message. (`Config` and `BrainConfig` gained a `Serialize` derive
+for this and nothing else.)
+
+The scan then reads the tracked test sources - all of `tests/`, and the
+`#[cfg(test)]` regions of `src/` - for that name being assigned: `name: value`
+in a Rust struct literal or a YAML mapping, `"name": value` in a JSON or Python
+dict, `.name = value`, a Python keyword argument or `config["name"] =`, and
+`--name value`. Rust strings holding YAML are unescaped and split on their `\n`
+first, so a config written inside a test reads like the file it is.
+
+**What it will not do is guess.** A literal is compared with the default; a bare
+word inside a config file is the scalar it looks like (`post_as: text` is the
+string), but the same shape in Rust is a name, looked up as a constant in the
+same file and, failing that, not counted at all (`topics: wanted` could be
+anything); a type in a declaration (`state_dir: PathBuf`, `topics: &[&str]`) is
+not a value at all. The single
+thing taken on trust is that an expression which is not the literal `None` is
+not None, which is what lets `persona_file: str(path)` count against a default
+of `null`. Everything else fails CLOSED, and a knob whose only assignments could
+not be read is reported as uncovered with the `file:line` that defeated the
+reader. The gate does not scan itself: its baselines mention nearly every knob
+in the schema, and a gate that counted its own scaffolding would pass for ever.
+
+### The inventory, before
+
+**75 knobs, 59 turned, 16 left at their default** - the tree the `api_key`
+defect shipped in, read by the gate as it first stood. Two of the sixteen turned
+out to be the READER's fault rather than a gap, and both are recorded as such
+below; with the reader as it stands now the same tree shows **fourteen**, and
+those fourteen were all real.
+
+| Knob (default) | Closed by |
+|---|---|
+| `brain.openai_compat.max_tokens` (600) | `openai_compat::the_token_budgets_are_the_ones_the_operator_set` - 42 tokens for the reply and 7 for the judge, read back off the wire |
+| `brain.openai_compat.judge_max_tokens` (60) | the same gate: the two budgets are two different costs |
+| `brain.openai_compat.judge_extra_body` (`{}`) | `openai_compat::a_judge_body_of_its_own_replaces_the_reply_bodys_extras` - the judge's `top_k` arrives and the reply's `chat_template_kwargs` does not, which is what "replaces, not merges" means |
+| `brain.openai_compat.warm_cooldown_s` (120) | `openai_compat::the_warm_up_cooldown_is_the_configured_one` - at 0 every typing notice warms, where the shipped 120 s makes a typed paragraph one request |
+| `brain.claude_code.judge_model` ("haiku") | `claude_code::the_judge_runs_the_model_it_was_told_to_and_the_reply_model_when_it_was_not` - `--model opus` for the judge, and the reply model when the knob is empty |
+| `brain.claude_code.judge_timeout_s` (90) | `claude_code::the_judge_gives_up_on_its_own_timeout_and_not_the_replys` - a fake CLI that sleeps 30 s, a judge timeout of 1 s and a `timeout_s` of 300: the verdict is a no in under fifteen seconds or the wrong timeout was used |
+| `brain.claude_code.permission_mode` ("default") | `claude_code::the_permission_mode_the_operator_set_is_the_one_claude_runs_under` - `--permission-mode plan` on the reply AND on the judge. (The reader's fault as well: `permission_mode: bypassPermissions` in a config-refusal test is a real non-default value, and the scan was reading the YAML scalar as a Rust name. The hole was real anyway - nothing proved the mode reached the CLI.) |
+| `brain.claude_code.rate_limit_backoff_s` (300) | `claude_code::the_cooldown_after_a_usage_limit_is_as_long_as_the_config_says` - a 60 s cooldown still spawning nothing at 30 s and spawning again at 70 |
+| `mcp.post_as` ("notice") | Nothing: **the reader was wrong.** `post_as: text` inside a Rust string is YAML, and the scan was reading the scalar as a variable it could not resolve. A bare word inside a config file is a scalar now; the knob was covered all along by `config::every_knob_in_the_schema_is_one_this_build_acts_on` and `mcp::a_post_is_a_notice_by_default_and_text_when_configured` |
+| `policy.prescore_fast` (4) | `unprompted::the_pre_score_threshold_is_the_configured_one` - at 2, a line scoring 2 takes the short back-off, and one scoring 1 still takes the full range |
+| `policy.inner_thoughts_threshold` (4) | `unprompted::the_inner_thought_threshold_is_the_configured_one` - urgency 2 raises a candidate at a threshold of 2 and the accumulator resets |
+| `policy.unprompted_max_wait_min` (240) | `unprompted::the_wait_a_thought_gives_up_after_is_the_configured_one` - five minutes, kept at four and dropped at six. The minutes-to-seconds conversion moved onto `PolicyConfig::unprompted_wait_limit_s()`, which is the seam that made the knob testable at all |
+| `policy.impulse_ttl_s` (21600) | `mcp::an_impulse_carries_the_lifetime_the_config_gave_it` - the real MCP tool writes a 90 s lifetime INTO the file, and the file expires at 91 s |
+| `policy.other_names_from_members` (true) | `connector::the_member_list_is_read_for_names_only_while_the_policy_says_so` - with it off, a member called "Alex" is no longer somebody to stand down for, and the configured `bot_user_ids` still are. The member-list branch moved into a pure `other_names()` beside the SDK call |
+| `policy.budgets.pair_cooldown_s` (60) | `ledger::the_pair_cooldown_lasts_as_long_as_the_config_says` - a 600 s cooldown still refusing at 61 s, where the three-a-minute rule has already let go and the shipped 60 s would have too |
+| `tls.verify` (true) | `config::verification_is_on_until_the_config_turns_it_off_and_mtls_has_no_say` - a real TLS handshake against a self-signed server: refused with the shipped default, completed with `verify: false`, and completed again with verification ON and the CA named in `ca_file`. **This one found a defect - see below.** |
+
+### The defect the gate found: `tls.verify` and `tls.ca_file` did nothing
+
+`TlsConfig::build_client` returned early when `tls.enabled` was false, before
+either the `ca_file` or the `verify` branch. `enabled` is about the certificate
+this client PRESENTS - mTLS, which almost nobody needs - while `ca_file` and
+`verify` are about the certificate the SERVER presents, which is what a
+homeserver behind a private CA or a self-signed development certificate needs.
+So an operator who set `verify: false` for their own dev homeserver got a
+verifying client and no word about it, and `config.rs` said in its own module
+docs that "nothing an operator sets is silently ignored".
+
+Fixed: the identity is built only when `enabled` is set, and the two
+server-trust knobs apply either way. The gate that proves it is the one written
+to close the coverage gap, and its middle assertion (`verify: false` completing
+a handshake with no client certificate anywhere) is exactly the case that used
+to do nothing.
+
+### The inventory, after
+
+**75 knobs, 75 turned.** `cargo test --test knob_coverage -- --nocapture` prints
+the count on every run:
+
+    75 knobs in the schema, 75 turned off their default by a test
+
+### Teeth
+
+Delete one covering test and the gate names the knob it covered. Measured
+2026-09-04, with `openai_compat::the_token_budgets_are_the_ones_the_operator_set`
+commented out:
+
+    2 of 75 config knobs are never set to anything but their default, so no test
+    in this repository can tell whether they do anything:
+
+      brain.openai_compat.judge_max_tokens (default 60)
+          src/brain/openai_compat.rs:521: judge_max_tokens = 60, [the default]
+          src/config.rs:1633: judge_max_tokens = 60, [the default]
+          src/config.rs:1662: judge_max_tokens = 60, [the default]
+      brain.openai_compat.max_tokens (default 600)
+          src/brain/openai_compat.rs:519: max_tokens = 600, [the default]
+          src/config.rs:1631: max_tokens = 600, [the default]
+          src/config.rs:1660: max_tokens = 600, [the default]
+
+Both knobs the deleted test covered, each with the places that DO mention it and
+why they do not count. Restored, the gate is green again.
+
+## Gate 2: client realism in the live harness
+
+**The rule: the human in a live gate posts what a person's client posts, and
+every machine-level signal is the exception, stated on purpose.** It is written
+at the top of `tests/conftest.py`, where the harness that would otherwise drift
+back lives.
+
+Element sends typed text as `m.text` with a `body` and nothing else. `m.mentions`
+appears only when the sender picks a name out of the completion list;
+`m.relates_to` only when they use the reply or thread affordance. So:
+
+- `post()` sends a body alone. `mentions=` and `thread_root=` are opt-in, and
+  passing one now says "this gate is about that signal".
+- `post_typed_name(human, room, bot_localpart, text)` is the way to address an
+  agent as a person does - a vocative in the body, no pill, no reply, no thread.
+  Like `post_unaddressed()`, it proves its own premise before posting: the name
+  has to be one the room recognises (asked of the homeserver, since the account
+  names come from the environment), and nobody else's name may be in the line.
+  The name test is the product's own word rule, hyphen included, so a member
+  called "gate" is not "named" by a line about `gate-bot-a`.
+
+### The audit
+
+Every live gate, by how its human addresses the agent:
+
+| Gate | Address form | Verdict |
+|---|---|---|
+| G1 mention answered in thread | `m.mentions` **and now a typed name** | the pill half was the whole gate; a typed-name exchange was added to it, asserting the same journey (threaded `m.notice`, mentioning the human) with `named in the body` in the log |
+| G2 unaddressed message left alone | **now `post_unaddressed`**, then a pill for the liveness half | the "just thinking aloud" line now proves it names nobody before it is posted; the liveness half addresses both agents at once, which is what the pill is for |
+| G3 pair budget | bot-to-bot | no human address |
+| G4 restart, no duplicate, no backlog | `m.mentions` | the subject is the restart, not the address; G1 carries the typed form for the same reply path |
+| G5-G8 tier 2, heartbeat | `post_unaddressed` | addressed to NOBODY on purpose - a typed name would defeat them |
+| G9-G12 impulses, loops, inner thoughts, warm-up | plain bodies and one pill | the human line is a presence signal, not an address |
+| N1-N4 addressing by name | typed names, `post_unaddressed` | this is the typed form's own gate |
+| T1 transcript rolling | 25 pills | volume, not addressing |
+| M1-M5 the live session | plain bodies | read by a session's tools, not answered by a connector |
+| C1-C3 the Claude brain, D1 doctor, E1 encrypted | `m.mentions` | the brain, the command and the crypto are the subject; each costs real money or a real device to run |
+
+### The live run, 2026-09-04
+
+`AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room pytest -q
+tests/live/test_journeys.py tests/live/test_addressing.py` - **7 passed, 1
+failed**, and the failure is recorded here because it was the harness's
+environment and not the product:
+
+| Gate | Time | |
+|---|---|---|
+| G1 | 5.8 s | the pill exchange and the new typed-name exchange, both answered in thread, `named in the body` in the log for the second |
+| G2 | 24.3 s | the unaddressed line, now proving it names nobody before it is posted |
+| G3 | 97.1 s | unchanged |
+| G4 | 49.9 s | unchanged |
+| N1 | 10.2 s | unchanged |
+| N2 | 25.8 s | unchanged |
+| N3 | 63.4 s | unchanged |
+| N4 | FAILED | `never became ready`: the connector logged its startup line and nothing else for 60 s, then took SIGKILL to stop |
+
+N4's connector never got as far as `encryption ready`, so it hung in the login,
+the store open or the encryption bootstrap - all of it before anything this
+slice touched. A full `make gate` - clippy over every target, then 255 tests,
+each of the Claude ones spawning a Python interpreter - was running on the same
+box, and `cli.rs` already carries a comment about the store open alone taking a
+while under load. Re-run on an idle box, nothing else
+changed:
+
+    AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room \
+        pytest -q tests/live/test_addressing.py
+    4 passed in 121.18s
+
+**N1 5.7 s, N2 24.8 s, N3 61.9 s, N4 25.2 s** - N4 back to the 25 s it has
+always taken. The lesson is for the runner rather than the code: the live gates
+time out on real seconds, so nothing else may be building while they run.
+
+`make gate` on the same tree: **357 tests** (255 in the crate, 90 R4 commands, 8
+state-compat, 2 encrypted-room, the publish scrub and the knob-coverage gate),
+clippy pedantic clean with warnings as errors. `make lint-live`: clean, 13 files.

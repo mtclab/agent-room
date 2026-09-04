@@ -42,6 +42,8 @@ from conftest import (
     make_connector,
     messages,
     post,
+    post_typed_name,
+    post_unaddressed,
     relates_to,
     wait_for,
     wait_for_join,
@@ -82,6 +84,25 @@ async def test_g1_a_mention_is_answered_in_thread(
     assert relation["event_id"] == trigger
     assert relation["m.in_reply_to"]["event_id"] == trigger
 
+    # The same journey the way a person actually types it: the agent's name in
+    # the body, with no pill, no reply and no thread. Until N1 existed, EVERY
+    # gate that said "a human addresses the agent" attached an `m.mentions`,
+    # which only a completion list writes - so the form people really use was
+    # the one form nothing gated (see CLIENT REALISM in tests/conftest.py).
+    typed = await post_typed_name(human, room_s3, S3_BOT_A_NAME, "one more thing")
+    events = await wait_for(
+        lambda evs: len(by_sender(evs, S3_BOT_A)) >= 2, human, room_s3, seconds=30
+    )
+    replies = by_sender(events, S3_BOT_A)
+    assert len(replies) == 2, f"the typed name was not answered ({len(replies)} replies)"
+    answer = next(reply for reply in replies if relates_to(reply).get("event_id") == typed)
+    assert answer["content"]["msgtype"] == "m.notice"
+    assert LIVE_HUMAN in answer["content"]["m.mentions"]["user_ids"]
+    assert relates_to(answer)["rel_type"] == "m.thread"
+    assert "named in the body" in bot.log_text(), (
+        "something other than the name guard answered the typed name"
+    )
+
 
 # -- G2 ----------------------------------------------------------------------
 
@@ -107,7 +128,11 @@ async def test_g2_an_unaddressed_message_is_left_alone(
         connector.wait_ready()
     await wait_for_join(human, room_s3, [S3_BOT_A, S3_BOT_B])
 
-    await post(human, room_s3, "just thinking aloud")
+    # Through `post_unaddressed`, which asks the room for its members and
+    # refuses to post a body carrying one of their names: without that, an
+    # account renamed on the homeserver would turn this into a tier-1 gate
+    # wearing tier 2's name.
+    await post_unaddressed(human, room_s3, "just thinking aloud")
 
     await asyncio.sleep(20)
     events = await messages(human, room_s3)
