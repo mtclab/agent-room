@@ -37,9 +37,9 @@ Two tarballs per release, one per architecture. Take the one for yours:
 
 Both are on the release page, next to a `SHA256SUMS` covering the pair:
 
-    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.2
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.2/agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.2/SHA256SUMS
+    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.3
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.3/agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.3/SHA256SUMS
 
 (`.../releases/latest` is whichever release is newest.) Somebody may have sent
 you the tarball directly instead, with its `SHA256SUMS` line in a separate
@@ -48,18 +48,18 @@ message; that is the same file.
 **Check it before you run it.**
 
     sha256sum -c SHA256SUMS
-    # agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz: OK
+    # agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz: OK
 
 or, if you only got the one line, compare it yourself:
 
-    sha256sum agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz
+    sha256sum agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
 
 A checksum only says the file did not change on the way to you. What says where
 it came FROM is the signed **provenance attestation** every release artefact
 carries - it names the workflow, the commit and the tag the binary was built
 from, and the GitHub CLI checks it against the public transparency log:
 
-    gh attestation verify agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz \
+    gh attestation verify agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz \
         --repo mtclab/agent-room
 
 That either prints the workflow and the commit that produced the file, or it
@@ -68,8 +68,8 @@ else.
 
 Then unpack it and put the binary on your PATH:
 
-    tar xzf agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl.tar.gz
-    cd agent-room-1.0.0-rc.2-x86_64-unknown-linux-musl
+    tar xzf agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
+    cd agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl
     mkdir -p ~/.local/bin && install -m 0755 agent-room ~/.local/bin/
     agent-room --version
 
@@ -92,9 +92,9 @@ directory are untouched by an upgrade.
 (amd64 and arm64) built from these very tarballs - the same binary, not a
 second compilation:
 
-    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.2
-    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.2 --version
-    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.2 \
+    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.3
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.3 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.3 \
         --repo mtclab/agent-room
 
 `examples/docker/` in the repository has the compose service that goes with it:
@@ -282,8 +282,9 @@ not equal. It is worth reading this section: it is the whole difference between
 an agent people are glad is in the room and one they mute.
 
 **Addressed: it answers.** Somebody mentions it, types its name, replies to one
-of its messages, or writes in a thread it is already in. This is the job, and it
-is the only case with no back-off and no second-guessing.
+of its messages, writes in a thread it is already in, or comes straight back to
+something it just said. This is the job, and it is the only case with no
+back-off and no second-guessing.
 
 **Typing its name is enough.** Only a client's completion list turns a name into
 a mention Matrix can see, and nobody types that way in a real conversation. So
@@ -301,6 +302,13 @@ should ask qwen about that") is talk ABOUT your agent rather than to it, and
 goes to the tier below - unless the line also says "you" ("what do you make of
 it qwen"), which is a question however it is punctuated.
 
+**And you only have to say its name once.** People do not repeat a name every
+sentence: you ask, it answers, and "and why is that?" is still to it. So a line
+of yours that arrives within two minutes of your agent's own last message, in
+the same conversation, is answered as if you had named it again
+(`followup_window_s`, 0 turns it off). Anybody else speaking in between ends
+that - they were the one being answered - and the budgets below still apply.
+
 **Not addressed: it thinks about it, usually briefly.** A human says something
 into the room addressed to nobody. Your agent waits a random 5-40 seconds,
 re-reads the room, and stands down if anybody has answered in the meantime - so
@@ -309,6 +317,14 @@ something, it asks its own model one cheap question - "would you add something
 nobody has said?" - and speaks only if the answer is yes. Anything but a clear
 yes is a no. Bots never trigger this: two agents answering each other's
 unaddressed lines is a loop with no human in it.
+
+An obvious question does not wait the full forty seconds for that. Before
+anything is asked of a model, the line is read for the things that are free to
+read - a question mark, a "you" or an "anyone", the agent's own name in
+passing, a word from `topics` - and a line carrying enough of them
+(`prescore_fast`) takes a five-second pause instead. It changes the WAIT and
+nothing else: the model still decides, and the agent still stands down if
+somebody got there first.
 
 **Nothing in the room made it speak at all.** Three things can make your agent
 say something nobody asked for, and all three wait until a human is actually in
@@ -358,8 +374,11 @@ In `policy:` in your config:
 | `addressed_names` | `[]` | extra names it answers to, beyond its display name and localpart |
 | `other_names_from_members` | `true` | learn the other people's names from the room's member list |
 | `bare_name_addresses` | `false` | treat a name anywhere in a line as an address |
+| `followup_window_s` | `120` | how long "you spoke to me last" keeps the turn; 0 = off |
 | `answer_unaddressed` | `true` | join in on questions addressed to nobody |
 | `backoff_s` | `[5, 40]` | how long it waits before doing so |
+| `topics` | `[]` | words that say a line is this agent's subject |
+| `prescore_fast` | `4` | the score at which it waits ~5 s instead of 5-40 |
 | `presence_window_min` | `30` | how long after somebody posts it still counts as "they are here" |
 | `followup_delay_s` | `[1200, 10800]` | when it comes back to a question nobody answered |
 | `impulse_ttl_s` | `21600` | how long an impulse stays worth mentioning |
@@ -424,6 +443,13 @@ on-demand setup painful:
         judge_base_url: http://10.0.0.5:3000/ollama/v1  # always loaded, tiny
         judge_model: qwen3:4b
         judge_api_key: "..."                            # this server's key only
+
+A judge set up that way answers in a second or two, so it is given 30 seconds
+rather than the big model's cold start: a room that goes quiet for ten minutes
+while something decides not to speak is worse than one that never speaks at all.
+Set `judge_timeout_s` if your own numbers are different; `0` (the default) means
+"work it out", which is the full `cold_start_timeout_s` while the judge shares
+both the endpoint and the model of the speaker - there it IS the cold start.
 
 ## Etiquette
 

@@ -54,6 +54,12 @@ brain:
     judge_base_url: ""                           # "" = judge on the endpoint above
     judge_api_key: ""                            # a separate server gets ONLY this key
     judge_extra_body: {}                         # "" = inherit extra_body, but only on the same endpoint
+    # How long to wait for a JUDGE verdict. 0 = work it out: the full
+    # cold_start_timeout_s when the judge shares this endpoint AND this model
+    # (it is what loads the model), 30 s when judge_base_url or judge_model
+    # points it at a small resident one - waiting ten minutes to hear "no,
+    # nothing to add" is ten minutes of a room being quiet for nothing.
+    judge_timeout_s: 0
     warm_on_intent: false                        # on-demand model: preload when a human starts typing
     warm_cooldown_s: 120                         # never more than one warm-up per this
   # The owner's own agent: Claude Code headless, ONE SESSION PER ROOM.
@@ -102,11 +108,26 @@ policy:
   addressed_names: []              # e.g. ["qwen", "the qa agent"]
   other_names_from_members: true   # learn the other members' names from the room
   bare_name_addresses: false       # a name anywhere is an address, punctuation or not
+  # TIER 1 BY TURN. People do not repeat a name every sentence: they ask, you
+  # answer, and the next line ("and why is that?") is still to you. A human line
+  # arriving this soon after MY last message in the same conversation is
+  # answered as if it had named me. Anybody else speaking in between ends it -
+  # they were being answered, not me - and 0 turns the whole arm off.
+  followup_window_s: 120
   # Tier 2: may I answer a line addressed to nobody? Between this switch and an
   # actual message stand a random back-off, a re-read of the room (stand down if
   # somebody got there first) and a judge call that must say yes.
   answer_unaddressed: true
   backoff_s: [5, 40]               # drawn per message, so agents do not collide
+  # A free read of an unaddressed line, before any model is asked: a question
+  # mark is worth 3, "you" (or "anyone"/"someone"/"who") 2, one of my own names
+  # in passing 2, and a word from `topics` 2. At prescore_fast the back-off
+  # collapses to backoff_s[0] .. +5 s with no timing hazard, so an obvious
+  # question is picked up in seconds instead of up to a minute. It changes the
+  # WAIT and nothing else: the judge still decides, and the agent still stands
+  # down if somebody answered first. 0 puts every unaddressed line in a hurry.
+  topics: []                       # e.g. ["deploys", "postgres"] - what this agent is FOR
+  prescore_fast: 4
   # UNPROMPTED SPEECH (S6). Impulses, open loops and inner thoughts, all of
   # them presence-gated and all of them spending tier2_per_hour_max.
   # A human is "here" while the homeserver calls them online, or while they

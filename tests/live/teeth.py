@@ -5,10 +5,10 @@ script applies one surgical mutation at a time to the shipped source, rebuilds
 the release binary, runs only the gate that guard protects, records the
 outcome, and restores the file with `git checkout` (verified clean afterwards).
 
-Two kinds of gate. G1-G12, N1/N2/N4, C1, C2, M2/M3/M5, D1 and T1 are LIVE journeys: they
+Two kinds of gate. G1-G12, N1-N4, C1, C2, M2/M3/M5, D1 and T1 are LIVE journeys: they
 need `AGENT_ROOM_LIVE=1`, a homeserver in `~/.config/agent-room/live.env` and
 the bot tokens, and C1/C2 additionally spend the owner's Claude quota.
-U8-U12 are OFFLINE and are cargo's own tests, so they need nothing but the
+U8-U18 are OFFLINE and are cargo's own tests, so they need nothing but the
 toolchain.
 C3's teeth are not a mutation here: `AGENT_ROOM_LEAK_TEETH=1` is how that gate
 is stripped, and the run is recorded in `docs/GATES.md`.
@@ -64,8 +64,8 @@ class Mutation:
 # -- the mutations ----------------------------------------------------------
 #
 # Each entry breaks exactly one guard in `src/`, rebuilds the release binary and
-# runs only the gate that guard protects. G1-G12, C1-C3, M2/M3/M5, D1 and T1 are
-# live journeys driven through the rebuilt binary; U8-U12 are cargo's own
+# runs only the gate that guard protects. G1-G12, N1-N4, C1-C3, M2/M3/M5, D1 and
+# T1 are live journeys driven through the rebuilt binary; U8-U18 are cargo's own
 # offline gates and need no homeserver.
 
 #: The `Relation` literal `room_post` builds. Kept out of the table because a
@@ -100,7 +100,7 @@ MUTATIONS = [
         guard="policy: the unaddressed guard",
         path=RUST_SRC / "policy.rs",
         old="    let Some(addressed) = addressed else {\n"
-        "        return unaddressed(ev, ledger, cfg);\n"
+        "        return unaddressed(ev, ledger, cfg, cues);\n"
         "    };",
         new="    let addressed = addressed"
         '.unwrap_or_else(|| "unaddressed (TEETH: guard removed)".to_owned());',
@@ -235,6 +235,15 @@ MUTATIONS = [
         ),
         test="tests/live/test_addressing.py::"
         "test_n2_a_name_that_is_not_mine_is_somebody_elses_turn",
+    ),
+    Mutation(
+        gate="N3",
+        guard="policy: the follow-up window (arm 3f), forced to nothing",
+        path=RUST_SRC / "policy.rs",
+        old="    let window = cfg.followup_window_s as f64;",
+        new="    let window = 0.0;  // TEETH: nobody ever spoke to me last",
+        test="tests/live/test_addressing.py::"
+        "test_n3_the_next_line_is_still_mine_until_the_window_closes",
     ),
     Mutation(
         gate="N4",
@@ -372,6 +381,74 @@ MUTATIONS = [
         old="        let seed = self.tail_lines(self.keep / 2);",
         new="        let seed: Vec<String> = Vec::new();  // TEETH: nothing carried over",
         test="transcript::tests::the_new_live_file_holds_the_newest_half_and_recent_reads_it_back",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    # -- PR 2: the follow-up, the pre-score, the judge timeout, the warm-up ---
+    Mutation(
+        gate="U13",
+        guard="policy: the follow-up window (arm 3f), offline",
+        path=RUST_SRC / "policy.rs",
+        old="    let window = cfg.followup_window_s as f64;",
+        new="    let window = 0.0;  // TEETH: nobody ever spoke to me last",
+        test="policy::tests::a_follow_up_within_the_window_is_mine_after_it_is_not",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U14",
+        guard="policy: the ledger check under the follow-up (the transcript alone decides)",
+        path=RUST_SRC / "policy.rs",
+        old="""    if !ledger
+        .posts
+        .iter()
+        .any(|post| post.thread_root == last.conversation)
+    {
+        return None;
+    }""",
+        new="    // TEETH: the ledger is not asked whether I really posted there",
+        test="policy::tests::a_follow_up_is_broken_by_any_other_speaker",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U15",
+        guard="addressing: the question mark in the pre-score",
+        path=RUST_SRC / "addressing.rs",
+        old="    if body.contains('?') {",
+        new="    if false && body.contains('?') {  // TEETH: a question scores nothing",
+        test="addressing::tests::the_pre_score_reads_the_cues_that_are_free_to_read",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U16",
+        guard="unprompted: the short back-off a pre-scored line takes",
+        path=RUST_SRC / "connector" / "unprompted.rs",
+        old="    if prescore >= cfg.prescore_fast {",
+        new="    if false && prescore >= cfg.prescore_fast {  // TEETH: everything waits",
+        test="connector::unprompted::tests::"
+        "a_pre_scored_line_collapses_the_back_off_and_skips_the_hazard",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U17",
+        guard="config: the judge's own timeout (it inherits the cold start again)",
+        path=RUST_SRC / "config.rs",
+        old="        RESIDENT_JUDGE_TIMEOUT_S\n    }",
+        new="        self.cold_start_timeout_s  // TEETH\n    }",
+        test="config::tests::the_judge_timeout_follows_the_endpoint_it_asks",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U18",
+        guard="connector: the warm-up on the human's line",
+        path=RUST_SRC / "connector" / "mod.rs",
+        old="fn wants_warm(decision: &Decision) -> bool {\n    decision.needs_judge()\n}",
+        new="fn wants_warm(_decision: &Decision) -> bool {\n    false  // TEETH\n}",
+        test="connector::tests::a_line_that_will_cost_a_model_call_warms_it_and_nothing_else_does",
         marker="offline",
         cargo_lib=True,
     ),

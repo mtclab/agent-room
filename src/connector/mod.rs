@@ -51,7 +51,7 @@ use crate::config::{BotToBot, Config};
 use crate::events::{BotRules, RoomEvent, from_source, is_bot_user, localpart};
 use crate::ledger::{Clock, Ledger};
 use crate::matrix;
-use crate::policy::{Cues, Decision, Verdict, should_reply};
+use crate::policy::{Cues, Decision, LastSpeaker, Verdict, should_reply};
 use crate::presence::PresenceBook;
 use crate::testing::maybe_start_spam;
 use crate::transcript::Transcript;
@@ -65,6 +65,11 @@ const SYNC_TIMEOUT_S: u64 = 30;
 const SHUTDOWN_GRACE_S: u64 = 10;
 /// How many events the startup `/messages` snapshot reads per room.
 const BACKLOG_SNAPSHOT: u32 = 100;
+/// How far back the follow-up arm looks for who spoke last. Eight, because the
+/// answer is the NEWEST line that is not the one that just arrived: any more is
+/// read and thrown away, and any fewer would miss a conversation whose last few
+/// lines all came from one burst.
+pub(crate) const LAST_SPEAKER_TAIL: usize = 8;
 
 /// One room's mutable state. Everything that decides whether to speak is behind
 /// this lock, so two events arriving at once cannot both find the room idle.
@@ -721,6 +726,66 @@ fn is_member_event<T>(raw: &Raw<T>) -> bool {
         .is_some_and(|kind| kind == "m.room.member")
 }
 
+/// Who spoke last in the conversation `ev` belongs to, out of the transcript.
+///
+/// The transcript is the room's own record of what happened in what order, so
+/// this is a read of it rather than a second piece of bookkeeping to keep in
+/// step with it. `ev` itself has already been appended by the time this runs,
+/// so it is skipped by event id.
+///
+/// Two shapes, and the asymmetry is deliberate. A THREADED line's conversation
+/// is its thread root, so only that thread can answer the question "who spoke
+/// last here". An UNTHREADED one's conversation is the room, so the newest
+/// message anywhere in it counts - because my answer to an unthreaded question
+/// is itself threaded ON that question (`turn::post_reply`), and the human who
+/// types "and why is that?" underneath it is answering me in the room, not
+/// opening a new subject.
+fn last_speaker(recent: &[RoomEvent], ev: &RoomEvent) -> Option<LastSpeaker> {
+    let thread = ev.thread_root.as_deref();
+    recent
+        .iter()
+        .rev()
+        .find(|other| {
+            other.event_id != ev.event_id
+                && thread.is_none_or(|root| other.thread_root_or_self() == root)
+        })
+        .map(|other| LastSpeaker {
+            sender: other.sender.clone(),
+            ts: other.ts,
+            conversation: other.thread_root_or_self().to_owned(),
+        })
+}
+
+/// Whether this decision means a model call is coming.
+///
+/// Both judged verdicts: tier 2 (`consider`) waits out a back-off first and a
+/// judged mention (`judge`) does not, and in both cases the next thing that
+/// happens to the endpoint is a request. A tier-1 `reply` is not here - it goes
+/// straight to the brain, and warming ahead of a request that is already on its
+/// way buys nothing and costs one more.
+fn wants_warm(decision: &Decision) -> bool {
+    decision.needs_judge()
+}
+
+/// Get an on-demand model out of bed the moment a line lands that may need it.
+///
+/// The third warm-up, and the earliest: the typing notice fires before a line
+/// exists and the back-off fires after the policy has decided, so this one -
+/// on the human's finished sentence - is the one that runs when somebody types
+/// a whole question and hits enter. All three are the same fire-and-forget call
+/// behind the same cooldown, so the extra ones cost nothing.
+pub(crate) async fn warm_for(brain: &dyn Brain, room_id: &RoomId, decision: &Decision) {
+    if !wants_warm(decision) {
+        return;
+    }
+    brain
+        .warm(&format!(
+            "a line in {room_id} may need an answer: {}",
+            decision.reason
+        ))
+        .await;
+}
+
 /// The bot rules as the policy sees them.
 pub(crate) fn rules_from<'a>(ids: &'a [String], patterns: &'a [Regex]) -> BotRules<'a> {
     BotRules {
@@ -801,8 +866,12 @@ impl Connector {
             // answer.
             let thread = ev.thread_root_or_self().to_owned();
             state.ledger.note_event(&thread, ev.is_bot);
-            self.decide(&mut state, &ev)
+            self.decide(worker, &mut state, &ev)
         };
+        // Before the back-off, not after it: the whole cost of an on-demand
+        // model is the loading, and the one moment we know a turn may be coming
+        // is now.
+        warm_for(self.brain.as_ref(), room_id, &decision).await;
         self.route(worker, decision, ev).await;
     }
 
@@ -829,11 +898,12 @@ impl Connector {
         }
     }
 
-    fn decide(&self, state: &mut WorkerState, ev: &RoomEvent) -> Decision {
+    fn decide(&self, worker: &RoomWorker, state: &mut WorkerState, ev: &RoomEvent) -> Decision {
         let roots = state.ledger.thread_roots();
+        let recent = worker.transcript.recent(LAST_SPEAKER_TAIL);
         let cues = Cues {
             names: &state.names,
-            ..Cues::default()
+            last_speaker: last_speaker(&recent, ev),
         };
         let decision = should_reply(ev, &self.me, &state.ledger, &roots, &self.cfg.policy, &cues);
         info!(
@@ -969,6 +1039,141 @@ pub fn describes_bot_policy(cfg: &Config) -> &'static str {
         BotToBot::None => "never answers other bots",
         BotToBot::Mentions => "answers other bots only when they mention it",
         BotToBot::All => "answers other bots",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::brain::{BrainContext, Judgement};
+    use crate::policy::Verdict;
+
+    const ME: &str = "@bot-a:example.com";
+    const HUMAN: &str = "@human:example.com";
+
+    /// One event as the homeserver sends it, threaded or not.
+    fn event(event_id: &str, sender: &str, ts: f64, thread_root: Option<&str>) -> RoomEvent {
+        let mut content = serde_json::json!({ "msgtype": "m.text", "body": "hello" });
+        if let Some(root) = thread_root {
+            content["m.relates_to"] = serde_json::json!({
+                "rel_type": "m.thread",
+                "event_id": root,
+            });
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let origin_server_ts = (ts * 1000.0) as u64;
+        from_source(
+            &serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": sender,
+                "origin_server_ts": origin_server_ts,
+                "room_id": testkit::ROOM_ID,
+                "content": content,
+            }),
+            testkit::ROOM_ID,
+            None,
+            rules_from(&[], &[]),
+        )
+    }
+
+    #[test]
+    fn the_last_speaker_of_an_unthreaded_line_is_the_newest_message_anywhere() {
+        // The shape the follow-up arm exists for: the human asked, I answered
+        // IN A THREAD on their question (which is what `post_reply` does), and
+        // the human typed the next line straight into the room.
+        let asked = event("$asked", HUMAN, 100.0, None);
+        let mine = event("$mine", ME, 110.0, Some("$asked"));
+        let next = event("$next", HUMAN, 115.0, None);
+        let last = last_speaker(&[asked, mine, next.clone()], &next).expect("somebody spoke");
+        assert_eq!(last.sender, ME);
+        assert!((last.ts - 110.0).abs() < f64::EPSILON);
+        assert_eq!(
+            last.conversation, "$asked",
+            "my answer's conversation is the thread it was posted in"
+        );
+    }
+
+    #[test]
+    fn the_event_that_just_arrived_is_never_its_own_last_speaker() {
+        // `on_message` appends before it decides, so the trigger is in there.
+        let only = event("$only", HUMAN, 100.0, None);
+        assert_eq!(last_speaker(std::slice::from_ref(&only), &only), None);
+        assert_eq!(last_speaker(&[], &only), None);
+    }
+
+    #[test]
+    fn a_threaded_line_only_hears_its_own_thread() {
+        let mine_here = event("$mine-here", ME, 100.0, Some("$root"));
+        let elsewhere = event("$elsewhere", HUMAN, 110.0, Some("$other"));
+        let threaded = event("$threaded", HUMAN, 120.0, Some("$root"));
+        let recent = [mine_here, elsewhere, threaded.clone()];
+        let last = last_speaker(&recent, &threaded).expect("somebody spoke in this thread");
+        assert_eq!(last.sender, ME);
+        assert_eq!(last.conversation, "$root");
+
+        // ... and a thread nobody has spoken in yet has no last speaker, even
+        // though the room does.
+        let fresh = event("$fresh", HUMAN, 130.0, Some("$brand-new"));
+        assert_eq!(last_speaker(&recent, &fresh), None);
+    }
+
+    /// A brain that answers nothing and counts what it was asked to prepare
+    /// for. The counting is the gate: a warm-up is fire and forget, so the only
+    /// thing that can be asserted about it is that it was asked for.
+    struct CountingBrain(AtomicUsize);
+
+    impl CountingBrain {
+        fn new() -> Self {
+            Self(AtomicUsize::new(0))
+        }
+        fn warms(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Brain for CountingBrain {
+        async fn reply(&self, _ctx: &BrainContext) -> Option<String> {
+            None
+        }
+        async fn judge(&self, _ctx: &BrainContext) -> Judgement {
+            Judgement::no("counting only")
+        }
+        async fn warm(&self, _reason: &str) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn decided(verdict: Verdict) -> Decision {
+        Decision {
+            verdict,
+            reason: "for the test".to_owned(),
+            unaddressed: verdict == Verdict::Consider,
+            prescore: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_that_will_cost_a_model_call_warms_it_and_nothing_else_does() {
+        let room = RoomId::parse(testkit::ROOM_ID).expect("a room id");
+        for (verdict, warms) in [
+            // A judged verdict means a request to the endpoint is coming, and
+            // for tier 2 it is coming after a back-off nobody has to wait
+            // through cold.
+            (Verdict::Consider, 1),
+            (Verdict::Judge, 1),
+            // Tier 1 goes straight to the brain: warming ahead of a request
+            // that is already on its way is one more request for nothing.
+            (Verdict::Reply, 0),
+            (Verdict::Silent, 0),
+        ] {
+            let brain = CountingBrain::new();
+            warm_for(&brain, &room, &decided(verdict)).await;
+            assert_eq!(brain.warms(), warms, "verdict={}", verdict.as_str());
+        }
     }
 }
 

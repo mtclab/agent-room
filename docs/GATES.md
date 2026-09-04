@@ -1935,3 +1935,101 @@ judge on a model that can take minutes to load.
   rest of G6 is unchanged, and its later `"<bot C> still with us?"` in the
   thread is now answered by bot C alone - which is 3d beating thread
   stickiness, exactly as designed.
+
+# Follow-up and faster self-selection (2026-09-04)
+
+Addressing by name closed half the gap. The other half is that a name is not
+repeated every sentence: you ask, the agent answers, and "and why is that?"
+names nobody, quotes nothing and starts no thread - so every guard read it as a
+line thrown at the room, and the agent that had just been talking to somebody
+made them type its name again. Arm 3f answers it, and the rest of this section
+is about the OTHER thing that made the room feel slow: a line nobody addressed
+waited a random 5-40 s and then a judge call on a model that may not be loaded.
+
+Four changes, and only the first one can make the agent speak where it would not
+have:
+
+1. **the follow-up (3f)** - I spoke last in this conversation and a human came
+   back inside `followup_window_s` (120 s, `0` = off);
+2. **the pre-score** - a free read of an unaddressed line (`?` +3, second person
+   or `anyone`/`someone`/`who` +2, one of my names in passing +2, a
+   `policy.topics` word +2) that at `prescore_fast` (4) collapses the back-off
+   to `backoff_s.0 .. +5 s` and skips the timing hazard;
+3. **warming on the human's line** - the third warm-up, next to the typing
+   notice and the start of the back-off, fired when the verdict needs a judge;
+4. **the judge's own timeout** - `judge_timeout_s`, or 30 s worked out from the
+   config's shape when the judge has an endpoint or a model of its own.
+
+Only (1) changes a verdict. (2) changes a WAIT, (3) changes when an endpoint is
+asked to load, and (4) changes how long a wrong answer takes to arrive.
+
+## Unit gates, 2026-09-04
+
+`make gate`: 342 tests (242 in the crate, 89 R4 commands, 8 state-compat, 2
+encrypted-room and the publish scrub), clippy pedantic clean with warnings as
+errors, no `unwrap()` outside tests. `make lint-live`: clean, 13 files.
+
+Fourteen new gates: five in `policy::tests`, three in `addressing::tests`, four
+in `connector::tests` (new module), one in `connector::unprompted::tests` and
+one in `config::tests`.
+
+| Guard | Gate |
+|---|---|
+| 3f answers inside the window and stops answering outside it | `policy::a_follow_up_within_the_window_is_mine_after_it_is_not` - the exact reason string (`follow-up: I spoke last here 41 s ago`), tier 1, no judge; at 121 s the same event is tier 2's |
+| any other speaker in between ends it, and so does a ledger that never saw me post there | `policy::a_follow_up_is_broken_by_any_other_speaker` - the other bot, the human, my own line in a different conversation, and a BOT's follow-up (which is a loop with no human in it) |
+| the window is a switch as well as a number | `policy::followup_window_zero_turns_the_arm_off` |
+| 3d still beats 3f | `policy::guard_order_other_vocative_before_the_follow_up` - a line naming somebody else, arriving five seconds after my own message, is still theirs |
+| the pre-score is in the reason string, and below the threshold nothing moved | `policy::a_pre_scored_line_says_so_and_takes_the_short_back_off` - both exact reason strings, and a `topics` word worth two points without reaching the threshold |
+| what the pre-score reads, and what it must not | `addressing::the_pre_score_reads_the_cues_that_are_free_to_read` - nine lines, including "I like this queue" (not a second person) and one scoring the practical maximum |
+| a topic is a word, not a substring | `addressing::a_topic_is_a_word_and_not_a_substring` - `deployment` and `deploy-bot` are not `deploy`, and a blank topic matches nothing |
+| a room before its first sync still scores the rest of the line | `addressing::a_room_with_no_names_still_scores_the_rest_of_the_line` |
+| the short back-off collapses the range AND drops the hazard | `connector::unprompted::a_pre_scored_line_collapses_the_back_off_and_skips_the_hazard` - the same range under all three hazards |
+| who spoke last, for an unthreaded line, is the newest message anywhere | `connector::the_last_speaker_of_an_unthreaded_line_is_the_newest_message_anywhere` - my answer is threaded ON the question, so a thread-only read would find nobody |
+| the event that just arrived is never its own last speaker | `connector::the_event_that_just_arrived_is_never_its_own_last_speaker` |
+| a threaded line only hears its own thread | `connector::a_threaded_line_only_hears_its_own_thread` |
+| the warm-up fires for the verdicts that cost a model call, and for no others | `connector::a_line_that_will_cost_a_model_call_warms_it_and_nothing_else_does` - a counting fake brain: `consider` and `judge` warm, `reply` and `silent` do not |
+| the judge's timeout follows the endpoint it asks | `config::the_judge_timeout_follows_the_endpoint_it_asks` - the full cold start while it shares both endpoint and model, 30 s with either of its own, and an operator's number always |
+
+## Live gate N3, 2026-09-04
+
+`tests/live/test_addressing.py`, one connector with `followup_window_s: 20` -
+short on purpose, because the gate has to sit out a window that has CLOSED as
+well as one that is open.
+
+| Gate | Journey | Guard it protects |
+|---|---|---|
+| N3 | the human types the agent's name and gets an answer; five seconds later an UNTHREADED line naming nobody, quoting nothing and carrying no `[[speak]]` - answered inside 30 s with `follow-up: I spoke last here` in the log and still no judge call; then, thirty seconds after that answer, the same shape of line again - which reaches `tier 2 candidate` and is met with silence | `policy::follow_up` (arm 3f) and the window closing behind it |
+
+Neither unaddressed line carries `[[speak]]`, so the echo judge would decline
+both: an answer to the second line can only be 3f, and silence on the third can
+only be the window having closed.
+
+Measured 2026-09-04 (`AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room
+pytest -q tests/live/test_addressing.py tests/live/test_tier2.py`): **8 passed
+in 340.7 s** - N1 3.7 s, N2 23.8 s, N3 60.9 s, N4 25.2 s, G5 51.6 s, G6 80.4 s,
+G7 25.3 s, G8 62.8 s. The tier-2 gates are in that run because the pre-score
+changed the back-off every one of them draws. Re-run on the rebased branch (the
+same tree, on top of the squashed name-addressing PR): 8 passed in 346.4 s.
+
+## Teeth run, 2026-09-04
+
+One mutation at a time in `src/`, rebuilt, and only the gate that guard protects
+run against it (`tests/live/teeth.py`). Every one of the seven new gates failed
+with its guard removed.
+
+| Gate | Guard removed | Result | Time |
+|---|---|---|---|
+| N3 | `policy::follow_up`: the window forced to nothing (`let window = 0.0`) | FAILED - "the follow-up was not answered": the unaddressed line went to tier 2 and its judge said no | 121 s |
+| U13 | the same mutation, offline | FAILED - `a_follow_up_within_the_window_is_mine_after_it_is_not` | 87 s |
+| U14 | `policy::follow_up`: the ledger check, so the transcript alone decides | FAILED - `a_follow_up_is_broken_by_any_other_speaker` | 90 s |
+| U15 | `addressing::pre_score`: the question mark scores nothing | FAILED - `the_pre_score_reads_the_cues_that_are_free_to_read` | 90 s |
+| U16 | `unprompted::tier2_range`: the short back-off never applies | FAILED - `a_pre_scored_line_collapses_the_back_off_and_skips_the_hazard` | 944 s (another `cargo` run held the build lock; the gate itself is instant) |
+| U17 | `config::resolved_judge_timeout`: the judge inherits the cold start again | FAILED - `the_judge_timeout_follows_the_endpoint_it_asks` | 90 s |
+| U18 | `connector::wants_warm`: nothing is ever warmed | FAILED - `a_line_that_will_cost_a_model_call_warms_it_and_nothing_else_does` | 85 s |
+
+N3's mutant is the one worth reading twice. With the window at zero the room
+looks almost the same - the agent answers the first line and then goes quiet -
+and the gate catches it because the SECOND line is the one under test and its
+answer is what times out. The third line's silence, which is the other half of
+the gate, is what the mutant produces everywhere: a gate asserting only that
+would have passed its own mutant, which is the trap N4 fell into the day before.

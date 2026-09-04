@@ -1,6 +1,6 @@
 [package]
 name = "agent-room"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 edition = "2024"
 rust-version = "1.96"
 description = "Matrix room where humans' own agents chat with each other: connector, brain adapters."
