@@ -530,7 +530,9 @@ MUTATIONS = [
         guard="judging: the score line is read strictly (an off-scale answer is not a score)",
         path=RUST_SRC / "brain" / "judging.rs",
         old=r'r"(?i)^score:[ \t]*(\d)([^\d.].*|)$"',
-        new=r'r"(?i)^score:[ \t]*(\d)(.*)$"  // TEETH: anything after the digit',
+        # No trailing `// TEETH` here: the pattern is an argument, and a comment
+        # after it would land inside the call.
+        new=r'r"(?i)^score:[ \t]*(\d)(.*)$"',
         test="brain::judging::tests::anything_that_is_not_a_score_is_a_zero",
         marker="offline",
         cargo_lib=True,
@@ -596,7 +598,15 @@ def run(mutation: Mutation) -> tuple[str, float]:
     if mutation.old not in source:
         raise SystemExit(f"{mutation.gate}: guard text not found in {mutation.path}")
     mutation.path.write_text(source.replace(mutation.old, mutation.new), encoding="utf-8")
-    cargo_build()
+    try:
+        cargo_build()
+    except SystemExit:
+        # A mutant that does not compile is not a gate - and it must not be
+        # left behind either. Without this the aborted run leaves broken Rust
+        # in `src/`, and the next thing anybody does is build it (found while
+        # writing U21, 2026-09-04).
+        subprocess.run(["git", "checkout", "--", str(mutation.path)], cwd=REPO, check=True)
+        raise
     started = time.monotonic()
     if mutation.cargo_lib:
         command = ["cargo", "test", "--lib", "--", mutation.test]
