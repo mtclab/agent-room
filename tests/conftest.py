@@ -9,6 +9,20 @@ See `tests/live/README.md` and `tests/live/live.env.example`.
 Everything here runs only when AGENT_ROOM_LIVE=1. Every room is created by the
 `room` fixture and forgotten at teardown; no pre-existing room is ever touched.
 The offline gates are Rust's - `cargo test`.
+
+CLIENT REALISM. The human here posts what a person's client posts. Element
+sends typed text as `m.text` with a `body` and NOTHING else: `m.mentions` is
+written only when the sender picks a name out of the completion list, and
+`m.relates_to` only when they use the reply or thread affordance. So `post()`
+sends a body alone, and `post_typed_name()` is the way to address an agent the
+way people actually do - by typing its name.
+
+The machine-level signals are the EXCEPTION, and each one is tested on purpose:
+`mentions=` for a pill, `thread_root=` for a threaded reply. Passing one is a
+deliberate statement that this gate is about that signal. A gate that only ever
+posted with `m.mentions` attached would be proving the pill works and nothing
+else - which is exactly how "Qwen, why are you so quiet?" reached a real room
+unanswered while every gate was green (docs/GATES.md, "Addressing by name").
 """
 
 from __future__ import annotations
@@ -16,10 +30,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -402,6 +417,13 @@ async def post(
 ) -> str:
     """Post as the human, riding out the homeserver's own rate limit.
 
+    The default is what a person's client sends for typed text: `m.text` with a
+    body, and no `m.mentions` and no `m.relates_to` at all. `mentions` and
+    `thread_root` are the machine-level signals a client writes only when the
+    sender picks a pill or uses the reply affordance - see CLIENT REALISM at the
+    top of this file - and a gate that passes one is saying it is about that
+    signal.
+
     Synapse limits messages per user, and a gate that posts a burst (T1 posts
     25) meets `M_LIMIT_EXCEEDED` before the product has done anything at all.
     Only that one refusal is retried, and only for as long as the server itself
@@ -451,6 +473,45 @@ async def addressable_names(human: AsyncClient, room_id: str) -> set[str]:
             names.add(display)
             names.add(display.split()[0])
     return {name.lower() for name in names if len(name) >= 3}
+
+
+def named_in(body: str, names: Iterable[str]) -> list[str]:
+    """Which of `names` this body NAMES, by the product's own word rule.
+
+    A hyphen is a word character (`src/addressing.rs`), so a room member called
+    "gate" is not named by a line about `gate-bot-a`. A plain substring test
+    would say it was, and these accounts share a localpart prefix.
+    """
+    low = body.lower()
+    return sorted(
+        name for name in names if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", low)
+    )
+
+
+async def post_typed_name(human: AsyncClient, room_id: str, bot_localpart: str, text: str) -> str:
+    """Address an agent the way a person does: by TYPING its name.
+
+    A vocative in the body and nothing else - no `m.mentions`, no reply, no
+    thread. This is what Element sends when somebody types "qwen, why so
+    quiet?", and the agent has only the body to read it out of.
+
+    The gate proves the line does what it says before posting it: the name has
+    to be one this room recognises (the account names come from the environment
+    and the display names from the homeserver, so nothing in the tree can know
+    them), and nobody ELSE'S name may be in it - a second name would hand the
+    turn to somebody else and the silence would mean something quite different.
+    """
+    body = f"{bot_localpart}, {text}"
+    names = await addressable_names(human, room_id)
+    assert bot_localpart.lower() in names, (
+        f"{bot_localpart!r} is not a name this room would recognise ({sorted(names)}), so this "
+        "line addresses nobody: the gate would be measuring tier 2."
+    )
+    others = [name for name in named_in(body, names) if name != bot_localpart.lower()]
+    assert not others, (
+        f"{body!r} also names {others}, so it is not addressed to {bot_localpart} alone."
+    )
+    return await post(human, room_id, body)
 
 
 async def post_unaddressed(human: AsyncClient, room_id: str, body: str, **kwargs: Any) -> str:

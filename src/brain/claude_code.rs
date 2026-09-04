@@ -1393,6 +1393,40 @@ print(json.dumps({
     }
 
     #[tokio::test]
+    async fn the_cooldown_after_a_usage_limit_is_as_long_as_the_config_says() {
+        // The gate above proves a limit stops the spawning; this one proves the
+        // length of the silence is the operator's number and not one of ours. A
+        // shorter one is somebody who would rather be hammered than quiet.
+        let fixture = Fixture::new();
+        fixture.fake.behave(&serde_json::json!({
+            "exit_code": 1,
+            "stderr": "Claude AI usage limit reached: session limit, resets 4pm",
+        }));
+        let brain = fixture.brain_with(|cfg| cfg.rate_limit_backoff_s = 60.0);
+        assert!(brain.reply(&context("hi")).await.is_none());
+        assert_eq!(fixture.fake.calls().len(), 1);
+
+        fixture
+            .fake
+            .behave(&serde_json::json!({"result": "I am back"}));
+        fixture.clock.advance(30.0);
+        assert!(brain.reply(&context("hi")).await.is_none());
+        assert_eq!(
+            fixture.fake.calls().len(),
+            1,
+            "claude was spawned 30 s into a 60 s cooldown"
+        );
+
+        fixture.clock.advance(40.0);
+        assert_eq!(
+            brain.reply(&context("hi")).await.as_deref(),
+            Some("I am back"),
+            "70 s in, a 60 s cooldown is over"
+        );
+        assert_eq!(fixture.fake.calls().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_limit_reported_in_the_result_object_also_triggers_the_cooldown() {
         let fixture = Fixture::new();
         fixture.fake.behave(&serde_json::json!({
@@ -1630,6 +1664,80 @@ print(json.dumps({
             .to_owned();
         assert!(stdin.contains("Would you, as this participant, add something here"));
         assert!(stdin.contains("anyone around?"));
+    }
+
+    #[tokio::test]
+    async fn the_judge_runs_the_model_it_was_told_to_and_the_reply_model_when_it_was_not() {
+        // The judge model is the cost control: it is asked on every unaddressed
+        // line, and it is the reason a room full of chatter is cheap. A build
+        // that ran the reply model here would be the same bill on every line.
+        let fixture = Fixture::new();
+        fixture
+            .fake
+            .behave(&serde_json::json!({"result": "no: nothing to add"}));
+        let brain = fixture.brain_with(|cfg| {
+            cfg.model = "sonnet".to_owned();
+            cfg.judge_model = "opus".to_owned();
+        });
+        brain.judge(&context("anyone around?")).await;
+        assert_eq!(flag_value(&fixture.fake.argv(0), "--model"), Some("opus"));
+
+        // And empty means "the same model as the reply", which is the only way
+        // to run one model for both.
+        let plain = fixture.brain_with(|cfg| {
+            cfg.model = "sonnet".to_owned();
+            cfg.judge_model = String::new();
+        });
+        plain.judge(&context("anyone around?")).await;
+        assert_eq!(flag_value(&fixture.fake.argv(1), "--model"), Some("sonnet"));
+    }
+
+    #[tokio::test]
+    async fn the_judge_gives_up_on_its_own_timeout_and_not_the_replys() {
+        // A verdict that arrives late is worthless: the judge has a timeout of
+        // its own, well under the reply's, because the room is waiting to hear
+        // whether anybody is going to say anything at all. The fixture's
+        // `timeout_s` is 300 s and the fake sleeps for 30, so a judge that used
+        // the reply's timeout would sit here for half a minute.
+        let fixture = Fixture::new();
+        fixture.fake.behave(&serde_json::json!({"sleep": 30}));
+        let brain = fixture.brain_with(|cfg| cfg.judge_timeout_s = 1.0);
+        let started = std::time::Instant::now();
+        let judgement = brain.judge(&context("anyone around?")).await;
+        let waited = started.elapsed();
+        assert!(!judgement.speak);
+        assert!(
+            judgement.why.contains("answered nothing"),
+            "{}",
+            judgement.why
+        );
+        assert!(
+            waited < Duration::from_secs(15),
+            "the judge waited {waited:?}: that is the reply's timeout, not its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_permission_mode_the_operator_set_is_the_one_claude_runs_under() {
+        // The config refuses `bypassPermissions`; every other mode is the
+        // operator's to choose, and a build that passed its own would make the
+        // choice decorative - in both directions, since the judge runs under it
+        // too.
+        let fixture = Fixture::new();
+        fixture
+            .fake
+            .behave(&serde_json::json!({"result": "no: nothing to add"}));
+        let brain = fixture.brain_with(|cfg| cfg.permission_mode = "plan".to_owned());
+        brain.reply(&context("hi")).await;
+        brain.judge(&context("hi")).await;
+        assert_eq!(
+            flag_value(&fixture.fake.argv(0), "--permission-mode"),
+            Some("plan")
+        );
+        assert_eq!(
+            flag_value(&fixture.fake.argv(1), "--permission-mode"),
+            Some("plan")
+        );
     }
 
     #[tokio::test]

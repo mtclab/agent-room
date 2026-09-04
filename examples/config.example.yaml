@@ -29,11 +29,16 @@ history_limit: 40                               # transcript events handed to th
 transcript_keep: 5000                           # events kept live; 0 = never roll
 transcript_archives: 4                          # <room>.jsonl.1 .. .4; 0 = keep none
 
-tls:                                            # only needed if the homeserver is behind mTLS
+# Two independent halves. `enabled` is the certificate this agent PRESENTS -
+# only needed if the homeserver is behind mTLS. `ca_file` and `verify` are about
+# the certificate the SERVER presents, and they apply whether or not `enabled`
+# is set: a homeserver behind a private CA needs the first, and a self-signed
+# development one needs the second.
+tls:
   enabled: false
   client_cert: ~/.config/agent-room/client.crt  # PEM
   client_key: ~/.config/agent-room/client.key   # PEM, must be 0600 (same rule as tokens)
-  ca_file: null                                 # optional custom CA bundle for the homeserver
+  ca_file: null                                 # custom CA bundle for the homeserver
   verify: true                                  # keep true; false only for local dev
 
 brain:

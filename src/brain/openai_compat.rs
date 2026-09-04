@@ -575,6 +575,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_token_budgets_are_the_ones_the_operator_set() {
+        // Both budgets, because they are two different costs: `max_tokens` is
+        // how long a reply may be, and `judge_max_tokens` is how much a yes/no
+        // question is allowed to spend. A build that sent its own numbers would
+        // truncate the first and pay for the second.
+        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("no: nothing to add")).await;
+        let mut cfg = config(&endpoint.base_url);
+        cfg.max_tokens = 42;
+        cfg.judge_max_tokens = 7;
+        let brain = brain(cfg);
+        brain.reply(&context("ping")).await;
+        brain.judge(&context("ping")).await;
+        let sent = endpoint.requests();
+        assert_eq!(sent[0]["max_tokens"], json!(42), "the reply budget");
+        assert_eq!(sent[1]["max_tokens"], json!(7), "the judge budget");
+        endpoint.stop();
+    }
+
+    #[tokio::test]
+    async fn a_judge_body_of_its_own_replaces_the_reply_bodys_extras() {
+        // `judge_extra_body` is not merged into `extra_body`: it REPLACES it,
+        // because the two calls can be two models with two sets of knobs, and
+        // one server's knobs are another server's 400.
+        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("no: nothing to add")).await;
+        let mut cfg = config(&endpoint.base_url);
+        cfg.judge_extra_body = BTreeMap::from([("top_k".to_owned(), json!(5))]);
+        let brain = brain(cfg);
+        brain.judge(&context("ping")).await;
+        brain.reply(&context("ping")).await;
+        let sent = endpoint.requests();
+        assert_eq!(sent[0]["top_k"], json!(5), "the judge's own body knob");
+        assert_eq!(
+            sent[0]["chat_template_kwargs"],
+            Value::Null,
+            "the reply's extras went to the judge as well"
+        );
+        assert_eq!(
+            sent[1]["chat_template_kwargs"],
+            json!({ "enable_thinking": false }),
+            "the reply lost its own extras"
+        );
+        assert_eq!(sent[1]["top_k"], Value::Null);
+        endpoint.stop();
+    }
+
+    #[tokio::test]
+    async fn the_warm_up_cooldown_is_the_configured_one() {
+        // The shipped 120 s turns a typed paragraph into one warm-up (the gate
+        // above). The number itself has to be the config's: at zero every
+        // notice warms, which is what an operator asking for zero asked for.
+        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("hi")).await;
+        let mut cfg = config(&endpoint.base_url);
+        cfg.warm_on_intent = true;
+        cfg.warm_cooldown_s = 0.0;
+        let brain = brain(cfg);
+        brain.warm("a human is typing").await;
+        brain.warm("still typing").await;
+        for _ in 0..100 {
+            if warm_ups(&endpoint).len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            warm_ups(&endpoint).len(),
+            2,
+            "with no cooldown, every notice warms"
+        );
+        endpoint.stop();
+    }
+
+    #[tokio::test]
     async fn a_thinking_block_is_stripped() {
         let endpoint = FakeEndpoint::start(FakeEndpoint::answering(
             "<think>weighing the options</think>\n\nThe answer is 42.",
@@ -776,24 +848,24 @@ mod tests {
     /// flaking it.
     async fn wait_for_warm_ups(endpoint: &FakeEndpoint) -> Vec<Value> {
         for _ in 0..100 {
-            let warm: Vec<Value> = endpoint
-                .requests()
-                .into_iter()
-                .filter(|body| body["max_tokens"] == json!(1))
-                .collect();
-            if !warm.is_empty() {
+            if !warm_ups(endpoint).is_empty() {
                 // Give any extra warm-up the cooldown should have refused the
                 // same chance to arrive.
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                return endpoint
-                    .requests()
-                    .into_iter()
-                    .filter(|body| body["max_tokens"] == json!(1))
-                    .collect();
+                return warm_ups(endpoint);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Vec::new()
+    }
+
+    /// The requests that are warm-ups: one token, and nothing else is.
+    fn warm_ups(endpoint: &FakeEndpoint) -> Vec<Value> {
+        endpoint
+            .requests()
+            .into_iter()
+            .filter(|body| body["max_tokens"] == json!(1))
+            .collect()
     }
 
     #[tokio::test]

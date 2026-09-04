@@ -433,7 +433,10 @@ pub enum BrainKind {
     Echo,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `Serialize` is here for `tests/knob_coverage.rs`, which derives the schema's
+/// field inventory by serialising a loaded config and walking the keys. Nothing
+/// this binary does writes a `BrainConfig` out.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrainConfig {
     pub kind: BrainKind,
@@ -700,6 +703,16 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// How long an unprompted thought waits for somebody to be here, in
+    /// SECONDS. The knob is in minutes because that is the unit an operator
+    /// thinks in, and everything that acts on it works in seconds; 0 is off.
+    #[must_use]
+    pub fn unprompted_wait_limit_s(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let minutes = self.unprompted_max_wait_min as f64;
+        minutes * 60.0
+    }
+
     fn validate(&self) -> Result<()> {
         for (name, (low, high)) in [
             ("policy.backoff_s", self.backoff_s),
@@ -826,9 +839,16 @@ impl TlsConfig {
     /// The HTTP client every request goes through: the homeserver's, and the
     /// brain's.
     ///
-    /// With TLS off this is a plain client with the platform's roots. With it
-    /// on, the client presents the configured certificate and, when a `ca_file`
-    /// is given, trusts that CA as well.
+    /// The block has two independent halves, and they answer two different
+    /// questions. `enabled` (with `client_cert` / `client_key`) is the
+    /// certificate this client PRESENTS - mTLS, which most deployments never
+    /// need. `ca_file` and `verify` are about the certificate the SERVER
+    /// presents, which a homeserver behind a private CA or a self-signed
+    /// development certificate needs whether or not anybody asked for a client
+    /// certificate. They used to be reachable only with `enabled: true`, so an
+    /// operator who set `verify: false` for their own dev homeserver got a
+    /// verifying client and no word about it (found by the knob-coverage gate,
+    /// 2026-09-04: the knob was never set to `false` by any test).
     ///
     /// # Errors
     /// When a configured file is missing or unreadable, when the private key is
@@ -836,37 +856,9 @@ impl TlsConfig {
     /// rustls refuses the material.
     pub fn build_client(&self) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder().use_rustls_tls();
-        if !self.enabled {
-            return builder
-                .build()
-                .map_err(|exc| ConfigError::msg(format!("cannot build an HTTP client: {exc}")));
+        if self.enabled {
+            builder = builder.identity(self.identity()?);
         }
-        let (Some(cert), Some(key)) = (&self.client_cert, &self.client_key) else {
-            return Err(ConfigError::msg(
-                "tls.enabled is true but client_cert/client_key are not both set",
-            ));
-        };
-        for (label, path) in [("tls.client_cert", cert), ("tls.client_key", key)] {
-            if !path.is_file() {
-                return Err(ConfigError::msg(format!(
-                    "{label} not found: {}",
-                    path.display()
-                )));
-            }
-        }
-        // The private key is a secret: same 0600 rule as the access token.
-        require_private_mode(key, "tls.client_key")?;
-        let mut pem = read_bytes(cert, "tls.client_cert")?;
-        pem.push(b'\n');
-        pem.extend_from_slice(&read_bytes(key, "tls.client_key")?);
-        let identity = reqwest::Identity::from_pem(&pem).map_err(|exc| {
-            ConfigError::msg(format!(
-                "cannot load tls.client_cert {} / tls.client_key {}: {exc}",
-                cert.display(),
-                key.display()
-            ))
-        })?;
-        builder = builder.identity(identity);
         if let Some(ca_file) = &self.ca_file {
             if !ca_file.is_file() {
                 return Err(ConfigError::msg(format!(
@@ -891,9 +883,44 @@ impl TlsConfig {
             .build()
             .map_err(|exc| ConfigError::msg(format!("cannot build an HTTP client: {exc}")))
     }
+
+    /// The client certificate this connector presents, loaded from the pair of
+    /// files `tls.enabled` promises are there.
+    fn identity(&self) -> Result<reqwest::Identity> {
+        let (Some(cert), Some(key)) = (&self.client_cert, &self.client_key) else {
+            return Err(ConfigError::msg(
+                "tls.enabled is true but client_cert/client_key are not both set",
+            ));
+        };
+        for (label, path) in [("tls.client_cert", cert), ("tls.client_key", key)] {
+            if !path.is_file() {
+                return Err(ConfigError::msg(format!(
+                    "{label} not found: {}",
+                    path.display()
+                )));
+            }
+        }
+        // The private key is a secret: same 0600 rule as the access token.
+        require_private_mode(key, "tls.client_key")?;
+        let mut pem = read_bytes(cert, "tls.client_cert")?;
+        pem.push(b'\n');
+        pem.extend_from_slice(&read_bytes(key, "tls.client_key")?);
+        reqwest::Identity::from_pem(&pem).map_err(|exc| {
+            ConfigError::msg(format!(
+                "cannot load tls.client_cert {} / tls.client_key {}: {exc}",
+                cert.display(),
+                key.display()
+            ))
+        })
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `Serialize` is here for `tests/knob_coverage.rs` alone: that gate derives the
+/// inventory of every knob in the schema by serialising a loaded config and
+/// walking the keys, so the list cannot go stale the way a hand-written one
+/// does. Nothing this binary does writes a `Config` out - `init` builds its own
+/// `ConfigFile` - and `password` must never be put anywhere by anything else.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub homeserver: String,
@@ -1422,12 +1449,111 @@ mod tests {
     /// A throwaway self-signed pair, generated per test: nothing resembling a
     /// private key is ever committed to this repo.
     fn throwaway_pem() -> (String, String) {
+        let (cert, key) = throwaway_cert("agent-room.test");
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// The same, as the objects, for the tests that need DER as well as PEM.
+    fn throwaway_cert(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().expect("a key pair");
-        let cert = rcgen::CertificateParams::new(vec!["agent-room.test".to_owned()])
+        let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
             .expect("params")
             .self_signed(&key)
             .expect("a self-signed certificate");
-        (cert.pem(), key.serialize_pem())
+        (cert, key)
+    }
+
+    /// An HTTPS server on localhost presenting `cert`, answering anything with
+    /// 200. Nothing here is a mock: `tls.verify` is a decision about a real
+    /// handshake, and only a real handshake can show it was made.
+    async fn https_server(cert: &rcgen::Certificate, key: &rcgen::KeyPair) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let chain = vec![cert.der().clone()];
+        let der = rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der());
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("the shipped protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(chain, der.into())
+        .expect("a server certificate and its key");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port");
+        let port = listener.local_addr().expect("bound").port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let mut buffer = [0u8; 1024];
+                    let _ignored = tls.read(&mut buffer).await;
+                    let _ignored = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ignored = tls.shutdown().await;
+                });
+            }
+        });
+        format!("https://127.0.0.1:{port}/")
+    }
+
+    #[tokio::test]
+    async fn verification_is_on_until_the_config_turns_it_off_and_mtls_has_no_say() {
+        // The server-trust half of the block, with no client certificate
+        // anywhere: `enabled` is about what this client PRESENTS, and gating
+        // `verify` behind it left an operator's `verify: false` doing nothing at
+        // all on the deployment that needs it - a homeserver with a self-signed
+        // certificate on somebody's own LAN.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (cert, key) = throwaway_cert("127.0.0.1");
+        let url = https_server(&cert, &key).await;
+
+        let strict = TlsConfig::default()
+            .build_client()
+            .expect("a client with the platform's roots");
+        let refused = strict
+            .get(&url)
+            .send()
+            .await
+            .expect_err("a self-signed certificate is not one the platform trusts");
+        assert!(refused.is_connect() || refused.is_request(), "{refused:?}");
+
+        let lax = TlsConfig {
+            verify: false,
+            ..TlsConfig::default()
+        }
+        .build_client()
+        .expect("a client that was told not to verify");
+        let answered = lax
+            .get(&url)
+            .send()
+            .await
+            .expect("verify: false must complete the handshake it was told to accept");
+        assert!(answered.status().is_success());
+
+        // And the honest way round: the CA that signed it, trusted by name,
+        // with verification still on and still no client certificate.
+        let ca = write(dir.path(), "ca.pem", &cert.pem(), 0o644);
+        let trusting = TlsConfig {
+            ca_file: Some(ca),
+            ..TlsConfig::default()
+        }
+        .build_client()
+        .expect("a client trusting one more root");
+        let answered = trusting
+            .get(&url)
+            .send()
+            .await
+            .expect("tls.ca_file must be trusted without tls.enabled");
+        assert!(answered.status().is_success());
     }
 
     /// The mTLS identity has to survive the rustls-only build.

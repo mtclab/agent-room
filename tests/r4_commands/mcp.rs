@@ -1048,6 +1048,46 @@ async fn room_impulse_writes_a_file_and_posts_nothing() {
 }
 
 #[tokio::test]
+async fn an_impulse_carries_the_lifetime_the_config_gave_it() {
+    // The lifetime is written INTO the file, because the connector that will
+    // read it is a different process with its own clock: an impulse that is
+    // still worth saying is one that has not run out yet. A build that used its
+    // own number here would keep a five-minute thought alive for six hours.
+    let policy = PolicyConfig {
+        impulse_ttl_s: 90.0,
+        ..PolicyConfig::default()
+    };
+    let session = Session::with(PostAs::Notice, policy, None).await;
+    let result = payload(&call(session.tools.room_impulse(Parameters(
+        ImpulseParams {
+            room_id: ROOM_ID.to_owned(),
+            text: "the render finished".to_owned(),
+            kind: "render".to_owned(),
+        },
+    ))));
+    assert_eq!(result["expires_in_s"].as_f64(), Some(90.0));
+
+    let state_dir = session.dir.path().join("state");
+    let impulses = read_impulses(&impulse_dir(&state_dir, ROOM_ID), 3600.0);
+    assert_eq!(impulses.len(), 1);
+    let written = &impulses[0];
+    assert!(
+        (written.ttl_s - 90.0).abs() < f64::EPSILON,
+        "the file carries a {} s lifetime, not the configured 90",
+        written.ttl_s
+    );
+    assert!(
+        !written.expired(written.ts + 89.0),
+        "it expired inside its own lifetime"
+    );
+    assert!(
+        written.expired(written.ts + 91.0),
+        "91 s into a 90 s lifetime it is still worth saying: the shipped six \
+         hours is what is being used"
+    );
+}
+
+#[tokio::test]
 async fn room_impulse_refuses_an_empty_line() {
     let session = Session::new().await;
     let refused = call(session.tools.room_impulse(Parameters(ImpulseParams {
