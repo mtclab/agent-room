@@ -5,10 +5,14 @@ script applies one surgical mutation at a time to the shipped source, rebuilds
 the release binary, runs only the gate that guard protects, records the
 outcome, and restores the file with `git checkout` (verified clean afterwards).
 
-Two kinds of gate. G1-G12, N1-N4, C1, C2, M2/M3/M5, D1 and T1 are LIVE journeys: they
-need `AGENT_ROOM_LIVE=1`, a homeserver in `~/.config/agent-room/live.env` and
-the bot tokens, and C1/C2 additionally spend the owner's Claude quota.
-U8-U18 are OFFLINE and are cargo's own tests, so they need nothing but the
+Two kinds of gate. G1-G12, N1-N4, C-1/C-2/C-3, C1, C2, M2/M3/M5, D1 and T1 are
+LIVE journeys: they need `AGENT_ROOM_LIVE=1`, a homeserver in
+`~/.config/agent-room/live.env` and the bot tokens, and C1/C2 additionally spend
+the owner's Claude quota. The hyphenated C-1/C-2/C-3 are the CONVERSATION gates
+(`test_conversation.py`, no quota); C1/C2/C3 without the hyphen are the
+Claude-brain ones. Different gates, and the runner tells them apart by the exact
+name.
+U8-U23 are OFFLINE and are cargo's own tests, so they need nothing but the
 toolchain.
 C3's teeth are not a mutation here: `AGENT_ROOM_LEAK_TEETH=1` is how that gate
 is stripped, and the run is recorded in `docs/GATES.md`.
@@ -77,6 +81,19 @@ OTHER_NAME_GUARD = """    if let Some((user_id, address)) = cues
         .names
         .addresses_other(&ev.body, cfg.bare_name_addresses)
     {"""
+
+#: The bot-to-bot switch's name arm: what makes another agent's TYPED name an
+#: address, since no model can make a Matrix mention. Two mutations use it.
+BOT_NAME_ARM = "                let Some(named) = names_me(ev, cfg, cues) else {"
+
+#: The one line that separates `conversational` from every other mode.
+BOT_TIER2_ARM = "        if !cfg.bot_to_bot.tier2_on_bots() {"
+
+#: `room_factor`'s early return, as one piece: the mutation has to replace the
+#: whole guard, because leaving the body unreachable is what makes it compile.
+ROOM_FACTOR_GUARD = """    if !cfg.small_room_backoff || participants == 0 {
+        return 1.0;
+    }"""
 
 THREAD_RELATION = """            &Relation {
                 thread_root,
@@ -254,6 +271,40 @@ MUTATIONS = [
             "    {", "        .filter(|_| false)\n    {  // TEETH: not somebody else's turn"
         ),
         test="tests/live/test_addressing.py::test_n4_two_agents_one_name_and_exactly_one_answer",
+    ),
+    # -- PR 3: two agents having a conversation (live) -----------------------
+    Mutation(
+        gate="C-1",
+        guard="policy: `conversational` lets a bot's unaddressed line reach tier 2",
+        path=RUST_SRC / "policy.rs",
+        old=BOT_TIER2_ARM,
+        new="        if true {  // TEETH: no mode ever lets a bot's line reach tier 2",
+        test="tests/live/test_conversation.py::"
+        "test_c1_two_agents_take_up_an_invitation_and_run_out_of_things_to_say",
+    ),
+    Mutation(
+        gate="C-2",
+        guard="policy: a bot that types my name has addressed me (the bot_to_bot name arm)",
+        path=RUST_SRC / "policy.rs",
+        old=BOT_NAME_ARM,
+        new="                let Some(named) = None::<String> else {  "
+        "// TEETH: a typed name never counts",
+        test="tests/live/test_conversation.py::"
+        "test_c2_a_bot_that_types_a_name_is_answered_under_mentions",
+    ),
+    # The other half of the same arm, and the reason C-2 is not enough on its
+    # own: a guard that let EVERY bot line through would pass C-2 and turn
+    # `mentions` into `all` with nobody the wiser.
+    Mutation(
+        gate="C-3",
+        guard="policy: the name arm is a name check, not a way in for every bot",
+        path=RUST_SRC / "policy.rs",
+        old=BOT_NAME_ARM,
+        new="                let Some(named) = names_me(ev, cfg, cues)\n"
+        '                    .or(Some("TEETH".to_owned()))\n'
+        "                else {",
+        test="tests/live/test_conversation.py::"
+        "test_c3_under_mentions_a_bots_unaddressed_line_never_reaches_tier_2",
     ),
     # -- R3: unprompted speech (live) ---------------------------------------
     Mutation(
@@ -449,6 +500,58 @@ MUTATIONS = [
         old="fn wants_warm(decision: &Decision) -> bool {\n    decision.needs_judge()\n}",
         new="fn wants_warm(_decision: &Decision) -> bool {\n    false  // TEETH\n}",
         test="connector::tests::a_line_that_will_cost_a_model_call_warms_it_and_nothing_else_does",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    # -- PR 3: the conversation, offline -------------------------------------
+    Mutation(
+        gate="U19",
+        guard="policy: a bot's typed name satisfies `bot_to_bot: mentions`, offline",
+        path=RUST_SRC / "policy.rs",
+        old=BOT_NAME_ARM,
+        new="                let Some(named) = None::<String> else {  "
+        "// TEETH: a typed name never counts",
+        test="policy::tests::a_bot_that_types_my_name_has_addressed_me",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U20",
+        guard="policy: only `conversational` opens tier 2 to a bot, offline",
+        path=RUST_SRC / "policy.rs",
+        old=BOT_TIER2_ARM,
+        new="        if true {  // TEETH: no mode ever lets a bot's line reach tier 2",
+        test="policy::tests::only_conversational_lets_a_bots_unaddressed_line_reach_tier_two",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U21",
+        guard="judging: the score line is read strictly (an off-scale answer is not a score)",
+        path=RUST_SRC / "brain" / "judging.rs",
+        old=r'r"(?i)^score:[ \t]*(\d)([^\d.].*|)$"',
+        new=r'r"(?i)^score:[ \t]*(\d)(.*)$"  // TEETH: anything after the digit',
+        test="brain::judging::tests::anything_that_is_not_a_score_is_a_zero",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U22",
+        guard="unprompted: the tier-2 back-off is scaled by how many people are in the room",
+        path=RUST_SRC / "connector" / "unprompted.rs",
+        old=ROOM_FACTOR_GUARD,
+        new="    return 1.0;  // TEETH: every room is a crowd",
+        test="connector::unprompted::tests::a_small_room_draws_from_a_shorter_back_off",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U23",
+        guard="addressing: a line handed to the room is one (the judge's cue and the pre-score)",
+        path=RUST_SRC / "addressing.rs",
+        old="    matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE)",
+        new="    false && (matches(&ROOM_INVITATION) || matches(&ROOM_IMPERATIVE))  // TEETH",
+        test="addressing::tests::the_lines_that_hand_the_turn_to_the_room_and_the_ones_that_do_not",
         marker="offline",
         cargo_lib=True,
     ),

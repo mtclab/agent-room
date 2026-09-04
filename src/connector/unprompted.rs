@@ -24,7 +24,7 @@ use matrix_sdk::ruma::RoomId;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::brain::{Occasion, python_bool};
+use crate::brain::Occasion;
 use crate::events::{NOTICE_MSGTYPE, RoomEvent};
 use crate::head;
 use crate::impulses::{Impulse, drop_expired, impulse_dir, read_impulses};
@@ -184,26 +184,57 @@ pub fn hazard_factor(now: f64, last_human_post_ts: f64, last_activity_ts: f64) -
     1.0
 }
 
+/// How much of the back-off a room this size is worth.
+///
+/// The back-off is collision avoidance: it is there so that several agents
+/// watching the same message do not all answer at once. How much room there is
+/// to collide in depends on how many of us there are - in a room of three
+/// (a person and two agents) there is nobody else the question could have been
+/// meant for, and drawing from a range built for a crowd is the difference
+/// between an agent that is thinking and one that is slow.
+///
+/// Linear from a quarter at three to the whole range at six, and never less
+/// than a quarter, because the floor is what stops two agents answering on top
+/// of each other. `participants == 0` means the member list has not arrived
+/// yet: an unmeasured room waits exactly as long as it always did, which is the
+/// safe direction to be wrong in.
+#[must_use]
+pub fn room_factor(cfg: &crate::config::PolicyConfig, participants: usize) -> f64 {
+    if !cfg.small_room_backoff || participants == 0 {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let people = participants as f64;
+    ((people - 2.0) / 4.0).clamp(0.25, 1.0)
+}
+
 /// The range a TIER-2 back-off is drawn from, before anything is drawn.
 ///
 /// Two shapes, and the second one is the whole point of the pre-score. Below
-/// `prescore_fast` it is the configured range scaled by [`hazard_factor`],
-/// exactly as it has always been. At or above it, the line is one somebody is
-/// visibly waiting on - a question, a "you", my name, my subject - and the
-/// range collapses to the configured floor plus [`PRESCORE_FAST_WINDOW_S`],
-/// with NO hazard at all: the hazard is about the mood of a room, and a
-/// question put to it is not a mood.
+/// `prescore_fast` it is the configured range scaled by [`hazard_factor`] and
+/// by how many people are here ([`room_factor`]). At or above it, the line is
+/// one somebody is visibly waiting on - a question, a "you", an invitation to
+/// the room, my name, my subject - and the range collapses to the configured
+/// floor plus [`PRESCORE_FAST_WINDOW_S`], with NO scaling at all: the hazard is
+/// about the mood of a room and the room factor about its size, and a question
+/// put to it is neither.
 ///
 /// It still leaves the floor in place, because the floor is the collision
 /// avoidance: two agents that both answer instantly answer on top of each
 /// other. What it removes is the waiting somebody can feel.
 #[must_use]
-pub fn tier2_range(cfg: &crate::config::PolicyConfig, prescore: u8, hazard: f64) -> (f64, f64) {
+pub fn tier2_range(
+    cfg: &crate::config::PolicyConfig,
+    prescore: u8,
+    hazard: f64,
+    participants: usize,
+) -> (f64, f64) {
     let (low, high) = cfg.backoff_s;
     if prescore >= cfg.prescore_fast {
         return (low, low + PRESCORE_FAST_WINDOW_S);
     }
-    (low * hazard, high * hazard)
+    let factor = hazard * room_factor(cfg, participants);
+    (low * factor, high * factor)
 }
 
 /// Read the inlet directory: fresh impulses in, stale ones deleted.
@@ -553,7 +584,7 @@ impl Runner {
     #[must_use]
     pub(crate) fn tier2_delay(&self, state: &WorkerState, prescore: u8) -> f64 {
         let factor = hazard_factor(self.now(), state.last_human_post_ts, state.last_activity_ts);
-        let (low, high) = tier2_range(&self.cfg.policy, prescore, factor);
+        let (low, high) = tier2_range(&self.cfg.policy, prescore, factor, state.participants);
         uniform(low, high)
     }
 
@@ -602,13 +633,14 @@ impl Runner {
             candidate.kind,
             candidate.note.clone(),
             candidate.thread_root.as_deref(),
+            self.participants(worker).await,
         );
         if candidate.needs_judge {
             let judgement = self.brain.judge(&ctx).await;
             info!(
-                "{room_id}: judge on this {} says speak={} ({})",
+                "{room_id}: judge on this {} says {}: {}",
                 candidate.kind.as_str(),
-                python_bool(judgement.speak),
+                judgement.says(ctx.speak_threshold),
                 judgement.why
             );
             if !judgement.speak {
@@ -761,13 +793,14 @@ impl Runner {
             Occasion::Unaddressed,
             String::new(),
             ev.thread_root.as_deref(),
+            self.participants(&worker).await,
         );
         let judgement = self.brain.judge(&ctx).await;
         info!(
-            "{}: inner-thought probe on {}: speak={} urgency={} ({})",
+            "{}: inner-thought probe on {}: says {} urgency={} ({})",
             worker.room_id,
             ev.event_id,
-            python_bool(judgement.speak),
+            judgement.says(ctx.speak_threshold),
             judgement.urgency,
             judgement.why
         );
@@ -876,11 +909,12 @@ impl Runner {
             Occasion::Heartbeat,
             String::new(),
             anchor.thread_root.as_deref(),
+            self.participants(worker).await,
         );
         let judgement = self.brain.judge(&ctx).await;
         info!(
-            "{room_id}: heartbeat judge says speak={} ({})",
-            python_bool(judgement.speak),
+            "{room_id}: heartbeat judge says {}: {}",
+            judgement.says(ctx.speak_threshold),
             judgement.why
         );
         if !judgement.speak {
@@ -925,21 +959,62 @@ mod tests {
         assert_eq!(cfg.prescore_fast, 4, "the shipped threshold");
 
         // Below the threshold: the configured range, scaled by the hazard,
-        // exactly as it was before the pre-score existed.
-        let (low, high) = tier2_range(&cfg, 3, HAZARD_QUIET_FACTOR);
+        // exactly as it was before the pre-score existed. (A room whose size
+        // nobody has read yet - 0 - is a full-sized room; see `room_factor`.)
+        let (low, high) = tier2_range(&cfg, 3, HAZARD_QUIET_FACTOR, 0);
         assert!((low - 10.0).abs() < f64::EPSILON, "{low}");
         assert!((high - 80.0).abs() < f64::EPSILON, "{high}");
 
         // At it: the floor plus a few seconds of jitter, and the hazard does
         // not get a say - a question with "you" in it is not a mood.
         for hazard in [HAZARD_LIVELY_FACTOR, 1.0, HAZARD_QUIET_FACTOR] {
-            let (low, high) = tier2_range(&cfg, 4, hazard);
+            let (low, high) = tier2_range(&cfg, 4, hazard, 3);
             assert!((low - cfg.backoff_s.0).abs() < f64::EPSILON, "{low}");
             assert!(
                 (high - (cfg.backoff_s.0 + PRESCORE_FAST_WINDOW_S)).abs() < f64::EPSILON,
                 "{high}"
             );
         }
+    }
+
+    #[test]
+    fn a_small_room_draws_from_a_shorter_back_off() {
+        // Three people is a person and two agents: nobody else the question
+        // could have been meant for, so waiting out a range built for a crowd
+        // is the difference between thinking and being slow.
+        let cfg = crate::config::PolicyConfig::default();
+        assert_eq!(cfg.backoff_s, (5.0, 40.0), "the shipped range");
+        let quarter = |participants: usize| tier2_range(&cfg, 0, 1.0, participants);
+
+        assert_eq!(quarter(3), (1.25, 10.0), "a quarter of the range at three");
+        assert_eq!(quarter(2), (1.25, 10.0), "and never less than a quarter");
+        assert_eq!(quarter(4), (2.5, 20.0));
+        assert_eq!(quarter(6), (5.0, 40.0), "the whole range from six up");
+        assert_eq!(quarter(30), (5.0, 40.0));
+
+        // An unmeasured room (no member list yet) waits as long as it always
+        // did: the safe direction to be wrong in.
+        assert_eq!(quarter(0), (5.0, 40.0));
+
+        // It multiplies the hazard rather than replacing it.
+        assert_eq!(
+            tier2_range(&cfg, 0, HAZARD_LIVELY_FACTOR, 3),
+            (0.625, 5.0),
+            "a live conversation in a small room is the quickest there is"
+        );
+
+        // Off, and nothing about the room's size is read at all.
+        let flat = crate::config::PolicyConfig {
+            small_room_backoff: false,
+            ..crate::config::PolicyConfig::default()
+        };
+        assert_eq!(tier2_range(&flat, 0, 1.0, 3), (5.0, 40.0));
+
+        // And the fast path is untouched: it is already the floor.
+        assert_eq!(
+            tier2_range(&cfg, cfg.prescore_fast, 1.0, 3),
+            (5.0, 5.0 + PRESCORE_FAST_WINDOW_S)
+        );
     }
 
     #[test]
@@ -951,7 +1026,7 @@ mod tests {
             prescore_fast: 2,
             ..crate::config::PolicyConfig::default()
         };
-        let (low, high) = tier2_range(&cfg, 2, HAZARD_QUIET_FACTOR);
+        let (low, high) = tier2_range(&cfg, 2, HAZARD_QUIET_FACTOR, 0);
         assert!((low - cfg.backoff_s.0).abs() < f64::EPSILON, "{low}");
         assert!(
             (high - (cfg.backoff_s.0 + PRESCORE_FAST_WINDOW_S)).abs() < f64::EPSILON,
@@ -959,7 +1034,7 @@ mod tests {
         );
 
         // And below it, nothing has moved: the configured range, hazard and all.
-        let (low, high) = tier2_range(&cfg, 1, HAZARD_QUIET_FACTOR);
+        let (low, high) = tier2_range(&cfg, 1, HAZARD_QUIET_FACTOR, 0);
         assert!((low - 10.0).abs() < f64::EPSILON, "{low}");
         assert!((high - 80.0).abs() < f64::EPSILON, "{high}");
     }

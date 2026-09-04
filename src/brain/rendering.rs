@@ -149,6 +149,8 @@ mod tests {
             occasion,
             note: String::new(),
             want_urgency: false,
+            speak_threshold: 5,
+            participants: 0,
         }
     }
 

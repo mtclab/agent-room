@@ -18,7 +18,7 @@ use regex::Regex;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::brain::{Brain, BrainContext, Occasion, python_bool};
+use crate::brain::{Brain, BrainContext, Occasion};
 use crate::config::Config;
 use crate::events::{NOTICE_MSGTYPE, Relation, RoomEvent, build_reply_content, mentioned_user_ids};
 use crate::head;
@@ -55,6 +55,12 @@ pub struct Runner {
 impl Runner {
     pub(crate) fn now(&self) -> f64 {
         (self.clock)()
+    }
+
+    /// How many people and agents are joined to this room, as the member store
+    /// had it at the last membership change. 0 before the first sync.
+    pub(crate) async fn participants(&self, worker: &RoomWorker) -> usize {
+        worker.state.lock().await.participants
     }
 
     // -- the ordinary turn ------------------------------------------------
@@ -137,6 +143,7 @@ impl Runner {
             occasion,
             String::new(),
             trigger.thread_root.as_deref(),
+            self.participants(worker).await,
         );
         let answer = self.ask_for_a_message(&worker.room_id, &ctx).await;
         let Some(answer) = answer.filter(|text| !text.is_empty()) else {
@@ -185,6 +192,7 @@ impl Runner {
         occasion: Occasion,
         note: String,
         thread_root: Option<&str>,
+        participants: usize,
     ) -> BrainContext {
         let thread = thread_root
             .map(|root| worker.transcript.thread(root))
@@ -199,6 +207,8 @@ impl Runner {
             occasion,
             note,
             want_urgency: self.cfg.policy.inner_thoughts,
+            speak_threshold: self.cfg.policy.effective_speak_threshold(),
+            participants,
         }
     }
 
@@ -426,12 +436,13 @@ impl Runner {
             Occasion::Unaddressed,
             String::new(),
             ev.thread_root.as_deref(),
+            self.participants(&worker).await,
         );
         let judgement = self.brain.judge(&ctx).await;
         info!(
-            "{room_id}: judge on {} says speak={} ({})",
+            "{room_id}: judge on {} says {}: {}",
             ev.event_id,
-            python_bool(judgement.speak),
+            judgement.says(ctx.speak_threshold),
             judgement.why
         );
         self.note_urgency(&worker, &ev, judgement.urgency, &judgement.why)

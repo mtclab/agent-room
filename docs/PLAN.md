@@ -100,9 +100,10 @@ Shipped:
   room - `/messages`, not only the local transcript - then the judge, then a
   budget re-check, then a threaded `m.notice`. ONE deliberation at a time per
   room, so a burst of chat cannot arm a judge call per message.
-- `Brain.judge(ctx) -> Judgement(speak, why)` with a no-by-default in
-  `BaseBrain`; the question, the frame and the strict `yes:`/`no:` parsing live
-  in `brain/judging.py` so the adapters cannot drift. echo judges on a
+- `Brain.judge(ctx) -> Judgement(speak, score, why)` with a no-by-default in
+  `BaseBrain`; the question, the frame and the strict `score: N` parsing live
+  in `brain/judging.rs` so the adapters cannot drift (it was `yes:`/`no:`
+  through 1.0.0-rc.3; see DESIGN, "The judge scores, the connector decides"). echo judges on a
   `[[speak]]` marker (deterministic gates), openai_compat uses `judge_model` at
   temperature 0, claude_code uses haiku with `--max-turns 1`, `--tools ""` and a
   throwaway session.
@@ -258,8 +259,8 @@ Shipped:
   `presence_window_min` (30). Candidates queue and wait for it, giving up after
   `unprompted_max_wait_min` (240). The back-off range is halved after a human
   post inside 10 min and doubled in a room quiet for an hour.
-- **Inner thoughts** (`inner_thoughts`, off): the judge answers `yes/no: ... |
-  urgency N` (0-3), accumulated per conversation, and at
+- **Inner thoughts** (`inner_thoughts`, off): the judge answers `score: N - ...
+  | urgency N` (0-3), accumulated per conversation, and at
   `inner_thoughts_threshold` (4) raises a candidate through the same
   presence/back-off/stand-down path - NOT judged again, because the judge
   already answered four points' worth. REFUSED by config validation for

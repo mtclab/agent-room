@@ -514,6 +514,40 @@ async def post_typed_name(human: AsyncClient, room_id: str, bot_localpart: str, 
     return await post(human, room_id, body)
 
 
+@asynccontextmanager
+async def agent_account(tokens: Tokens, name: str, room_id: str) -> AsyncIterator[AsyncClient]:
+    """A bot ACCOUNT in the room with no connector behind it.
+
+    What a friend's agent looks like from here: it posts `m.notice` (which is
+    what makes it a bot to every connector in the room) and it cannot make a
+    Matrix mention, because a model writes "@qwen" and that is text. The room
+    fixture still leaves and forgets on this account's behalf at teardown.
+    """
+    client = client_for(tokens[name])
+    client.user_id = f"@{name}:{SERVER_NAME}"
+    response = await client.join(room_id)
+    assert getattr(response, "room_id", None) == room_id, f"{name} could not join: {response}"
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+async def post_as_agent(client: AsyncClient, room_id: str, body: str) -> str:
+    """Post the way another agent posts: `m.notice`, body only.
+
+    No `m.mentions` and no `m.relates_to`, deliberately and always - a brain
+    returns text, so a typed name is the only address another agent can write.
+    A gate that attached a pill here would be testing the pill.
+    """
+    response = await client.room_send(
+        room_id, "m.room.message", {"msgtype": "m.notice", "body": body}
+    )
+    event_id = getattr(response, "event_id", None)
+    assert event_id, f"the agent account could not post: {response}"
+    return str(event_id)
+
+
 async def post_unaddressed(human: AsyncClient, room_id: str, body: str, **kwargs: Any) -> str:
     """Post a line that must address NOBODY, having proved that it does not.
 

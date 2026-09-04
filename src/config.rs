@@ -22,6 +22,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::addressing::MIN_NAME_CHARS;
+use crate::brain::MAX_JUDGE_SCORE;
 use crate::events::localpart;
 
 /// Set to "1" to allow an access-token file whose mode is looser than 0600.
@@ -405,12 +406,23 @@ pub struct EchoBrainConfig {
     /// A user id every echo reply names, so the reply mentions that account.
     #[serde(default)]
     pub mention_back: String,
+    /// A NAME every echo reply ends with, as a vocative (`..., qwen?`), so one
+    /// echo bot can address another the way a person does: by typing a name,
+    /// with no `m.mentions` anywhere. `mention_back` is the machine form of the
+    /// same thing and they are deliberately separate.
+    #[serde(default)]
+    pub name_back: String,
     /// Appended to every reply, which is what leaves a question hanging.
     #[serde(default)]
     pub ask_back: String,
     /// What the echo judge reports as urgency (the inner-thoughts axis).
     #[serde(default)]
     pub urgency: i32,
+    /// The score the echo judge reports for a trigger that carries no marker.
+    /// 0 (the default) is the marker-driven brain the gates have always had;
+    /// a gate that needs an agent which always has something to say sets it.
+    #[serde(default)]
+    pub score: u8,
 }
 
 impl EchoBrainConfig {
@@ -419,6 +431,19 @@ impl EchoBrainConfig {
             return Err(ConfigError::msg(format!(
                 "brain.echo.mention_back {:?} is not a Matrix user id",
                 self.mention_back
+            )));
+        }
+        if self.name_back.starts_with('@') {
+            return Err(ConfigError::msg(format!(
+                "brain.echo.name_back {:?} is a Matrix user id, not a name: it is the typed \
+                 form, and `mention_back` is the one that takes an id",
+                self.name_back
+            )));
+        }
+        if self.score > MAX_JUDGE_SCORE {
+            return Err(ConfigError::msg(format!(
+                "brain.echo.score {} is outside the judge's 0-{MAX_JUDGE_SCORE} scale",
+                self.score
             )));
         }
         Ok(())
@@ -552,12 +577,37 @@ impl Default for BudgetsConfig {
     }
 }
 
+/// What another agent's line may do here.
+///
+/// The three tighter modes differ only in what counts as being addressed by a
+/// bot; the fourth changes what a bot's line is allowed to REACH.
+///
+/// - `none` - another agent's line is never answered at all.
+/// - `mentions` (the default) - answered when it addresses me: an
+///   `m.mentions`, or my name typed in the body, because a model writing
+///   "@qwen" produces text and no other agent can make a Matrix mention.
+/// - `all` - answered like anybody's line, and still only when something in it
+///   addresses me: tier 2 never triggers on a bot.
+/// - `conversational` - `all`, plus a bot's UNADDRESSED line may reach tier 2,
+///   so two agents can talk to each other the way they talk to people. The
+///   loop bounds are what keep that from being a runaway: the pair budget, the
+///   per-thread cap, the energy decay, the tier-2 hourly cap and the
+///   stand-down re-read all still apply, unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BotToBot {
     None,
     Mentions,
     All,
+    Conversational,
+}
+
+impl BotToBot {
+    /// Whether a bot's line that addressed nobody may reach tier 2.
+    #[must_use]
+    pub fn tier2_on_bots(self) -> bool {
+        matches!(self, Self::Conversational)
+    }
 }
 
 // The switches really are that many independent booleans: each one is a
@@ -613,8 +663,26 @@ pub struct PolicyConfig {
     /// hurry, which is not the same thing as off.
     #[serde(default = "default_prescore_fast")]
     pub prescore_fast: u8,
+    /// The judge's enthusiasm (0-9) at which its answer is a yes. The judge is
+    /// asked how much it would add here, not whether to speak: a yes/no
+    /// question about whether to say anything is biased to silence, and a room
+    /// of agents that all answer "the conversation has naturally settled" is
+    /// the failure this replaced.
+    #[serde(default = "default_speak_threshold")]
+    pub speak_threshold: u8,
+    /// How talkative this agent is, -3 to 3, as a shift of
+    /// `speak_threshold`: +1 speaks one point of enthusiasm sooner, -1 needs
+    /// one more. The threshold is the room's rule; this is the personality.
+    #[serde(default)]
+    pub chattiness: i8,
     #[serde(default = "default_backoff")]
     pub backoff_s: (f64, f64),
+    /// Scale the tier-2 back-off by how many people are in the room. In a room
+    /// of three there is nobody else for a question to be meant for, and
+    /// waiting out a range built for a crowd is what makes an agent feel slow.
+    /// The pre-scored fast path is untouched: it is already the floor.
+    #[serde(default = "yes")]
+    pub small_room_backoff: bool,
     #[serde(default)]
     pub heartbeat_minutes: i64,
     #[serde(default = "default_presence_window")]
@@ -654,6 +722,9 @@ fn default_followup_window() -> u64 {
 fn default_prescore_fast() -> u8 {
     4
 }
+fn default_speak_threshold() -> u8 {
+    5
+}
 fn default_presence_window() -> i64 {
     30
 }
@@ -686,7 +757,10 @@ impl Default for PolicyConfig {
             answer_unaddressed: true,
             topics: Vec::new(),
             prescore_fast: default_prescore_fast(),
+            speak_threshold: default_speak_threshold(),
+            chattiness: 0,
             backoff_s: default_backoff(),
+            small_room_backoff: true,
             heartbeat_minutes: 0,
             presence_window_min: default_presence_window(),
             unprompted_max_wait_min: default_unprompted_max_wait(),
@@ -703,6 +777,26 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// The score at which THIS agent's judge says yes: `speak_threshold`
+    /// shifted by `chattiness` and held inside the scale.
+    ///
+    /// The clamp is what makes both ends mean something: `MAX_JUDGE_SCORE + 1`
+    /// is "never speaks unprompted" (no score can reach it) and 0 is "speaks
+    /// whenever it is asked", so a chatty personality cannot push a
+    /// deliberately silent agent into talking, and a shy one cannot make a
+    /// deliberately talkative one silent.
+    #[must_use]
+    pub fn effective_speak_threshold(&self) -> u8 {
+        if self.speak_threshold > MAX_JUDGE_SCORE {
+            // Off the scale is the off switch, and a personality does not get
+            // to talk an agent out of being switched off.
+            return self.speak_threshold;
+        }
+        let shifted = i32::from(self.speak_threshold) - i32::from(self.chattiness);
+        let ceiling = i32::from(MAX_JUDGE_SCORE) + 1;
+        u8::try_from(shifted.clamp(0, ceiling)).unwrap_or(MAX_JUDGE_SCORE)
+    }
+
     /// How long an unprompted thought waits for somebody to be here, in
     /// SECONDS. The knob is in minutes because that is the unit an operator
     /// thinks in, and everything that acts on it works in seconds; 0 is off.
@@ -757,6 +851,21 @@ impl PolicyConfig {
                      characters: a shorter name would match syllables in the middle of words"
                 )));
             }
+        }
+        if self.speak_threshold > MAX_JUDGE_SCORE + 1 {
+            return Err(ConfigError::msg(format!(
+                "policy.speak_threshold {} is outside the judge's 0-{MAX_JUDGE_SCORE} scale \
+                 ({} = never speaks unprompted)",
+                self.speak_threshold,
+                MAX_JUDGE_SCORE + 1
+            )));
+        }
+        if !(-3..=3).contains(&self.chattiness) {
+            return Err(ConfigError::msg(format!(
+                "policy.chattiness {} is outside -3..3: it shifts policy.speak_threshold, and \
+                 a shift wider than the scale would only ever mean always or never",
+                self.chattiness
+            )));
         }
         for topic in &self.topics {
             if topic.trim().is_empty() {
@@ -1673,6 +1782,71 @@ mod tests {
         );
         assert_eq!(brain.resolved_judge_api_key(), "big-key");
         assert_eq!(brain.resolved_judge_body().len(), 1);
+    }
+
+    #[test]
+    fn chattiness_shifts_the_threshold_and_never_off_the_scale() {
+        // The judge answers 0-9; the operator decides where the line is. Two
+        // agents with the same brain, one talkative and one not.
+        let shipped = PolicyConfig::default();
+        assert_eq!(shipped.speak_threshold, 5);
+        assert_eq!(shipped.chattiness, 0);
+        assert_eq!(shipped.effective_speak_threshold(), 5);
+
+        let chatty = PolicyConfig {
+            chattiness: 2,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(chatty.effective_speak_threshold(), 3);
+        let quiet = PolicyConfig {
+            chattiness: -3,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(quiet.effective_speak_threshold(), 8);
+
+        // Neither end can be pushed off the scale: an agent set to never speak
+        // unprompted stays that way however chatty its personality is, and one
+        // set to always speak stays that way however shy.
+        let never = PolicyConfig {
+            speak_threshold: MAX_JUDGE_SCORE + 1,
+            chattiness: 3,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(never.effective_speak_threshold(), MAX_JUDGE_SCORE + 1);
+        let shy = PolicyConfig {
+            speak_threshold: MAX_JUDGE_SCORE,
+            chattiness: -3,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(
+            shy.effective_speak_threshold(),
+            MAX_JUDGE_SCORE + 1,
+            "a shift past the top of the scale is the same as never"
+        );
+        let always = PolicyConfig {
+            speak_threshold: 1,
+            chattiness: 3,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(always.effective_speak_threshold(), 0);
+
+        // And the schema refuses what would only ever mean always or never.
+        for bad in [
+            PolicyConfig {
+                speak_threshold: 11,
+                ..PolicyConfig::default()
+            },
+            PolicyConfig {
+                chattiness: 4,
+                ..PolicyConfig::default()
+            },
+            PolicyConfig {
+                chattiness: -4,
+                ..PolicyConfig::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

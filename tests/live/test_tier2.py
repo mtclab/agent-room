@@ -247,7 +247,10 @@ async def test_g7_an_unaddressed_line_the_judge_declines_is_left_alone(
     await asyncio.sleep(20)
     events = await messages(human, room_s3)
     assert by_sender(events, S3_BOT_A) == [], "the agent answered a line its judge declined"
-    assert "speak=False" in bot.log_text(), "the judge was never asked"
+    # The judge answers with a SCORE now, and the log says what it was measured
+    # against: `judge on $evt says 0 (< 5): ...`.
+    log = bot.log_text()
+    assert "judge on" in log and "(< " in log, "the judge was never asked, or it did not decline"
 
     await post_unaddressed(human, room_s3, "[[speak]] and now something worth answering")
     events = await wait_for(lambda evs: bool(by_sender(evs, S3_BOT_A)), human, room_s3, seconds=30)

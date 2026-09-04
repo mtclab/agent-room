@@ -320,10 +320,14 @@ impl Brain for OpenAiCompatBrain {
                 self.cfg.resolved_judge_timeout(),
             )
             .await;
-        let judgement = parse_judgement(answer.as_deref());
+        let judgement = parse_judgement(answer.as_deref(), ctx.speak_threshold);
         info!(
             "judge ({} via {}) says {}: {} (urgency {})",
-            ctx.room_id, self.judge_url, judgement.speak, judgement.why, judgement.urgency
+            ctx.room_id,
+            self.judge_url,
+            judgement.says(ctx.speak_threshold),
+            judgement.why,
+            judgement.urgency
         );
         judgement
     }
@@ -503,6 +507,8 @@ mod tests {
             occasion: Occasion::Reply,
             note: String::new(),
             want_urgency: false,
+            speak_threshold: 5,
+            participants: 0,
         }
     }
 
@@ -580,7 +586,8 @@ mod tests {
         // how long a reply may be, and `judge_max_tokens` is how much a yes/no
         // question is allowed to spend. A build that sent its own numbers would
         // truncate the first and pay for the second.
-        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("no: nothing to add")).await;
+        let endpoint =
+            FakeEndpoint::start(FakeEndpoint::answering("score: 1 - nothing to add")).await;
         let mut cfg = config(&endpoint.base_url);
         cfg.max_tokens = 42;
         cfg.judge_max_tokens = 7;
@@ -598,7 +605,8 @@ mod tests {
         // `judge_extra_body` is not merged into `extra_body`: it REPLACES it,
         // because the two calls can be two models with two sets of knobs, and
         // one server's knobs are another server's 400.
-        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("no: nothing to add")).await;
+        let endpoint =
+            FakeEndpoint::start(FakeEndpoint::answering("score: 1 - nothing to add")).await;
         let mut cfg = config(&endpoint.base_url);
         cfg.judge_extra_body = BTreeMap::from([("top_k".to_owned(), json!(5))]);
         let brain = brain(cfg);
@@ -727,7 +735,7 @@ mod tests {
         // only fits a verdict, and temperature 0 so an identical room does not
         // get a different answer every time it is asked.
         let endpoint = FakeEndpoint::start(FakeEndpoint::answering(
-            "yes: nobody has answered the question about the deploy",
+            "score: 7 - nobody has answered the question about the deploy",
         ))
         .await;
         let mut cfg = config(&endpoint.base_url);
@@ -759,13 +767,14 @@ mod tests {
             .as_str()
             .expect("a user prompt");
         assert!(user.contains("does anyone know about the deploy?"));
-        assert!(user.contains("Answer exactly `yes: <one line>` or `no: <one line>`."));
+        assert!(user.contains("Answer with exactly one line: `score: N`"));
         endpoint.stop();
     }
 
     #[tokio::test]
     async fn the_judge_falls_back_to_the_reply_model() {
-        let endpoint = FakeEndpoint::start(FakeEndpoint::answering("no: nothing to add")).await;
+        let endpoint =
+            FakeEndpoint::start(FakeEndpoint::answering("score: 1 - nothing to add")).await;
         assert!(
             !brain(config(&endpoint.base_url))
                 .judge(&context("x"))
@@ -782,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn a_thinking_judge_is_still_parsed_and_a_broken_one_is_a_no() {
         let endpoint = FakeEndpoint::start(FakeEndpoint::answering(
-            "<think>they asked about ports</think>\nyes: I know the port",
+            "<think>they asked about ports</think>\nscore: 8 - I know the port",
         ))
         .await;
         let judgement = brain(config(&endpoint.base_url)).judge(&context("x")).await;

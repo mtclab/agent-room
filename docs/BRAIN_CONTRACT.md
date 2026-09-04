@@ -3,8 +3,8 @@
 A brain answers two questions and nothing else:
 
 - **`reply(ctx)`** - given what happened in the room, what should I say?
-- **`judge(ctx)`** - nobody addressed me; is there anything here worth saying at
-  all?
+- **`judge(ctx)`** - nobody addressed me; how much would I add by speaking
+  here at all?
 
 Everything else - when to speak, back-offs, budgets, threading, mentions, read
 receipts, restarts - belongs to the connector and is deliberately not your
@@ -73,6 +73,12 @@ Three rules that are worth more than the signatures:
 | `occasion: Occasion` | why you are being asked (below) |
 | `note: String` | what the occasion is about when the room is not: the impulse, the loop, the thought. Empty for `Reply` and `Unaddressed` |
 | `want_urgency: bool` | the connector is collecting inner thoughts; see `Judgement` |
+| `speak_threshold: u8` | the score at which YOUR judgement is a yes here (`policy.speak_threshold` shifted by `policy.chattiness`). The operator's, not yours |
+| `participants: usize` | how many people and agents are joined to this room; 0 before the member list has arrived |
+
+`ctx.i_took_part()` answers "am I already part of this exchange?" off the thread
+(or the room's recent lines when there is no thread). It is one of the cues the
+shipped judge prompt states rather than makes the model infer.
 
 A `RoomEvent` (`src/events.rs`) carries `event_id`, `room_id`, `sender`,
 `sender_display`, `body`, `msgtype`, `ts` (epoch seconds), `thread_root`,
@@ -102,21 +108,39 @@ question.
 ```rust
 pub struct Judgement {
     pub speak: bool,
+    /// 0-9: how much this brain would add here. 0 whenever nothing usable
+    /// came back.
+    pub score: u8,
     pub why: String,
     /// 0-3: how much this brain wanted to say something, whatever it decided.
     pub urgency: i32,
 }
 ```
 
-`Judgement::no(why)` is the whole constructor most adapters need. The `why` is
-logged, so write it for the person reading the log at midnight.
+**A score, not a verdict.** The judge is asked how much it would add, 0 to 9,
+and the operator's configuration is what turns that into speech - which is why
+`Judgement::scored(score, ctx.speak_threshold, why, urgency)` is the
+constructor, and why the threshold comes in on the context. A binary "should
+you speak?" is biased to silence: the first room to hold two agents got "no:
+the conversation has naturally settled" from a judge that had just been told to
+talk (see `docs/DESIGN.md`, "The judge scores, the connector decides").
+
+| score | what it means |
+|---|---|
+| 9-7 | I clearly should: invited, asked, or squarely my subject |
+| 6-4 | I could add something |
+| 3-0 | nothing to add, the thread is closed, or it is somebody else's |
+
+`Judgement::no(why)` is the other constructor most adapters need: score 0,
+speak false, whatever the threshold. The `why` is logged, so write it for the
+person reading the log at midnight.
 
 `urgency` is 0-3 (`brain::MAX_URGENCY`) and only matters when `ctx.want_urgency`
 is set (the operator turned on `policy.inner_thoughts`). It is "how much did you
-want to say something, whatever you decided" - and it is what lets a run of nos
-add up to one message. `parse_judgement` reads it off the end of the verdict
-line (`no: they have it covered | urgency 2`), and a mangled suffix costs the
-urgency and never the verdict.
+want to say something, whatever you scored" - and it is what lets a run of nos
+add up to one message. `parse_judgement` reads it off the end of the score line
+(`score: 2 - they have it covered | urgency 2`), and a mangled suffix costs the
+urgency and never the score.
 
 ### Promising to come back to something
 
@@ -163,11 +187,11 @@ in `crate::brain`:
   your adapter cannot drift from the shipped two.
 - **`judge_system_prompt(ctx)` / `judge_prompt(ctx)`** - the persona plus the
   judging frame, and the room plus the question. Same question for every brain.
-- **`parse_judgement(text)`** - reads `yes: ...` / `no: ...` and treats anything
-  else as a no, with a reason saying so. Use it rather than writing your own
-  parser: "anything unparseable is silence" is a rule of the project, not a
-  detail of one adapter. It takes an `Option<&str>`, so "the endpoint returned
-  nothing at all" goes through the same door.
+- **`parse_judgement(text, ctx.speak_threshold)`** - reads `score: N - reason`
+  and treats anything else as 0, with a reason saying so. Use it rather than
+  writing your own parser: "anything unparseable is silence" is a rule of the
+  project, not a detail of one adapter. It takes an `Option<&str>`, so "the
+  endpoint returned nothing at all" goes through the same door.
 
 ## Adding a kind
 
@@ -312,9 +336,10 @@ impl Brain for MyBrain {
                 "prompt": judge_prompt(ctx),
             }))
             .await;
-        // The shared parser, not one of your own: anything that is not a clear
-        // yes is a no, and that rule belongs to the project.
-        parse_judgement(answer.as_deref())
+        // The shared parser, not one of your own: anything that is not a
+        // score is a 0, and that rule belongs to the project. The threshold
+        // comes from the operator's config, through the context.
+        parse_judgement(answer.as_deref(), ctx.speak_threshold)
     }
 }
 ```

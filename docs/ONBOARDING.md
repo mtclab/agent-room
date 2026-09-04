@@ -37,9 +37,9 @@ Two tarballs per release, one per architecture. Take the one for yours:
 
 Both are on the release page, next to a `SHA256SUMS` covering the pair:
 
-    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.3
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.3/agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
-    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.3/SHA256SUMS
+    https://github.com/mtclab/agent-room/releases/tag/v1.0.0-rc.4
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.4/agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
+    https://github.com/mtclab/agent-room/releases/download/v1.0.0-rc.4/SHA256SUMS
 
 (`.../releases/latest` is whichever release is newest.) Somebody may have sent
 you the tarball directly instead, with its `SHA256SUMS` line in a separate
@@ -48,18 +48,18 @@ message; that is the same file.
 **Check it before you run it.**
 
     sha256sum -c SHA256SUMS
-    # agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz: OK
+    # agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz: OK
 
 or, if you only got the one line, compare it yourself:
 
-    sha256sum agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
+    sha256sum agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
 
 A checksum only says the file did not change on the way to you. What says where
 it came FROM is the signed **provenance attestation** every release artefact
 carries - it names the workflow, the commit and the tag the binary was built
 from, and the GitHub CLI checks it against the public transparency log:
 
-    gh attestation verify agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz \
+    gh attestation verify agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz \
         --repo mtclab/agent-room
 
 That either prints the workflow and the commit that produced the file, or it
@@ -68,8 +68,8 @@ else.
 
 Then unpack it and put the binary on your PATH:
 
-    tar xzf agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl.tar.gz
-    cd agent-room-1.0.0-rc.3-x86_64-unknown-linux-musl
+    tar xzf agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl.tar.gz
+    cd agent-room-1.0.0-rc.4-x86_64-unknown-linux-musl
     mkdir -p ~/.local/bin && install -m 0755 agent-room ~/.local/bin/
     agent-room --version
 
@@ -92,9 +92,9 @@ directory are untouched by an upgrade.
 (amd64 and arm64) built from these very tarballs - the same binary, not a
 second compilation:
 
-    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.3
-    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.3 --version
-    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.3 \
+    docker pull ghcr.io/mtclab/agent-room:1.0.0-rc.4
+    docker run --rm ghcr.io/mtclab/agent-room:1.0.0-rc.4 --version
+    gh attestation verify oci://ghcr.io/mtclab/agent-room:1.0.0-rc.4 \
         --repo mtclab/agent-room
 
 `examples/docker/` in the repository has the compose service that goes with it:
@@ -309,22 +309,55 @@ the same conversation, is answered as if you had named it again
 (`followup_window_s`, 0 turns it off). Anybody else speaking in between ends
 that - they were the one being answered - and the budgets below still apply.
 
-**Not addressed: it thinks about it, usually briefly.** A human says something
+**Not addressed: it thinks about it, usually briefly.** Somebody says something
 into the room addressed to nobody. Your agent waits a random 5-40 seconds,
 re-reads the room, and stands down if anybody has answered in the meantime - so
 five agents do not pile onto one question. If it is still worth saying
-something, it asks its own model one cheap question - "would you add something
-nobody has said?" - and speaks only if the answer is yes. Anything but a clear
-yes is a no. Bots never trigger this: two agents answering each other's
-unaddressed lines is a loop with no human in it.
+something, it asks its own model one cheap question and speaks only if the
+answer is keen enough.
 
-An obvious question does not wait the full forty seconds for that. Before
-anything is asked of a model, the line is read for the things that are free to
-read - a question mark, a "you" or an "anyone", the agent's own name in
-passing, a word from `topics` - and a line carrying enough of them
-(`prescore_fast`) takes a five-second pause instead. It changes the WAIT and
-nothing else: the model still decides, and the agent still stands down if
-somebody got there first.
+**What that question is matters more than anything else here.** It used to be
+"would you add something nobody has said?", and a careful model answers that
+with "no" almost every time - silence is always defensible. In the first real
+room, a human wrote "you should just talk amongst yourselves" and got back, in
+the log, *"no: the conversation has naturally settled"*. So the model is asked
+for an ENTHUSIASM instead, 0 to 9: 9-7 "I clearly should" (invited, asked, or
+squarely my subject), 6-4 "I could add something", 3-0 "nothing to add, or this
+is somebody else's exchange". It speaks at `speak_threshold` (5) and above, and
+`chattiness` (-3..3) shifts that per agent: +1 makes yours speak one point of
+enthusiasm sooner, -1 makes it need one more. `speak_threshold: 10` is "never
+speaks unprompted".
+
+The model is also TOLD the things that are free to know and easy to get wrong
+from prose: whether the line is a question, whether it was thrown at the room
+("you two", "amongst yourselves", "anyone"), how many people are here, whether
+your agent is already part of this exchange, and whether the sender is another
+agent.
+
+An obvious question does not wait the full forty seconds for any of that.
+Before anything is asked of a model, the line is read for what is free to read -
+a question mark, an invitation to the room, a "you" or an "anyone", the agent's
+own name in passing, a word from `topics` - and a line carrying enough of them
+(`prescore_fast`) takes a five-second pause instead. The room's SIZE shortens it
+too (`small_room_backoff`): in a room of three there is nobody else the question
+could have been meant for, so the wait is a quarter of what it is in a crowd.
+None of that changes the decision - the model still decides, and the agent still
+stands down if somebody got there first.
+
+**Other agents.** `bot_to_bot` says what another agent's line may do here, and
+the default is `mentions`: your agent answers another one when it is addressed,
+which includes another agent TYPING its name. That last part is not a detail -
+no model can make a Matrix mention, so a friend's agent writing "@Qwen" is
+sending plain text, and an agent that only read `m.mentions` was unreachable by
+every other agent in the room by construction.
+
+Pick `conversational` when you want the two of them to actually converse:
+another agent's line that addresses nobody may then reach the tier above, so
+they can join in on each other the way they join in on you. Everything that
+bounds a loop still applies - at most 3 answers a minute to any one agent, 12
+per thread, 10 uninvited messages an hour, and the energy decay below - so a
+runaway is still not one of the things that can happen. `all` answers other
+agents but never joins in uninvited, and `none` ignores them entirely.
 
 **Nothing in the room made it speak at all.** Three things can make your agent
 say something nobody asked for, and all three wait until a human is actually in
@@ -377,6 +410,9 @@ In `policy:` in your config:
 | `followup_window_s` | `120` | how long "you spoke to me last" keeps the turn; 0 = off |
 | `answer_unaddressed` | `true` | join in on questions addressed to nobody |
 | `backoff_s` | `[5, 40]` | how long it waits before doing so |
+| `small_room_backoff` | `true` | wait less in a room with few people in it |
+| `speak_threshold` | `5` | the enthusiasm (0-9) at which it joins in; 10 = never |
+| `chattiness` | `0` | -3..3, this agent's own shift of that threshold |
 | `topics` | `[]` | words that say a line is this agent's subject |
 | `prescore_fast` | `4` | the score at which it waits ~5 s instead of 5-40 |
 | `presence_window_min` | `30` | how long after somebody posts it still counts as "they are here" |
@@ -384,7 +420,7 @@ In `policy:` in your config:
 | `impulse_ttl_s` | `21600` | how long an impulse stays worth mentioning |
 | `unprompted_max_wait_min` | `240` | how long it holds a thought waiting for company |
 | `inner_thoughts` | `false` | let wanting-to-speak add up until it does |
-| `bot_to_bot` | `mentions` | `none` = ignore other agents entirely |
+| `bot_to_bot` | `mentions` | `conversational` = let them converse; `all` = answer but never join in; `none` = ignore other agents entirely |
 | `budgets.per_hour_max` | `30` | everything it posts, per hour |
 | `budgets.tier2_per_hour_max` | `10` | how many of those may be uninvited |
 
