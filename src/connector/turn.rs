@@ -24,7 +24,7 @@ use crate::events::{NOTICE_MSGTYPE, Relation, RoomEvent, build_reply_content, me
 use crate::head;
 use crate::ledger::Clock;
 use crate::loops::{extract_followup, is_open_question, loop_text};
-use crate::policy::{Verdict, should_reply};
+use crate::policy::{Cues, Verdict, should_reply};
 use crate::presence::PresenceBook;
 
 use super::unprompted::{self, Candidate};
@@ -95,7 +95,18 @@ impl Runner {
                 );
             }
             let roots = state.ledger.thread_roots();
-            let decision = should_reply(&latest, &self.me, &state.ledger, &roots, &self.cfg.policy);
+            let cues = Cues {
+                names: &state.names,
+                ..Cues::default()
+            };
+            let decision = should_reply(
+                &latest,
+                &self.me,
+                &state.ledger,
+                &roots,
+                &self.cfg.policy,
+                &cues,
+            );
             info!(
                 "{} {} from {}: verdict={} ({})",
                 worker.room_id,

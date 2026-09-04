@@ -422,7 +422,9 @@ a unit test and every log line names the single rule that decided:
 | `silent` | no, and the reason says which guard said so. |
 
 **Tier 1, always answer**: `m.mentions` contains me, a real reply to my message,
-or a thread I already spoke in (thread stickiness).
+MY NAME IN THE BODY (see "Addressing" below), or a thread I already spoke in
+(thread stickiness). Somebody else's name in the body is the one guard that
+answers "silent" without being a refusal - it is the line going somewhere else.
 
 **Tier 2, may answer** (`policy.answer_unaddressed`, on by default). The trigger
 must be a HUMAN `m.text` that addressed nobody - bots never trigger tier 2,
@@ -477,6 +479,110 @@ Budgets (hard, in the connector, not in the prompt):
   fresh licence to ping-pong.
 - Self-echo guard outside any config branch. `msgtype: m.notice` for all bot posts
   so other connectors can identify bots cheaply.
+
+### Addressing (BUILT 2026-09-04)
+
+The room's first real use found the gap: "Qwen, why are you so quiet?" got
+nothing; "@Qwen hello" got an answer. Only three things counted as an address -
+an `m.mentions` entry (which Element writes only when the sender picks the pill
+out of the completion list), a rich reply, or a thread I had spoken in - so a
+typed name was plain text and fell to tier 2: a random back-off, then a judge
+call on an on-demand model that could take minutes to load, and usually silence.
+
+The prior art is unanimous about the shape of the fix. Turn ALLOCATION (someone
+selected me as the next speaker) must be deterministic, free and immediate;
+SELF-selection (nobody selected anyone) is where the back-off, the judge and the
+stand-down belong; and "somebody else was clearly selected" has to short-circuit
+to silence, or every agent in the room answers the same line.
+
+- Matt Webb, multiplayer AI turn-taking (2025): directly addressed scores 9 out
+  of 9, somebody else clearly addressed scores 0, and a plain "should I reply?"
+  prompt failed - everyone answers, nobody coordinates.
+  <https://interconnected.org/home/2025/05/23/turntaking>
+- Inner Thoughts (arXiv 2501.00383): turn allocation - a name, or a question put
+  to me - replies with no threshold at all; self-selection is the part that
+  needs a motivation score.
+- MUCA (arXiv 2401.04883): "direct chatting" is the highest priority and is
+  answered immediately.
+- GroupGPT (arXiv 2603.01059): decoupling the timing decision from the
+  generation cut tokens threefold; "stay silent" is a first-class label.
+- Addressee recognition (arXiv 2501.16643): explicit addressees are ~20% of
+  turns, and even a large model is near chance on the implicit ones. The
+  explicit cases are the only reliable ones - which is exactly what a
+  deterministic tier should own, and all it should try to own.
+- OpenClaw groups derive `mentionPatterns` from the agent's identity,
+  case-insensitively and unanchored.
+  <https://docs.openclaw.ai/channels/groups>
+
+The decision order in `policy::should_reply`, with the two new arms in bold:
+
+| # | Signal | Verdict | Model call | Log reason |
+|---|---|---|---|---|
+| 1 | sender is me | silent | none | `self-echo: the event is mine` |
+| 2 | bot sender vs `bot_to_bot` | silent / pass | none | `bot_to_bot=...` |
+| 3a | `m.mentions` or a pill names me | reply | speaker | `mentioned` |
+| 3b | rich reply to my event | reply | speaker | `reply to my event $id` |
+| 3c | **a vocative of one of my names** | reply | speaker | `named in the body (qwen, leading)` |
+| 3d | **a vocative of another member's name** | silent | none | `addressed to alex (@alex:server), not me` |
+| 3e | a thread I have posted in | reply | speaker | `thread $id I have posted in` |
+| 4-5 | budgets, then energy decay | silent / judge | | unchanged |
+| 6 | nobody addressed anybody | consider | judge | `unaddressed: tier 2 candidate ...` |
+
+3d beats 3e deliberately: being in the thread is a weaker claim than being
+named, and without that ordering two agents in one thread both answer a line
+meant for one of them. It never beats 3a or 3b - a mention and a reply are
+addresses the sender made explicit - and it sets `unaddressed: false`, so the
+line costs nothing at all: no back-off, no judge, no inner-thought probe.
+
+**What counts as a vocative** (`src/addressing.rs`, pure and table-tested).
+Rust's regex has no lookaround, so every boundary is CONSUMED: `(?:^|[^\p{L}\p{N}_-])`
+before a name and `(?:$|[^\p{L}\p{N}_'-])` after it (the two typographic dashes
+count with the hyphen, and the right-hand apostrophe with the left),
+case-insensitive, names escaped and matched longest first, nothing under three
+characters. The hyphen counts as a WORD character on purpose - without that, a
+member called "gate" would be addressed by every line naming `gate-bot-a` - and
+the apostrophe is excluded on the right so that "qwen's day" is about qwen.
+
+| form | what it takes |
+|---|---|
+| leading | start of a line, up to two filler words (`hey`, `hi`, `ok`, `so`, `thanks`, `please`, `sorry`, ...), the name, and then either punctuation or a next token that is not `is`/`was`/`has`/`seems`/`said`/`will`/`can`/`and`/`or`/... |
+| at | `@name` anywhere |
+| trailing | a comma, semicolon, colon or spaced dash, the name, end of line |
+| parenthetical | the name between two such separators |
+| bare + second person | the name anywhere, in a line that also says you/your/you're/yours/u |
+
+A bare name on its own is NOT an address (owner, 2026-09-04): "I should ask
+qwen about it" is talk about the agent, and it goes to tier 2 where the judge
+decides. `policy.bare_name_addresses: true` overrides that for an operator who
+wants it. The second-person fallback applies to MY names only, never to 3d:
+"you should ask alex" names alex but asks me, and a silence there would be the
+one failure this feature must not introduce.
+
+**Where the names come from.** Mine: the display name this room knows me by
+(`room.get_member_no_sync`), falling back to the account's own display name read
+once at login, plus its first word, plus my localpart, plus
+`policy.addressed_names`. Everybody else's: the joined members' display names,
+their first words and their localparts, read from the STORE (no HTTP), plus the
+localparts of `policy.bot_user_ids` - which are configured rather than
+discovered, so another agent is addressable before it has ever spoken. Rebuilt
+at startup and whenever a sync carries an `m.room.member` event; never per
+message, because these are compiled regexes. A name of mine is never registered
+as somebody else's.
+
+The risk this buys is a display name that is an ordinary word ("Max", "Will").
+Three things hold it down - the vocative position, the three-character floor and
+the next-token filter - and the escape hatch is
+`other_names_from_members: false` plus an explicit `addressed_names`, with
+`reply_to_names: false` turning the whole thing off.
+
+Knobs: `reply_to_names` (true), `addressed_names` ([]),
+`other_names_from_members` (true), `bare_name_addresses` (false).
+
+NOT BUILT YET, and the next thing here: the FOLLOW-UP arm (3f) - "I was the last
+speaker in this conversation and the human came back within two minutes" - which
+is why `policy::Cues` carries a `last_speaker` field that nothing sets. With it
+come the warm-on-the-human-line and the deterministic pre-score that collapses
+the tier-2 back-off for an obvious question.
 
 ### Unprompted speech, second design (BUILT 2026-09-02, S6)
 

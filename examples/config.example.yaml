@@ -87,6 +87,21 @@ brain:
 policy:
   reply_to_mentions: true          # tier 1: answer when addressed
   reply_in_own_threads: true       # tier 1: stay in a thread I am already in
+  # TIER 1 BY NAME. People hand each other the turn by typing a name, and only
+  # a client's completion list turns that into an `m.mentions` the agent can
+  # see. With this on, the BODY is read for names as well: one of mine at the
+  # start or end of a line (or as @name, or after a comma) is answered at once,
+  # and somebody ELSE'S name means the line was theirs and this agent stays out
+  # of it - which is what stops every agent in a room piling onto one question.
+  # A bare name mid-sentence ("ask alex about it") is talk ABOUT somebody and
+  # goes to tier 2 instead, unless the line also says "you".
+  reply_to_names: true
+  # Names beyond the display name and the localpart. The escape hatch for an
+  # agent whose display name is a common word: set other_names_from_members to
+  # false and name what should be recognised here.
+  addressed_names: []              # e.g. ["qwen", "the qa agent"]
+  other_names_from_members: true   # learn the other members' names from the room
+  bare_name_addresses: false       # a name anywhere is an address, punctuation or not
   # Tier 2: may I answer a line addressed to nobody? Between this switch and an
   # actual message stand a random back-off, a re-read of the room (stand down if
   # somebody got there first) and a judge call that must say yes.

@@ -281,9 +281,25 @@ There are three ways your agent can say something, and they are deliberately
 not equal. It is worth reading this section: it is the whole difference between
 an agent people are glad is in the room and one they mute.
 
-**Addressed: it answers.** Somebody mentions it, replies to one of its messages,
-or writes in a thread it is already in. This is the job, and it is the only case
-with no back-off and no second-guessing.
+**Addressed: it answers.** Somebody mentions it, types its name, replies to one
+of its messages, or writes in a thread it is already in. This is the job, and it
+is the only case with no back-off and no second-guessing.
+
+**Typing its name is enough.** Only a client's completion list turns a name into
+a mention Matrix can see, and nobody types that way in a real conversation. So
+your agent reads the line as well: its name at the start ("Qwen, how was your
+night?"), at the end after a comma ("what do you think, qwen?"), or as `@qwen`
+anywhere is the same as picking it out of the list. It answers to its display
+name, the first word of it, its localpart, and anything you add to
+`addressed_names`.
+
+And the other half of that rule matters just as much: **somebody else's name
+means the line was theirs.** "Alex, what about you?" is answered by Alex's agent
+and by nobody else - which is what keeps a room with several agents in it from
+answering the same question three times. A name in the middle of a sentence ("I
+should ask qwen about that") is talk ABOUT your agent rather than to it, and
+goes to the tier below - unless the line also says "you" ("what do you make of
+it qwen"), which is a question however it is punctuated.
 
 **Not addressed: it thinks about it, usually briefly.** A human says something
 into the room addressed to nobody. Your agent waits a random 5-40 seconds,
@@ -338,6 +354,10 @@ In `policy:` in your config:
 
 | Knob | Default | What it changes |
 |---|---|---|
+| `reply_to_names` | `true` | answer when its name is typed, and stay out when somebody else's is |
+| `addressed_names` | `[]` | extra names it answers to, beyond its display name and localpart |
+| `other_names_from_members` | `true` | learn the other people's names from the room's member list |
+| `bare_name_addresses` | `false` | treat a name anywhere in a line as an address |
 | `answer_unaddressed` | `true` | join in on questions addressed to nobody |
 | `backoff_s` | `[5, 40]` | how long it waits before doing so |
 | `presence_window_min` | `30` | how long after somebody posts it still counts as "they are here" |
@@ -351,7 +371,10 @@ In `policy:` in your config:
 
 Tighten anything you like. `answer_unaddressed: false` and `bot_to_bot: none`
 give you an agent that only ever answers you and the people who address it,
-which is a perfectly good way to start. `presence_window_min: 0` makes it
+which is a perfectly good way to start. If your agent's display name is an
+ordinary word and it starts answering to it, `other_names_from_members: false`
+plus an explicit `addressed_names` list is the way out; `reply_to_names: false`
+turns the whole thing off and leaves it waiting for a proper mention. `presence_window_min: 0` makes it
 speak unprompted only while the homeserver says you are actually online.
 
 Everything else - `history_limit`, the brain block, the model, the tool list -

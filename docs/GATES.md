@@ -1779,6 +1779,14 @@ U11 and U12 are the first entries in `teeth.py` that run the crate's OWN unit
 tests (`cargo test --lib`) rather than an integration binary; the runner grew a
 `cargo_lib` flag for it.
 
+## The gates that were re-run because the policy moved, 2026-09-04
+
+Two guards were inserted into `should_reply`, so the tier-2 gates that run
+through it were re-run on the same binary:
+`AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room pytest -q
+tests/live/test_tier2.py` - **4 passed in 225.1 s**: G5 51.6 s, G6 81.8 s, G7
+25.3 s, G8 62.3 s. Nothing in them changed except the two lines noted below.
+
 ## What the harness gained, and why
 
 - `make_connector` takes `transcript_keep` and `transcript_archives`, left out
@@ -1789,3 +1797,102 @@ tests (`cargo test --lib`) rather than an integration binary; the runner grew a
   messages; without this the gate fails before the product has done anything.
   Only that one refusal is retried - a gate that retried its way past a real
   error would be proving nothing.
+
+# Addressing by name (2026-09-04)
+
+The room's first real use found the gap: "Qwen, why are you so quiet?" got
+nothing, "@Qwen hello" got an answer. Three things counted as an address - an
+`m.mentions` entry (which a client writes only when the sender picks the pill
+out of the completion list), a rich reply, and a thread the agent had already
+spoken in - so a typed name was plain text and fell to tier 2: a random
+back-off, a judge call on a model that can take minutes to load, and usually
+silence.
+
+`src/addressing.rs` reads the body for names; `policy::read_names` turns that
+into two guards. 3c: one of MY names, in a position that means it, so answer
+now. 3d: somebody ELSE's, so the line is theirs - silent, with
+`unaddressed: false`, which costs nothing at all.
+
+3d needs gates of its own because it is the only guard that answers "silent"
+without refusing anything, and because it is the half that keeps a room with
+several agents in it from answering the same question three times. A gate for
+3c alone would stay green with 3d gone.
+
+## Unit gates, 2026-09-04
+
+`make gate`: 326 tests (228 in the crate, 87 R4 commands, 8 state-compat, 2
+encrypted-room and the publish scrub), clippy pedantic clean with warnings as
+errors, no `unwrap()` outside tests. `make lint-live`: clean, 13 files.
+
+Nineteen new gates: eleven in `addressing::tests`, seven in `policy::tests` and
+one in `config::tests`.
+
+| Guard | Gate |
+|---|---|
+| what counts as a vocative, and what does not | `the_forms_that_address_me_and_the_ones_that_do_not` - 28 bodies: leading with and without punctuation, one and two fillers, `@name`, trailing after a comma or a spaced dash, parenthetical - against `qwen is depressed`, `qwen and alex should decide`, `I like qwen.`, `that is qwen's problem`, `bot-abacus`, `qwenite` and `the qwen team shipped it` |
+| a bare name is not an address, unless the line says "you" or the knob is on | `a_bare_name_needs_second_person_or_the_knob` |
+| the second person as people type it, and not as a syllable | `second_person_is_the_forms_people_type_and_not_a_syllable` - `you`, `YOUR`, `you're`, `yours`, `u`, against `queue` and `universal` |
+| a name of mine is never registered as somebody else's | `a_name_of_mine_is_never_somebody_elses` - both agents answer to "alex": the line is mine to answer and 3d cannot claim it |
+| 3d names the person AND their user id, and the second-person rule is mine alone | `a_vocative_of_somebody_else_names_them_and_their_user_id` - "you should ask alex about it" must never silence me |
+| cleaning, case-insensitive deduplication, the three-character floor, longest first | `names_are_cleaned_deduplicated_and_ordered_longest_first` |
+| a display name yields itself and its first word; a member yields their localpart too | `a_display_name_yields_itself_and_its_first_word` |
+| the hyphen is a word character | `a_hyphen_is_part_of_a_word_and_not_a_boundary` - a member called "gate" is NOT addressed by a line naming `gate-bot-a`, which is what the live gates' own account names would otherwise trip over |
+| a name on a later line is still a vocative | `a_name_on_a_later_line_is_still_a_vocative` |
+| no names, no body reading | `an_empty_name_set_addresses_nobody` |
+| 3c is tier 1: no back-off, no judge, no model call | `a_vocative_of_my_name_is_a_turn_allocation` - and the SAME event in a room with no names is `consider`, which is exactly what shipped before |
+| 3d is silent, free, and not `unaddressed` | `a_vocative_of_somebody_else_is_silent_with_no_judge` |
+| 3d beats thread stickiness and loses to a mention and a reply | `guard_order_other_vocative_before_thread_stickiness` |
+| one line, two agents, one answer | `two_bots_one_name_only_the_named_one_replies` - the same event through both agents' names, one `reply` and one `silent` |
+| a bare name goes to tier 2; "you" makes it tier 1; the knob overrides | `bare_name_needs_you_or_goes_to_tier_two` |
+| one switch turns both arms off | `reply_to_names_off_leaves_the_body_unread` |
+| being named is an invitation, not an exemption from the budgets | `a_named_line_still_answers_to_the_budgets` |
+| a name too short to be one is refused, not silently dropped | `a_name_too_short_to_address_anybody_is_refused` |
+
+The ten policy gates that were already there run unchanged through a `decide()`
+helper carrying `Cues::default()` - a room where nobody has a name, which is the
+old behaviour exactly, and is why none of them moved.
+
+## Live gates N1, N2 and N4, 2026-09-04
+
+`tests/live/test_addressing.py`, in the `live` target. Fresh private rooms, the
+S3 pair, real `agent-room run` processes, the echo brain. The names come from
+the environment like every other account detail - nothing in the tree knows
+which accounts the gates borrow.
+
+Every one of these lines would be ANSWERED by a connector whose name guards
+were gone: N1's carries no `[[speak]]`, so an agent that fell through to tier 2
+would be told no and would say nothing, and N2's and N4's DO carry it, so tier 2
+would answer them. That is what makes silence a decision here rather than a
+model's mood.
+
+| Gate | Journey | Guard it protects |
+|---|---|---|
+| N1 | one connector; the human types its name and a comma, with no pill, no reply and no thread. Answered inside 30 s as an `m.notice` in the trigger's thread, mentioning the human, with `named in the body` and `verdict=reply` in the log and no `speak=` line anywhere | `policy::read_names` 3c |
+| N2 | one connector; the human names the OTHER agent, which is not even running, and carries `[[speak]]`. 20 s of silence, `addressed to ... not me` in the log, no judge call - then its own name, answered, so the silence was a decision and not a dead process | `policy::read_names` 3d, on a name known from `bot_user_ids` |
+| N4 | both connectors; the human names one of them, `[[speak]]` again. Exactly one answer, from the named one; the other logs `not me` and never asks its judge | 3d with two agents in the room |
+
+N3, the follow-up gate ("I spoke last here 41 s ago"), belongs to the follow-up
+arm and is not built yet.
+
+Measured 2026-09-04 (`AGENT_ROOM_LIVE=1 AGENT_ROOM_BIN=target/release/agent-room
+pytest -q tests/live/test_addressing.py`): **3 passed in 67.3 s** - N1 6.4 s, N2
+27.3 s, N4 28.2 s. N1 is the shape of the whole change: six seconds, no model
+call at all, for a line that used to draw a 5-40 s back-off and then a judge.
+
+## What the harness gained, and why
+
+- `post_unaddressed()` in `tests/conftest.py`: a gate that means "nobody was
+  addressed" now PROVES it before posting. It asks the room for its members,
+  builds the same name set the product builds - localpart, display name, its
+  first word, nothing under three characters - and refuses to post a body
+  containing one. The account names come from the environment and the display
+  names from the homeserver, so neither the gate nor the harness can know them
+  in advance: without this, renaming an account on the homeserver would turn a
+  tier-2 gate into a tier-1 gate silently. G5, G7 and G8 post through it.
+- G6's seeding line was `"<bot C> please say hello to <bot D>"` with a mention
+  of bot C. Bot D's user id in that body IS an address now (the `@name` form),
+  so the line would have started both agents instead of one; it is now "please
+  say hello to the room" and the mention still does the work it always did. The
+  rest of G6 is unchanged, and its later `"<bot C> still with us?"` in the
+  thread is now answered by bot C alone - which is 3d beating thread
+  stickiness, exactly as designed.
