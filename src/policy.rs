@@ -15,9 +15,16 @@
 //! This module is pure and synchronous, so the whole decision table is a unit
 //! test and the reason strings - which the docs and the live gates quote - are
 //! asserted here rather than guessed at.
+//!
+//! Two of the guards read the message BODY, and only for names ([`crate::addressing`]):
+//! a vocative of one of my names is an invitation, and a vocative of somebody
+//! else's is an instruction to stay out of it. Everything they need arrives in
+//! [`Cues`], so the decision stays a pure function of the event, the ledger and
+//! what the room is called.
 
 use std::collections::HashSet;
 
+use crate::addressing::Names;
 use crate::config::{BotToBot, PolicyConfig};
 use crate::events::RoomEvent;
 use crate::ledger::Ledger;
@@ -72,6 +79,89 @@ impl Decision {
     }
 }
 
+/// Who spoke last in one conversation, and when.
+///
+/// Nothing sets this yet: it is what the follow-up guard (arm 3f, "I was the
+/// last speaker here and the human came back within the window") will be built
+/// on, and it lives here so that adding the guard changes one function rather
+/// than every call site.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LastSpeaker {
+    pub sender: String,
+    /// The homeserver's timestamp, in epoch seconds.
+    pub ts: f64,
+    /// Thread root, or the room's timeline for an unthreaded line.
+    pub conversation: String,
+}
+
+/// The room around one event: everything a guard needs that is not in the
+/// event, the ledger or the config.
+///
+/// Borrowed rather than owned because it is built per message, and the names
+/// are compiled regexes that must not be rebuilt for every line of chat.
+#[derive(Debug, Clone)]
+pub struct Cues<'a> {
+    /// What the people in this room are called.
+    pub names: &'a Names,
+    /// Who spoke last here (arm 3f; always `None` today).
+    pub last_speaker: Option<LastSpeaker>,
+}
+
+/// The names of a room nobody has told us anything about. `Cues::default()` is
+/// a policy decision as much as a convenience: with no names, the body is not
+/// read and the agent waits to be mentioned.
+static NO_NAMES: Names = Names::empty();
+
+impl Default for Cues<'_> {
+    fn default() -> Self {
+        Self {
+            names: &NO_NAMES,
+            last_speaker: None,
+        }
+    }
+}
+
+/// What the BODY says about who is being spoken to: guards 3c and 3d.
+enum Named {
+    /// One of MY names, in a position that means it: the reason to answer.
+    Me(String),
+    /// Somebody else's, which decides the whole thing - the line is theirs.
+    SomebodyElse(Decision),
+    Nobody,
+}
+
+/// Read the body for names (3c, 3d). The only guards that read what was said.
+///
+/// 3c is turn allocation: somebody typed my name, which is how people hand each
+/// other the turn, and it must cost no back-off and no model call. 3d is the
+/// other half of the same rule and the reason a room full of agents does not
+/// pile onto one line: a name selects ONE speaker, so a vocative of somebody
+/// else's name is silence - and a silence that costs nothing, because it is not
+/// `unaddressed` and so wakes neither tier 2 nor an inner-thought probe.
+fn read_names(ev: &RoomEvent, cfg: &PolicyConfig, cues: &Cues<'_>) -> Named {
+    if !cfg.reply_to_names {
+        return Named::Nobody;
+    }
+    if let Some(address) = cues.names.addresses_me(&ev.body, cfg.bare_name_addresses) {
+        return Named::Me(format!(
+            "named in the body ({}, {})",
+            address.matched,
+            address.form.as_str()
+        ));
+    }
+    if let Some((user_id, address)) = cues
+        .names
+        .addresses_other(&ev.body, cfg.bare_name_addresses)
+    {
+        return Named::SomebodyElse(Decision::new(
+            Verdict::Silent,
+            format!("addressed to {} ({user_id}), not me", address.matched),
+            false,
+        ));
+    }
+    Named::Nobody
+}
+
 /// Decide whether to answer `ev`, and say why.
 #[must_use]
 pub fn should_reply<S: std::hash::BuildHasher>(
@@ -80,6 +170,7 @@ pub fn should_reply<S: std::hash::BuildHasher>(
     ledger: &Ledger,
     thread_memberships: &HashSet<String, S>,
     cfg: &PolicyConfig,
+    cues: &Cues<'_>,
 ) -> Decision {
     // (1) Self-echo. Outside every config branch, before anything else: no
     // setting may ever make an agent answer itself.
@@ -112,8 +203,10 @@ pub fn should_reply<S: std::hash::BuildHasher>(
         }
     }
 
-    // (3) Am I addressed? Mention, a real reply to one of my events, or a
-    // thread I have already spoken in.
+    // (3) Am I addressed? A mention, a real reply to one of my events, my name
+    // in the body, or a thread I have already spoken in - in that order, so a
+    // log line names the strongest reason and not the first one that happened
+    // to be checked.
     let addressed: Option<String> = if cfg.reply_to_mentions && ev.mentions.contains(me) {
         Some("mentioned".to_owned())
     } else if cfg.reply_to_mentions
@@ -124,18 +217,28 @@ pub fn should_reply<S: std::hash::BuildHasher>(
             "reply to my event {}",
             ev.reply_to.as_deref().unwrap_or_default()
         ))
-    } else if cfg.reply_in_own_threads
-        && ev
-            .thread_root
-            .as_ref()
-            .is_some_and(|root| thread_memberships.contains(root))
-    {
-        Some(format!(
-            "thread {} I have posted in",
-            ev.thread_root.as_deref().unwrap_or_default()
-        ))
     } else {
-        None
+        match read_names(ev, cfg, cues) {
+            Named::Me(reason) => Some(reason),
+            // The line went to somebody else and the whole decision is made:
+            // this beats thread stickiness, checked just below.
+            Named::SomebodyElse(decision) => return decision,
+            Named::Nobody => {
+                if cfg.reply_in_own_threads
+                    && ev
+                        .thread_root
+                        .as_ref()
+                        .is_some_and(|root| thread_memberships.contains(root))
+                {
+                    Some(format!(
+                        "thread {} I have posted in",
+                        ev.thread_root.as_deref().unwrap_or_default()
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
     };
     let Some(addressed) = addressed else {
         return unaddressed(ev, ledger, cfg);
@@ -345,7 +448,31 @@ mod tests {
     }
 
     fn decide(ev: &RoomEvent, led: &Ledger, cfg: &PolicyConfig) -> Decision {
-        should_reply(ev, ME, led, &led.thread_roots(), cfg)
+        should_reply(ev, ME, led, &led.thread_roots(), cfg, &Cues::default())
+    }
+
+    /// The same decision, in a room where everybody has a name.
+    fn decide_named(ev: &RoomEvent, led: &Ledger, cfg: &PolicyConfig) -> Decision {
+        let names = room_names();
+        let cues = Cues {
+            names: &names,
+            ..Cues::default()
+        };
+        should_reply(ev, ME, led, &led.thread_roots(), cfg, &cues)
+    }
+
+    /// Me, the other bot and the human, by the names a room would know them by.
+    fn room_names() -> Names {
+        Names::new(
+            &["bot-a".to_owned(), "qwen".to_owned()],
+            vec![
+                (
+                    OTHER_BOT.to_owned(),
+                    vec!["bot-b".to_owned(), "alex".to_owned()],
+                ),
+                (HUMAN.to_owned(), vec!["human".to_owned()]),
+            ],
+        )
     }
 
     fn policy() -> PolicyConfig {
@@ -839,6 +966,225 @@ mod tests {
         assert_eq!(
             decide(&event(mention(ME)), &led, &cfg).verdict,
             Verdict::Consider
+        );
+    }
+
+    // -- 3c and 3d: the body, read for names -----------------------------
+
+    #[test]
+    fn a_vocative_of_my_name_is_a_turn_allocation() {
+        // The line that started all this: a typed name, no pill, no thread.
+        // It must be tier 1 - no back-off, no judge, no model call.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let ev = event(EventSpec {
+            body: "qwen, why are you so quiet?".to_owned(),
+            ..EventSpec::default()
+        });
+        let decision = decide_named(&ev, &led, &policy());
+        assert_eq!(decision.verdict, Verdict::Reply);
+        assert!(!decision.needs_judge());
+        assert!(!decision.unaddressed);
+        assert_eq!(decision.reason, "named in the body (qwen, leading)");
+
+        // ... and with the same event in a room that has never heard of me, it
+        // is tier 2 - which is exactly what the shipped build did before.
+        assert_eq!(decide(&ev, &led, &policy()).verdict, Verdict::Consider);
+    }
+
+    #[test]
+    fn a_vocative_of_somebody_else_is_silent_with_no_judge() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let ev = event(EventSpec {
+            body: "alex, what do you think?".to_owned(),
+            ..EventSpec::default()
+        });
+        let decision = decide_named(&ev, &led, &policy());
+        assert_eq!(decision.verdict, Verdict::Silent);
+        assert_eq!(
+            decision.reason,
+            format!("addressed to alex ({OTHER_BOT}), not me")
+        );
+        assert!(!decision.needs_judge(), "a line for somebody else is free");
+        assert!(
+            !decision.unaddressed,
+            "the line DID address somebody, so tier 2 and the inner probe have              nothing to want here"
+        );
+    }
+
+    #[test]
+    fn guard_order_other_vocative_before_thread_stickiness() {
+        // I am in this thread, so without 3d I would answer. A name in the
+        // line selects one speaker and that beats being in the room.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", "$root", HUMAN, None, 1);
+        let threaded = |body: &str| {
+            event(EventSpec {
+                body: body.to_owned(),
+                relates_to: Some(thread_relation("$root", "$latest")),
+                ..EventSpec::default()
+            })
+        };
+        assert_eq!(
+            decide_named(&threaded("still with us?"), &led, &policy()).verdict,
+            Verdict::Reply,
+            "the thread is mine to answer while nobody else is named"
+        );
+        let elsewhere = decide_named(&threaded("alex, what do you think?"), &led, &policy());
+        assert_eq!(elsewhere.verdict, Verdict::Silent);
+        assert!(elsewhere.reason.contains("not me"), "{}", elsewhere.reason);
+
+        // ... but it never beats a mention of me, or a reply to my event.
+        let mentioned = event(EventSpec {
+            body: "alex, what do you think?".to_owned(),
+            mentions: Some(vec![ME.to_owned()]),
+            ..EventSpec::default()
+        });
+        assert_eq!(
+            decide_named(&mentioned, &led, &policy()).verdict,
+            Verdict::Reply
+        );
+        let replied = event(EventSpec {
+            body: "alex, what do you think?".to_owned(),
+            relates_to: Some(reply_relation("$mine")),
+            ..EventSpec::default()
+        });
+        let answered = decide_named(&replied, &led, &policy());
+        assert_eq!(answered.verdict, Verdict::Reply);
+        assert!(answered.reason.contains("reply to my event"));
+    }
+
+    #[test]
+    fn two_bots_one_name_only_the_named_one_replies() {
+        // The whole point of 3d, as the room sees it: one line, two agents,
+        // exactly one answer - and no model call on either side.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let ev = event(EventSpec {
+            body: "bot-a, how was your night?".to_owned(),
+            ..EventSpec::default()
+        });
+        let names = room_names();
+        let cues = Cues {
+            names: &names,
+            ..Cues::default()
+        };
+        let answered = should_reply(&ev, ME, &led, &led.thread_roots(), &policy(), &cues);
+        assert_eq!(answered.verdict, Verdict::Reply);
+
+        // The other agent, in the same room, with the names the other way round.
+        let theirs = Names::new(
+            &["bot-b".to_owned(), "alex".to_owned()],
+            vec![
+                (ME.to_owned(), vec!["bot-a".to_owned(), "qwen".to_owned()]),
+                (HUMAN.to_owned(), vec!["human".to_owned()]),
+            ],
+        );
+        let cues = Cues {
+            names: &theirs,
+            ..Cues::default()
+        };
+        let other = should_reply(&ev, OTHER_BOT, &led, &led.thread_roots(), &policy(), &cues);
+        assert_eq!(other.verdict, Verdict::Silent);
+        assert!(other.reason.contains(&format!("addressed to bot-a ({ME})")));
+        assert!(!other.needs_judge());
+    }
+
+    #[test]
+    fn bare_name_needs_you_or_goes_to_tier_two() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let bare = event(EventSpec {
+            body: "somebody should ask qwen about it".to_owned(),
+            ..EventSpec::default()
+        });
+        let considered = decide_named(&bare, &led, &policy());
+        assert_eq!(
+            considered.verdict,
+            Verdict::Consider,
+            "a bare name mid-sentence is talk ABOUT me: tier 2 decides, {}",
+            considered.reason
+        );
+        assert!(considered.unaddressed);
+
+        let asked = event(EventSpec {
+            body: "what do you make of it qwen".to_owned(),
+            ..EventSpec::default()
+        });
+        let answered = decide_named(&asked, &led, &policy());
+        assert_eq!(answered.verdict, Verdict::Reply);
+        assert_eq!(
+            answered.reason,
+            "named in the body (qwen, bare with second person)"
+        );
+
+        // With the knob on, the bare name is enough on its own.
+        let mut cfg = policy();
+        cfg.bare_name_addresses = true;
+        let knob = decide_named(&bare, &led, &cfg);
+        assert_eq!(knob.verdict, Verdict::Reply);
+        assert_eq!(knob.reason, "named in the body (qwen, bare)");
+    }
+
+    #[test]
+    fn reply_to_names_off_leaves_the_body_unread() {
+        // One switch, both arms: an operator who turns it off gets the
+        // mention-only agent they had before, in both directions.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let led = ledger(dir.path(), &clock);
+        let mut cfg = policy();
+        cfg.reply_to_names = false;
+        cfg.answer_unaddressed = false;
+        for body in ["qwen, why so quiet?", "alex, what do you think?"] {
+            let decision = decide_named(
+                &event(EventSpec {
+                    body: body.to_owned(),
+                    ..EventSpec::default()
+                }),
+                &led,
+                &cfg,
+            );
+            assert_eq!(decision.verdict, Verdict::Silent, "{body:?}");
+            assert!(
+                decision.reason.contains("unaddressed"),
+                "{body:?}: {}",
+                decision.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_line_still_answers_to_the_budgets() {
+        // 3c is an invitation, not an exemption: the hourly cap is the cost
+        // guard and it applies to everyone who asks.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        for index in 0..led.budgets.per_hour_max {
+            led.record_post(&format!("$mine{index}"), &format!("$t{index}"), "", None, 1);
+            clock.advance(1.0);
+        }
+        let decision = decide_named(
+            &event(EventSpec {
+                body: "qwen, are you there?".to_owned(),
+                ..EventSpec::default()
+            }),
+            &led,
+            &policy(),
+        );
+        assert_eq!(decision.verdict, Verdict::Silent);
+        assert!(
+            decision.reason.contains("hour budget"),
+            "{}",
+            decision.reason
         );
     }
 

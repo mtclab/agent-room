@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addressing;
 pub mod brain;
 pub mod cli;
 pub mod config;

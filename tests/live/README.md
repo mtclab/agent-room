@@ -50,7 +50,7 @@ sends bursts, and a homeserver rate-limits per user.
 | Role (the variable naming it) | Used by |
 |---|---|
 | `AGENT_ROOM_LIVE_HUMAN` | plays the HUMAN in every journey |
-| `AGENT_ROOM_LIVE_S3_BOT_A`, `..._S3_BOT_B` | the two agents under test (G1-G12, C1-C3, D1) |
+| `AGENT_ROOM_LIVE_S3_BOT_A`, `..._S3_BOT_B` | the two agents under test (G1-G12, N1/N2/N4, C1-C3, D1) |
 | `AGENT_ROOM_LIVE_S3_BOT_A` | also the live MCP session (M1-M5) |
 | `AGENT_ROOM_LIVE_BOT_B` | the daemon connector beside that session (M4) |
 | `AGENT_ROOM_LIVE_E1_BOT` | the encrypted-room gate E1, whose store is kept between runs |

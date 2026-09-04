@@ -5,7 +5,7 @@ script applies one surgical mutation at a time to the shipped source, rebuilds
 the release binary, runs only the gate that guard protects, records the
 outcome, and restores the file with `git checkout` (verified clean afterwards).
 
-Two kinds of gate. G1-G12, C1, C2, M2/M3/M5, D1 and T1 are LIVE journeys: they
+Two kinds of gate. G1-G12, N1/N2/N4, C1, C2, M2/M3/M5, D1 and T1 are LIVE journeys: they
 need `AGENT_ROOM_LIVE=1`, a homeserver in `~/.config/agent-room/live.env` and
 the bot tokens, and C1/C2 additionally spend the owner's Claude quota.
 U8-U12 are OFFLINE and are cargo's own tests, so they need nothing but the
@@ -70,6 +70,14 @@ class Mutation:
 
 #: The `Relation` literal `room_post` builds. Kept out of the table because a
 #: multi-line Rust literal inside a dataclass argument is unreadable.
+#: Guard 3d, as `policy::read_names` writes it: the vocative of another member's
+#: name that makes the line theirs. Out of the table because two mutations use
+#: it and a multi-line Rust literal inside a dataclass argument is unreadable.
+OTHER_NAME_GUARD = """    if let Some((user_id, address)) = cues
+        .names
+        .addresses_other(&ev.body, cfg.bare_name_addresses)
+    {"""
+
 THREAD_RELATION = """            &Relation {
                 thread_root,
                 reply_to,
@@ -204,6 +212,39 @@ MUTATIONS = [
         "                let period_s = minutes as f64 * 60.0;",
         test="tests/live/test_tier2.py::"
         "test_g8_a_heartbeat_speaks_into_a_quiet_room_and_addresses_nobody",
+    ),
+    # -- Addressing by name (live) ------------------------------------------
+    Mutation(
+        gate="N1",
+        guard="policy: my own name in the body is an address (arm 3c)",
+        path=RUST_SRC / "policy.rs",
+        old="    if let Some(address) = cues.names.addresses_me(&ev.body, "
+        "cfg.bare_name_addresses) {",
+        new="    if let Some(address) = cues.names.addresses_me(&ev.body, "
+        "cfg.bare_name_addresses).filter(|_| false) {  // TEETH: my own name never counts",
+        test="tests/live/test_addressing.py::"
+        "test_n1_a_typed_name_is_answered_at_once_and_costs_no_judge",
+    ),
+    Mutation(
+        gate="N2",
+        guard="policy: somebody else's name in the body is their turn (arm 3d)",
+        path=RUST_SRC / "policy.rs",
+        old=OTHER_NAME_GUARD,
+        new=OTHER_NAME_GUARD.replace(
+            "    {", "        .filter(|_| false)\n    {  // TEETH: not somebody else's turn"
+        ),
+        test="tests/live/test_addressing.py::"
+        "test_n2_a_name_that_is_not_mine_is_somebody_elses_turn",
+    ),
+    Mutation(
+        gate="N4",
+        guard="policy: arm 3d again, with both agents in the room",
+        path=RUST_SRC / "policy.rs",
+        old=OTHER_NAME_GUARD,
+        new=OTHER_NAME_GUARD.replace(
+            "    {", "        .filter(|_| false)\n    {  // TEETH: not somebody else's turn"
+        ),
+        test="tests/live/test_addressing.py::test_n4_two_agents_one_name_and_exactly_one_answer",
     ),
     # -- R3: unprompted speech (live) ---------------------------------------
     Mutation(

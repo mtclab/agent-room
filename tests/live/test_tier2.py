@@ -34,6 +34,7 @@ from conftest import (
     make_connector,
     messages,
     post,
+    post_unaddressed,
     relates_to,
     wait_for,
     wait_for_join,
@@ -104,7 +105,9 @@ async def test_g5_exactly_one_of_two_bots_answers_an_unaddressed_question(
 
     for round_number in (1, 2, 3):
         before = len(all_replies(await messages(human, room_s3)))
-        trigger = await post(human, room_s3, f"[[speak]] anyone around? (round {round_number})")
+        trigger = await post_unaddressed(
+            human, room_s3, f"[[speak]] anyone around? (round {round_number})"
+        )
         await wait_for(
             lambda evs, t=trigger: bool(answers_to(evs, t)),
             human,
@@ -178,7 +181,7 @@ async def test_g6_a_bot_only_thread_winds_down_and_a_human_revives_it(
 
     # One human message to start it, and then nothing from any human.
     root = await post(
-        human, room_s3, f"{S3_BOT_A} please say hello to {S3_BOT_B}", mentions=[S3_BOT_A]
+        human, room_s3, f"{S3_BOT_A} please say hello to the room", mentions=[S3_BOT_A]
     )
     ceiling = budgets["bot_only_turns_before_decay"] + 2
 
@@ -240,13 +243,13 @@ async def test_g7_an_unaddressed_line_the_judge_declines_is_left_alone(
     bot.wait_ready()
     await wait_for_join(human, room_s3, [S3_BOT_A])
 
-    await post(human, room_s3, "just thinking aloud about the weather")
+    await post_unaddressed(human, room_s3, "just thinking aloud about the weather")
     await asyncio.sleep(20)
     events = await messages(human, room_s3)
     assert by_sender(events, S3_BOT_A) == [], "the agent answered a line its judge declined"
     assert "speak=False" in bot.log_text(), "the judge was never asked"
 
-    await post(human, room_s3, "[[speak]] and now something worth answering")
+    await post_unaddressed(human, room_s3, "[[speak]] and now something worth answering")
     events = await wait_for(lambda evs: bool(by_sender(evs, S3_BOT_A)), human, room_s3, seconds=30)
     assert len(by_sender(events, S3_BOT_A)) == 1, "tier 2 never spoke at all - was it alive?"
 
@@ -266,7 +269,7 @@ async def test_g8_a_heartbeat_speaks_into_a_quiet_room_and_addresses_nobody(
     in the transcript for the heartbeat to have something to be about, and the
     room is quiet from the moment the connector opens its eyes.
     """
-    await post(human, room_s3, "[[speak]] leaving this here before anyone joins")
+    await post_unaddressed(human, room_s3, "[[speak]] leaving this here before anyone joins")
 
     bot = make_connector(
         tmp_path,

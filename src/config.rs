@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::addressing::MIN_NAME_CHARS;
 use crate::events::localpart;
 
 /// Set to "1" to allow an access-token file whose mode is looser than 0600.
@@ -534,6 +535,25 @@ pub struct PolicyConfig {
     pub reply_to_mentions: bool,
     #[serde(default = "yes")]
     pub reply_in_own_threads: bool,
+    /// Tier 1: read the BODY for names - answer when one of mine is in it, and
+    /// stay out when somebody else's is. Off leaves `m.mentions`, replies and
+    /// threads as the only ways to address this agent.
+    #[serde(default = "yes")]
+    pub reply_to_names: bool,
+    /// Extra names I answer to, on top of my display name and my localpart.
+    /// The escape hatch for an agent whose display name is a common word.
+    #[serde(default)]
+    pub addressed_names: Vec<String>,
+    /// Learn the OTHER members' names from the room's member list. Off leaves
+    /// `bot_user_ids` (their localparts) as the only names I recognise as
+    /// somebody else's.
+    #[serde(default = "yes")]
+    pub other_names_from_members: bool,
+    /// A name anywhere in a line addresses its owner, punctuation or not. Off
+    /// (the default): a bare name mid-sentence is talk ABOUT somebody, and only
+    /// a line that also says "you" is talk TO them.
+    #[serde(default)]
+    pub bare_name_addresses: bool,
     /// Tier 2: may I answer a human message that addressed nobody?
     #[serde(default = "yes")]
     pub answer_unaddressed: bool,
@@ -596,6 +616,10 @@ impl Default for PolicyConfig {
         Self {
             reply_to_mentions: true,
             reply_in_own_threads: true,
+            reply_to_names: true,
+            addressed_names: Vec::new(),
+            other_names_from_members: true,
+            bare_name_addresses: false,
             answer_unaddressed: true,
             backoff_s: default_backoff(),
             heartbeat_minutes: 0,
@@ -650,6 +674,14 @@ impl PolicyConfig {
             return Err(ConfigError::msg(
                 "policy.impulse_ttl_s must be positive (it is a lifetime)",
             ));
+        }
+        for name in &self.addressed_names {
+            if name.trim().chars().count() < MIN_NAME_CHARS {
+                return Err(ConfigError::msg(format!(
+                    "policy.addressed_names {name:?} must be at least {MIN_NAME_CHARS} \
+                     characters: a shorter name would match syllables in the middle of words"
+                )));
+            }
         }
         for pattern in &self.bot_localpart_patterns {
             Regex::new(pattern).map_err(|exc| {
@@ -1163,6 +1195,32 @@ mod tests {
         let err = load_config(&minimal(dir.path(), "policy:\n  backoff_s: [40, 5]\n"))
             .expect_err("refused");
         assert!(format!("{err}").contains("backoff_s"), "{err}");
+    }
+
+    #[test]
+    fn a_name_too_short_to_address_anybody_is_refused() {
+        // Silently dropping it would leave an operator wondering why the agent
+        // does not answer to the name they configured.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let err = load_config(&minimal(
+            dir.path(),
+            "policy:\n  addressed_names: [\"qwen\", \"q\"]\n",
+        ))
+        .expect_err("refused");
+        let text = format!("{err}");
+        assert!(text.contains("addressed_names"), "{text}");
+        assert!(text.contains("at least 3 characters"), "{text}");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg = load_config(&minimal(
+            dir.path(),
+            "policy:\n  addressed_names: [\"qwen\"]\n  bare_name_addresses: true\n",
+        ))
+        .expect("a name long enough is kept as written");
+        assert_eq!(cfg.policy.addressed_names, ["qwen"]);
+        assert!(cfg.policy.bare_name_addresses);
+        assert!(cfg.policy.reply_to_names, "the default is on");
+        assert!(cfg.policy.other_names_from_members);
     }
 
     #[test]

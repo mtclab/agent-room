@@ -430,6 +430,46 @@ async def post(
     raise AssertionError(f"the human could not post: {response}")
 
 
+def localpart(user_id: str) -> str:
+    """`@bot-a:example.com` -> `bot-a`, the way the connector reads a name."""
+    return user_id.split(":", 1)[0].lstrip("@")
+
+
+async def addressable_names(human: AsyncClient, room_id: str) -> set[str]:
+    """Every name a connector in this room would take for an address.
+
+    The same set the product builds (`src/addressing.rs`): each member's
+    localpart, their display name and its first word, and nothing shorter than
+    three characters. Lowercased, because the match is case-insensitive.
+    """
+    response = await human.joined_members(room_id)
+    names: set[str] = set()
+    for member in getattr(response, "members", []):
+        names.add(localpart(member.user_id))
+        display = (getattr(member, "display_name", "") or "").strip()
+        if display:
+            names.add(display)
+            names.add(display.split()[0])
+    return {name.lower() for name in names if len(name) >= 3}
+
+
+async def post_unaddressed(human: AsyncClient, room_id: str, body: str, **kwargs: Any) -> str:
+    """Post a line that must address NOBODY, having proved that it does not.
+
+    A tier-2 gate says "nobody was addressed" in its body and nowhere else, and
+    since the connector reads names out of that body, a body that happens to
+    contain somebody's name is a tier-1 gate wearing tier 2's name. The account
+    names come from the environment and the display names from the homeserver,
+    so neither this file nor the gate can know them: this asks the room.
+    """
+    named = sorted(name for name in await addressable_names(human, room_id) if name in body.lower())
+    assert not named, (
+        f"{body!r} names {named}, so it is addressed to somebody and cannot gate "
+        "the unaddressed path. Rename the accounts or the body."
+    )
+    return await post(human, room_id, body, **kwargs)
+
+
 async def messages(human: AsyncClient, room_id: str) -> list[dict[str, Any]]:
     """Every `m.room.message` in the room, newest first, via /messages.
 

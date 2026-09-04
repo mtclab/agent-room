@@ -35,20 +35,23 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
-use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt};
-use matrix_sdk::{Client, Room};
+use matrix_sdk::ruma::serde::Raw;
+use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
+use matrix_sdk::sync::{JoinedRoomUpdate, State};
+use matrix_sdk::{Client, Room, RoomMemberships};
 use regex::Regex;
 use serde_json::Value;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::addressing::{Names, names_for};
 use crate::brain::Brain;
 use crate::config::{BotToBot, Config};
-use crate::events::{BotRules, RoomEvent, from_source, is_bot_user};
+use crate::events::{BotRules, RoomEvent, from_source, is_bot_user, localpart};
 use crate::ledger::{Clock, Ledger};
 use crate::matrix;
-use crate::policy::{Decision, Verdict, should_reply};
+use crate::policy::{Cues, Decision, Verdict, should_reply};
 use crate::presence::PresenceBook;
 use crate::testing::maybe_start_spam;
 use crate::transcript::Transcript;
@@ -91,6 +94,10 @@ pub struct WorkerState {
     /// of "is anybody here", and the reason the presence window survives a
     /// restart: it is read off the room, not off a local clock.
     pub last_human_post_ts: f64,
+    /// What everybody in this room is called, compiled. Rebuilt from the
+    /// member store at startup and whenever somebody joins, leaves or renames -
+    /// never per message, because these are compiled regexes.
+    pub names: Names,
     /// Unprompted candidates waiting for somebody to be around.
     pub queue: Vec<Candidate>,
     pub queued: HashSet<String>,
@@ -114,6 +121,7 @@ impl WorkerState {
             probing: false,
             last_activity_ts: now,
             last_human_post_ts: 0.0,
+            names: Names::empty(),
             queue: Vec::new(),
             queued: HashSet::new(),
             inner_urgency: HashMap::new(),
@@ -136,6 +144,10 @@ pub struct Connector {
     brain: Arc<dyn Brain>,
     me: String,
     persona: String,
+    /// My display name on the account, read once at login. The per-room member
+    /// display name is better and is preferred; this is the fallback for a room
+    /// whose member list has not arrived yet.
+    account_display: Option<String>,
     bot_user_ids: Vec<String>,
     bot_patterns: Vec<Regex>,
     workers: HashMap<OwnedRoomId, Arc<RoomWorker>>,
@@ -197,6 +209,7 @@ impl Connector {
             client,
             brain,
             persona,
+            account_display: None,
             bot_user_ids: Vec::new(),
             bot_patterns,
             workers,
@@ -251,7 +264,23 @@ impl Connector {
         );
         matrix::bootstrap_encryption(&self.client, &self.cfg).await;
         info!("encryption ready");
+        // One request, at startup, for the name I am known by everywhere. The
+        // per-room display name is better and comes free with the sync below;
+        // this is what answers when a room has not told us one.
+        self.account_display = self
+            .client
+            .account()
+            .get_display_name()
+            .await
+            .unwrap_or_else(|exc| {
+                warn!("could not read my own display name ({exc}); using my localpart");
+                None
+            })
+            .filter(|name| !name.trim().is_empty());
         self.consume_backlog().await?;
+        for room_id in self.workers.keys() {
+            self.refresh_names(room_id).await;
+        }
         let spam = maybe_start_spam(&self.client, &self.cfg.rooms);
         self.start_room_loops(&stop).await;
         info!(
@@ -506,6 +535,11 @@ impl Connector {
             if !self.workers.contains_key(room_id) {
                 continue;
             }
+            // Before the messages, not after: a line that arrives in the same
+            // sync as the join that explains a name must be read with it.
+            if touches_membership(update) {
+                self.refresh_names(room_id).await;
+            }
             for raw in &update.ephemeral {
                 self.handle_ephemeral(room_id, raw.json().get()).await;
             }
@@ -567,6 +601,89 @@ impl Connector {
         is_bot_user(user_id, &self.bot_user_ids, &self.bot_patterns)
     }
 
+    // -- who this room can call whom ---------------------------------------
+
+    /// Rebuild one room's names from the member store.
+    ///
+    /// Cheap and rare: it reads the store the sync has already filled - no
+    /// HTTP - and only runs at startup and when a membership event says the
+    /// answer may have changed.
+    async fn refresh_names(&self, room_id: &RoomId) {
+        let Some(worker) = self.workers.get(room_id) else {
+            return;
+        };
+        let Some(room) = self.client.get_room(room_id) else {
+            return;
+        };
+        let names = self.names_for_room(&room).await;
+        info!(
+            "{room_id}: I answer to [{}]; {} other name(s) known: [{}]",
+            names.mine().join(", "),
+            names.theirs().len(),
+            crate::head(&names.theirs().join(", "), 200)
+        );
+        worker.state.lock().await.names = names;
+    }
+
+    /// Every name this room can call somebody by.
+    ///
+    /// Mine: the display name this room knows me by, the account's display name
+    /// when the room has none yet, the first word of either, my localpart, and
+    /// `policy.addressed_names`. Everybody else's: the joined members' display
+    /// names, their first words and their localparts, plus the localparts of
+    /// `policy.bot_user_ids` - which are configured rather than discovered, so
+    /// they are known before anybody has spoken or even joined.
+    async fn names_for_room(&self, room: &Room) -> Names {
+        let policy = &self.cfg.policy;
+        let mut mine: Vec<String> = Vec::new();
+        if let Ok(user) = UserId::parse(&self.me)
+            && let Some(display) = room
+                .get_member_no_sync(&user)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|member| member.display_name().map(ToOwned::to_owned))
+        {
+            mine.extend(crate::addressing::names_from_display(&display));
+        }
+        if mine.is_empty()
+            && let Some(display) = &self.account_display
+        {
+            mine.extend(crate::addressing::names_from_display(display));
+        }
+        mine.push(localpart(&self.me).to_owned());
+        mine.extend(policy.addressed_names.iter().cloned());
+
+        let mut others: Vec<(String, Vec<String>)> = Vec::new();
+        if policy.other_names_from_members {
+            match room.members_no_sync(RoomMemberships::JOIN).await {
+                Ok(members) => {
+                    for member in members {
+                        let user_id = member.user_id().as_str();
+                        if user_id == self.me {
+                            continue;
+                        }
+                        others.push((
+                            user_id.to_owned(),
+                            names_for(user_id, member.display_name()),
+                        ));
+                    }
+                }
+                Err(exc) => warn!(
+                    "{}: cannot read the member list ({exc}); other names come from the config \
+                     alone",
+                    room.room_id()
+                ),
+            }
+        }
+        for user_id in &self.bot_user_ids {
+            if user_id != &self.me && !others.iter().any(|(known, _)| known == user_id) {
+                others.push((user_id.clone(), names_for(user_id, None)));
+            }
+        }
+        Names::new(&mine, others)
+    }
+
     /// Normalise one raw timeline event, or None when it is not a message.
     ///
     /// The SDK has already decrypted it when the room is encrypted, so an
@@ -579,6 +696,29 @@ impl Connector {
     ) -> Option<RoomEvent> {
         normalise_event(room, room_id, raw, self.rules()).await
     }
+}
+
+/// Whether this room update can have changed who is called what.
+///
+/// A join, a leave and a display-name change are all `m.room.member`, and for a
+/// joined room they arrive in the timeline, in the state block, or in both.
+fn touches_membership(update: &JoinedRoomUpdate) -> bool {
+    let state = match &update.state {
+        State::Before(events) | State::After(events) => events,
+    };
+    state.iter().any(is_member_event)
+        || update
+            .timeline
+            .events
+            .iter()
+            .any(|event| is_member_event(event.raw()))
+}
+
+fn is_member_event<T>(raw: &Raw<T>) -> bool {
+    raw.get_field::<String>("type")
+        .ok()
+        .flatten()
+        .is_some_and(|kind| kind == "m.room.member")
 }
 
 /// The bot rules as the policy sees them.
@@ -691,7 +831,11 @@ impl Connector {
 
     fn decide(&self, state: &mut WorkerState, ev: &RoomEvent) -> Decision {
         let roots = state.ledger.thread_roots();
-        let decision = should_reply(ev, &self.me, &state.ledger, &roots, &self.cfg.policy);
+        let cues = Cues {
+            names: &state.names,
+            ..Cues::default()
+        };
+        let decision = should_reply(ev, &self.me, &state.ledger, &roots, &self.cfg.policy, &cues);
         info!(
             "{} {} from {}: verdict={} ({})",
             ev.room_id,

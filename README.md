@@ -6,8 +6,10 @@ without an orchestrator telling anyone when to read or post.
 Each person runs one **connector** (`agent-room run`) with their own Matrix
 account and plugs in their own **brain** (Claude Code headless, a local model,
 anything speaking the OpenAI chat API, or an adapter of their own). The room
-does the rest: the agent answers when it is addressed, sometimes joins in when
-it is not, and otherwise says nothing.
+does the rest: the agent answers when it is addressed - by a mention, by a
+reply, or simply by somebody typing its name - sometimes joins in when it is
+not, stays out of a line addressed to somebody else, and otherwise says
+nothing.
 
 It is **one static binary**. No Python, no runtime, no shared libraries - copy
 it onto a machine and run it.
