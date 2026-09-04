@@ -1137,7 +1137,16 @@ these are BUILT and recorded in `docs/GATES.md` with their teeth runs:
 13. E1 A real ENCRYPTED room: the agent decrypts the mention and answers, and
     the reply comes back as `m.room.encrypted` for the room to decrypt - with
     the identical journey in a plain room as its negative control.
-14. Each gate proven to have teeth by reverting the guard it protects.
+14. N1-N4 A typed name is answered at once and costs no judge call; somebody
+    else's name is theirs; the next line is still mine until the window closes;
+    and with two agents in the room, exactly one answers a line naming one of
+    them.
+15. C-1/C-2/C-3 Two agents and a person: the human hands the turn to the room
+    and both agents end up talking, by name, until the thread runs out of
+    energy; another agent's TYPED name is answered under the shipped
+    `bot_to_bot: mentions`; and the same agent naming nobody is refused at the
+    switch, with the human's identical line still answered.
+16. Each gate proven to have teeth by reverting the guard it protects.
 
 ### Two standing rules about INPUTS (2026-09-04)
 
