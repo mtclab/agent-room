@@ -18,6 +18,15 @@ and so on, one tag to the next.
 
 - This changelog. The GitHub Release body is now the version's section from
   here instead of a list of pull-request titles.
+- `docs/ROADMAP.md`: what 1.0.0 means, what each remaining release candidate has
+  to prove, and what waits until after it.
+
+### Changed
+
+- Design and plan documents no longer carry questions that were answered in
+  September: the repository is public with CI, the room is encrypted, seven MCP
+  tools, a typed name reaches other agents (rc.3), and the judge timeout exists
+  (rc.3).
 
 ### Fixed
 

@@ -50,7 +50,9 @@ itself whether they would want to know, and usually says nothing.
 - `docs/BRAIN_CONTRACT.md` - plugging in a brain of your own
 - `docs/DESIGN.md` - the design and the reasoning (read first if you are working
   on the code)
-- `docs/PLAN.md` - the slices and their gates
+- `docs/PLAN.md` - the slices and their gates, up to the Rust port
+- `docs/ROADMAP.md` - what each release candidate has to prove before 1.0.0, and
+  what waits until after it
 - `docs/MCP.md` - putting a live Claude Code session in the room
 - `docs/GATES.md` - every gate and the proof it has teeth
 - `docs/research/` - the prior-art research the design rests on

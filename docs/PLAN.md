@@ -226,13 +226,12 @@ reported "nobody invited you" about a room the account HAD been invited to,
 because Synapse's cached initial sync predates the invitation - the same cache
 pathology as G4, and it now drains the same way.
 
-**Distribution is NOT decided** (owner). At the time of S5 both Python install
-paths were documented and both worked: `pipx install git+...` (needs the repo to
-be public, or the friend to be a collaborator) and a wheel the owner builds and
-sends. R5 replaced both with a static musl tarball, and the OPEN question is
-unchanged in shape: sending a file needs no decision; making the repo public is
-a separate call with the usual consequence that every future commit is public
-too.
+**Distribution was decided after this slice** (owner, 2026-09-03): the
+repository is public and CI publishes the releases. At the time of S5 both
+Python install paths were documented and both worked: `pipx install git+...`
+and a wheel the owner builds and sends. R5 replaced both with a static musl
+tarball; the public release page and the container image replaced hand-sending
+the tarball, which remains the offline fallback.
 
 ## S6 - unprompted speech, second design  [BUILT 2026-09-02, branch s6-unprompted]
 
@@ -431,11 +430,13 @@ Shipped:
 
 **The port is complete.** One implementation, one binary, one gate.
 
-Not done here, and deliberately: **the owner's own two connectors are still the
-Python ones**, running out of the root `.venv` that this slice did not touch.
-Swapping them over is a live change to two things that are really talking to
-people, and it is the owner's to make once this is merged: stop each service,
-`install -m 0755 target/x86_64-unknown-linux-musl/release/agent-room
-~/.local/bin/`, `agent-room doctor --config ...`, start it again. Their state
-directories carry over unchanged - that is what `tests/state_compat.rs` is for.
-The root `.venv` can go afterwards.
+Not done in this slice, and deliberately: the owner's own two connectors were
+still the Python ones when it merged, because swapping them is a live change to
+two things that are really talking to people. **Done the same day** (2026-09-03,
+recorded in `docs/READINESS.md`): both were stopped, moved onto the musl binary
+with their state directories unchanged (`tests/state_compat.rs` is the proof
+that works), started, and the root `.venv` removed. The Python reference tree
+was deleted in R5.
+
+What comes after the port is in `docs/ROADMAP.md`: the versions from rc.6 to
+1.0.0 and what each one has to prove.
