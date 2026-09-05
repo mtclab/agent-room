@@ -186,6 +186,11 @@ jobs:
       id-token: write      # the Sigstore identity the attestation is signed with
       attestations: write  # record the attestation against this repository
     steps:
+      # Only CHANGELOG.md and the script that reads it are needed from the tree;
+      # the binaries come from the build job's artefacts below, never from here.
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download both tarballs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -210,6 +215,19 @@ jobs:
         with:
           subject-path: dist/*.tar.gz
 
+      # The body of the release is the version's section of CHANGELOG.md, not a
+      # list of pull-request titles. No section, no release: the script exits 1
+      # and the reader gets "add a section" instead of an empty page.
+      # tests/changelog.rs asks the same script the same question on every
+      # `make gate`, so this is the backstop, not the first time anybody hears.
+      - name: The release notes are the changelog section
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/changelog-section.sh "$version" > release-notes.md
+          echo "release notes for ${version}:"
+          cat release-notes.md
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -220,7 +238,7 @@ jobs:
           args=(
             "$GITHUB_REF_NAME"
             --title "agent-room ${version}"
-            --generate-notes
+            --notes-file release-notes.md
             --verify-tag
           )
           # A tag with a hyphen in it is 1.0.0-rc.1 and friends: not the stable

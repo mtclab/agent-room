@@ -40,7 +40,14 @@ installs its own pinned zig and `cargo-zigbuild` and does not touch yours.
 **Every time:**
 
 1. Set the version in `Cargo.toml`. It is what `agent-room --version` prints and
-   what every artefact is named after.
+   what every artefact is named after. Then give the version its section in
+   `CHANGELOG.md`: move what sits under `[Unreleased]` to a new
+   `## [<version>] - <date>` heading directly below it, written for the person
+   running an agent (what they will notice, which knob is new, what was broken),
+   and add the compare link at the bottom. That section IS the GitHub Release
+   body - the workflow reads it with `scripts/changelog-section.sh` and refuses a
+   tag whose version has no section, and `make gate` fails on the same omission
+   (`tests/changelog.rs`), so you hear about it in step 2, not after the tag.
 2. `make gate` - fmt, clippy pedantic with warnings as errors, the unit tests.
    Two of those are standing rules rather than tests of a behaviour: no tracked
    file names a deployment or an account (`tests/publish_clean.rs`), and every
