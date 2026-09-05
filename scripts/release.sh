@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cut a release: one static binary per target, a tarball each, and SHA256SUMS.
 #
-# Everything happens on this machine; there is no CI (house rule, private repo).
+# This is the one release path: `make release` runs it here, and the release
+# workflow (.github/workflows/release.yml) runs the same script on a tag.
 # The binaries are STATIC musl builds so a friend can copy one onto any Linux of
 # the right architecture and run it - no Python, no glibc version to match, no
 # shared library to install.

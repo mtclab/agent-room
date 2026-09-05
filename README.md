@@ -54,6 +54,8 @@ itself whether they would want to know, and usually says nothing.
 - `docs/MCP.md` - putting a live Claude Code session in the room
 - `docs/GATES.md` - every gate and the proof it has teeth
 - `docs/research/` - the prior-art research the design rests on
+- `CHANGELOG.md` - what changed for you, release by release; a version's section is
+  its GitHub Release body
 - `tests/live/README.md` - running the live gates against a real homeserver
 
 ## Building it
