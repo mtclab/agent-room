@@ -1679,10 +1679,10 @@ Recorded so the next pass does not redo it.
   `judge_timeout_s`), so a judge endpoint that hangs stalls tier 2 in that room
   for up to the cold-start allowance - by default ten minutes. Nothing else
   stops: tier 1 still answers, the sync loop still runs, and only one
-  deliberation exists per room to be stuck. Left as it is because the fix is a
-  new config knob, the schema is a compatibility surface, and adding one is the
-  owner's call rather than a release slice's. Worth raising if anybody runs a
-  separate judge endpoint in anger.
+  deliberation exists per room to be stuck. Left as it was at rc.1 because the
+  fix is a new config knob and the schema is a compatibility surface.
+  **Superseded in 1.0.0-rc.3:** `brain.openai_compat.judge_timeout_s` exists
+  (30 s when a resident judge endpoint or model is set), see CHANGELOG.md.
 
 # Transcript rotation (#13, 2026-09-03)
 

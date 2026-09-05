@@ -52,6 +52,13 @@ to short-lived agents run by an orchestrator. It never became a conversation:
 
 ## Proposed shape
 
+> Written 2026-09-02, before anything was built. The shape held; the details
+> did not all survive: the Matrix layer is the Rust matrix-sdk, not matrix-nio
+> (see "The implementation"), the room is encrypted (see "E2EE"), the
+> `opencode serve` adapter was never built (a generic `command` brain is on the
+> roadmap instead, `docs/ROADMAP.md`), and the repository is public with CI.
+> Kept as the record of what was proposed; the BUILT sections below are current.
+
 ### One reusable "agent connector", run by each person
 
 Each friend runs a small daemon that connects THEIR agent to the room with THEIR
@@ -198,9 +205,9 @@ the only thing standing between a chatty room and a bill.
 
 ### The MCP server for live sessions (BUILT 2026-09-02, S4)
 
-`agent-room mcp --config PATH` serves the room over stdio as six tools -
+`agent-room mcp --config PATH` serves the room over stdio as seven tools -
 `room_list`, `room_read`, `room_post`, `room_react`, `room_threads`,
-`room_wait` - so an interactive Claude Code session takes part in the room as a
+`room_wait`, and since S6 `room_impulse` - so an interactive Claude Code session takes part in the room as a
 first-class participant. Registered with
 `claude mcp add agent-room -- <venv>/bin/agent-room mcp --config <session.yaml>`;
 the whole how-to is `docs/MCP.md`.
@@ -1141,8 +1148,10 @@ trade for a thing somebody installs once.
 
 ### Where the code lives
 
-A small repo of its own (no CI, owner rule), not a directory inside another
-project: this is its own product.
+A small repo of its own, not a directory inside another project: this is its
+own product. It began private with no CI (owner rule for private repositories);
+since 2026-09-03 it is public, and CI runs the gate on every pull request and
+cuts the release on every tag (`docs/OWNER_RUNBOOK.md`).
 
 ### Gates (before anyone's friend installs it)
 
@@ -1226,19 +1235,25 @@ green, because every gate but one attached a pill the sender never typed.
 
 ## Open questions for owner
 
-- **Distribution: public repo, or tarballs the owner sends? OPEN.** The tarball
-  path is built and documented (`make release` -> `dist/`, a sha256 in a second
-  message, `docs/ONBOARDING.md` inside the archive) and needs no decision and no
-  access. Making the repo public would let anybody clone and build, and would
-  make every future commit public with it. Nothing in the code depends on the
-  answer.
+- (answered 2026-09-03) **Distribution: the repository is public.** Releases
+  are published on it by CI, tarballs with checksums and provenance plus a
+  container image; the tarball a person sends by hand is the offline fallback
+  (`docs/OWNER_RUNBOOK.md`, "Hand a friend a tarball"). The private history was
+  not published; the public repository starts from a single clean commit.
 - (answered 2026-09-02) Owner's brain = Claude Code headless; friends bring theirs.
 - (answered 2026-09-02) Friends' agents reuse spare bot accounts on our
   homeserver, handed over by an admin-API password reset with
   `logout_devices: true`. Never a raw token.
-- Tool allowlist for the room agent: read-only + memory, or none at all?
-- Encryption: v1 unencrypted room (simple, nio E2E has no cross-signing)?
-- Do friends get accounts on our homeserver, or federate from their own servers?
+- (answered by S2, standing) Tool allowlist for the room agent: read-only
+  (`Read`, `Grep`, `Glob`, `WebSearch`); a memory tool was never added and
+  nothing since has asked for one. Reopen only with a concrete need.
+- (answered by R1) Encryption: the room IS encrypted; the Rust matrix-sdk
+  brought cross-signing and a recovery key, which the Python layer lacked. The
+  unencrypted room is still supported (`allow_wedged_device` exists for it).
+- (answered 2026-09-02, in practice) Friends' agents get spare accounts on the
+  owner's homeserver, handed over by password reset. Federating from another
+  homeserver is not prevented by anything in the connector and has not been
+  tried; it is an open question only for a deployment that wants it.
 - (answered by S3, revised by S6) Tier 2 ships ON with a 5-40 s back-off, a
   stand-down re-read and a judge in front of it. The TIMER ships off
   (`heartbeat_minutes: 0`) and is undocumented for friends; unprompted speech
@@ -1246,4 +1261,6 @@ green, because every gate but one attached a pill the sender never typed.
   presence-gated. Inner thoughts ship off and are refused for `claude_code`.
 - (answered 2026-09-02) Wake strategy is the operator's: `warm_on_intent` and a
   separate judge endpoint are independent knobs, any combination.
-- Do we have Synapse admin/config access on the homeserver host (rate-limit exemption)?
+- (answered 2026-09-03) Synapse admin access exists; the rate-limit exemption
+  and the account hand-over are admin-API calls in `docs/OWNER_RUNBOOK.md`. The
+  roadmap puts them behind an `agent-room owner` subcommand (`docs/ROADMAP.md`).
