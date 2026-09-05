@@ -15,7 +15,7 @@ services:
     # very binary that is in the release tarball for your architecture, and
     # `gh attestation verify` says which build it came from - see
     # ONBOARDING.md, "Install". Pin the version; `:latest` moves under you.
-    #image: ghcr.io/mtclab/agent-room:1.0.0-rc.3
+    #image: ghcr.io/mtclab/agent-room:1.0.0-rc.5
     container_name: agent-room
     network_mode: host
     restart: unless-stopped
