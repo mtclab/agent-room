@@ -1,4 +1,4 @@
-//! Append-only per-room transcript (JSONL).
+//! Per-room transcript (JSONL): appended to, and corrected in place.
 //!
 //! Every event we see and every reply we make is appended here. This file is
 //! the session memory a brain gets handed: it survives restarts and needs no
@@ -17,6 +17,12 @@
 //! cap - what an append or a turn costs is bounded by `transcript_keep` rather
 //! than by how long the room has existed. The archives are history for a human
 //! with `jq`, not memory for the brain.
+//!
+//! Everything else here is an append; two things are not, and both are
+//! CORRECTIONS to a line that is already on disk. An edit (`m.replace`)
+//! replaces the text of the record it points at, and a redaction takes its
+//! records away. Both rewrite the live file through a staged 0600 file and a
+//! rename, and neither touches an archive.
 
 use std::collections::HashSet;
 use std::fs;
@@ -28,7 +34,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::events::RoomEvent;
+use crate::events::{Edit, RoomEvent};
 
 const BLOCK: usize = 64 * 1024;
 /// How many records to scan back when collecting one thread.
@@ -47,6 +53,16 @@ pub const DEFAULT_ARCHIVES: usize = 4;
 /// arms one; in the shipped binary `crash_point` has no state behind it.
 const AFTER_SEED: &str = "after the seed file was written";
 const AFTER_ARCHIVE: &str = "after the live file was rolled into .1";
+
+/// What a correction does to one record of the transcript.
+enum Fate {
+    /// Untouched: the line is copied through byte for byte.
+    Kept,
+    /// Changed: the record is serialised again.
+    Rewritten,
+    /// Gone: the line is not written at all.
+    Dropped,
+}
 
 /// What a record is: something the room said, or something I posted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +126,10 @@ impl Transcript {
     /// A failure is logged rather than raised: the transcript is memory, and
     /// losing a line of it must not lose the turn that produced it.
     pub fn append(&self, kind: Kind, ev: &RoomEvent) {
+        // The line count is this file's lock as well as its cache: an append, a
+        // roll and a correction's rewrite are one at a time, so a rewrite can
+        // never lose a line that landed while it was reading the file.
+        let mut held = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(exc) = self.try_append(kind, ev) {
             warn!(
                 "cannot append to the transcript {}: {exc}",
@@ -119,7 +139,7 @@ impl Transcript {
         }
         // Reported on its own line, and after the fact: the record is on disk by
         // now, so a roll that failed costs disk space, never the turn.
-        if let Err(exc) = self.roll_if_full() {
+        if let Err(exc) = self.roll_if_full(&mut held) {
             warn!("cannot roll the transcript {}: {exc}", self.path.display());
         }
     }
@@ -153,11 +173,10 @@ impl Transcript {
     /// is a few megabytes, and reading all of it to answer "is it full yet?"
     /// on every message in the room would be the most expensive thing an append
     /// does. It is counted once per process per room, then kept in step.
-    fn roll_if_full(&self) -> std::io::Result<()> {
+    fn roll_if_full(&self, held: &mut Option<usize>) -> std::io::Result<()> {
         if self.keep == 0 {
             return Ok(());
         }
-        let mut held = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
         let count = match *held {
             Some(known) => known + 1,
             None => count_lines(&self.path)?,
@@ -187,7 +206,7 @@ impl Transcript {
     fn rotate(&self, held: usize) -> std::io::Result<usize> {
         let seed = self.tail_lines(self.keep / 2);
         let staged = self.sibling(".rolling");
-        write_seed(&staged, &seed)?;
+        write_lines(&staged, &seed)?;
         crash_point(AFTER_SEED)?;
         self.shift_archives()?;
         if self.archives == 0 {
@@ -241,6 +260,120 @@ impl Transcript {
         let mut name = self.path.clone().into_os_string();
         name.push(suffix);
         PathBuf::from(name)
+    }
+
+    // -- corrections -----------------------------------------------------
+    //
+    // The two things that change a line that is already on disk. Both rewrite
+    // the LIVE file only: an archive is history, and history is not corrected
+    // (see `docs/DESIGN.md`, "Corrections").
+
+    /// Replace the text of `edit.target` with the edit's, in place.
+    ///
+    /// Only the line's own author may rewrite it. A homeserver will carry an
+    /// `m.replace` that points at somebody ELSE's event, and a transcript that
+    /// took one would let anybody in the room put words in anybody else's
+    /// mouth - and then feed them to the brain as what that person said.
+    ///
+    /// Returns how many records changed. 0 means the target is not in the live
+    /// file - it has rolled away, or was never seen - and the edit is dropped.
+    #[must_use]
+    pub fn apply_edit(&self, edit: &Edit) -> usize {
+        self.correct("apply the edit to", |event| {
+            if event.event_id != edit.target || event.sender != edit.sender {
+                return Fate::Kept;
+            }
+            event.body.clone_from(&edit.body);
+            event.formatted_body.clone_from(&edit.formatted_body);
+            event.mentions.clone_from(&edit.mentions);
+            Fate::Rewritten
+        })
+    }
+
+    /// Take a redacted event out of the transcript entirely.
+    ///
+    /// Every record of it goes: the line as it was seen, and my own copy of it
+    /// when what was redacted is something I posted. Returns how many went.
+    #[must_use]
+    pub fn remove_event(&self, event_id: &str) -> usize {
+        self.correct("redact", |event| {
+            if event.event_id == event_id {
+                Fate::Dropped
+            } else {
+                Fate::Kept
+            }
+        })
+    }
+
+    /// [`Self::rewrite`], with the failure logged the way an append's is: a
+    /// correction that cannot be written must not take the sync loop with it.
+    fn correct<F>(&self, what: &str, visit: F) -> usize
+    where
+        F: FnMut(&mut RoomEvent) -> Fate,
+    {
+        match self.rewrite(visit) {
+            Ok(touched) => touched,
+            Err(exc) => {
+                warn!(
+                    "cannot {what} the transcript {}: {exc}",
+                    self.path.display()
+                );
+                0
+            }
+        }
+    }
+
+    /// Rewrite the live file, showing `visit` every record in it.
+    ///
+    /// Returns how many records it changed or dropped; 0 leaves the file alone,
+    /// bytes and all. The write is the ledger's discipline: a fresh 0600 file
+    /// beside it, `fsync`ed, then renamed over the live name - so a crash in the
+    /// middle of a correction leaves the transcript exactly as it was, and no
+    /// reader ever meets a half-written one. A line this build cannot parse is
+    /// copied through untouched rather than dropped.
+    fn rewrite<F>(&self, mut visit: F) -> std::io::Result<usize>
+    where
+        F: FnMut(&mut RoomEvent) -> Fate,
+    {
+        let mut held = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(exc) if exc.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(exc) => return Err(exc),
+        };
+        let mut kept: Vec<String> = Vec::new();
+        let mut touched = 0usize;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(mut record) = serde_json::from_str::<Record>(line) else {
+                kept.push(line.to_owned());
+                continue;
+            };
+            match visit(&mut record.event) {
+                Fate::Kept => kept.push(line.to_owned()),
+                Fate::Rewritten => match serde_json::to_string(&record) {
+                    Ok(written) => {
+                        touched += 1;
+                        kept.push(written);
+                    }
+                    Err(exc) => {
+                        warn!("a corrected transcript record will not serialise: {exc}");
+                        kept.push(line.to_owned());
+                    }
+                },
+                Fate::Dropped => touched += 1,
+            }
+        }
+        if touched == 0 {
+            return Ok(0);
+        }
+        let staged = self.sibling(".rewriting");
+        write_lines(&staged, &kept)?;
+        fs::rename(&staged, &self.path)?;
+        *held = Some(kept.len());
+        Ok(touched)
     }
 
     pub fn append_seen(&self, ev: &RoomEvent) {
@@ -400,12 +533,14 @@ fn count_lines(path: &Path) -> std::io::Result<usize> {
     }
 }
 
-/// Write the seed for a new live file, 0600, and get it onto the disk.
+/// Write a whole transcript file, 0600, and get it onto the disk.
 ///
-/// `sync_all` before the rename that publishes it: the file this becomes is the
-/// agent's memory, and a rename that lands before the bytes do would turn a
-/// power cut into an empty transcript.
-fn write_seed(path: &Path, lines: &[String]) -> std::io::Result<()> {
+/// Used by both things that make one: the seed a roll starts the next live file
+/// with, and the rewrite a correction leaves behind. `sync_all` before the
+/// rename that publishes it: the file this becomes is the agent's memory, and a
+/// rename that lands before the bytes do would turn a power cut into an empty
+/// transcript.
+fn write_lines(path: &Path, lines: &[String]) -> std::io::Result<()> {
     let mut handle = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -844,6 +979,170 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    // -- corrections ------------------------------------------------------
+
+    fn edit_of(target: &str, sender: &str, body: &str) -> Edit {
+        Edit {
+            event_id: format!("$edit-of-{target}"),
+            target: target.to_owned(),
+            sender: sender.to_owned(),
+            body: body.to_owned(),
+            formatted_body: None,
+            mentions: std::collections::BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn an_edit_replaces_the_text_of_the_line_it_points_at() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::new(dir.path().join("room.jsonl"));
+        transcript.append_seen(&event("$a", "before", None));
+        transcript.append_seen(&event("$b", "untouched", None));
+
+        assert_eq!(transcript.apply_edit(&edit_of("$a", HUMAN, "after")), 1);
+
+        let bodies: Vec<String> = transcript.tail(10).into_iter().map(|e| e.body).collect();
+        assert_eq!(bodies, ["after", "untouched"]);
+        assert_eq!(
+            transcript.tail(10).len(),
+            2,
+            "an edit added a line instead of replacing one"
+        );
+        // Everything else about the line is what it was: the edit is text.
+        let edited = transcript.tail(10).swap_remove(0);
+        assert_eq!(edited.event_id, "$a");
+        assert_eq!(edited.sender, HUMAN);
+        assert!((edited.ts - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn only_the_author_of_a_line_may_edit_it() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::new(dir.path().join("room.jsonl"));
+        transcript.append_seen(&event("$a", "what I said", None));
+
+        assert_eq!(
+            transcript.apply_edit(&edit_of("$a", "@stranger:example.com", "what I never said")),
+            0,
+            "somebody else's edit was applied"
+        );
+        assert_eq!(transcript.tail(10)[0].body, "what I said");
+    }
+
+    #[test]
+    fn an_edit_of_a_line_that_is_not_here_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::new(dir.path().join("room.jsonl"));
+        transcript.append_seen(&event("$a", "the only line", None));
+        let before = fs::read_to_string(&transcript.path).expect("readable");
+
+        assert_eq!(
+            transcript.apply_edit(&edit_of("$gone", HUMAN, "nothing")),
+            0
+        );
+        assert_eq!(
+            fs::read_to_string(&transcript.path).expect("readable"),
+            before,
+            "a correction that corrects nothing still rewrote the file"
+        );
+        // ... and on a transcript that does not exist yet either.
+        assert_eq!(
+            Transcript::new(dir.path().join("nope.jsonl")).apply_edit(&edit_of("$a", HUMAN, "x")),
+            0
+        );
+    }
+
+    #[test]
+    fn a_redaction_takes_every_record_of_the_event_away() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::new(dir.path().join("room.jsonl"));
+        transcript.append_seen(&event("$a", "before", None));
+        // My own post: the reply record, and the same event coming back through
+        // the sync as a `seen` one. Both are records of the redacted event.
+        let mut mine = event("$mine", "something I regret", None);
+        mine.sender = ME.to_owned();
+        transcript.append_reply(&mine);
+        transcript.append_seen(&mine);
+        transcript.append_seen(&event("$c", "after", None));
+
+        assert_eq!(transcript.remove_event("$mine"), 2);
+
+        let left: Vec<String> = transcript
+            .tail(10)
+            .into_iter()
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(left, ["$a", "$c"]);
+        assert!(
+            !fs::read_to_string(&transcript.path)
+                .expect("readable")
+                .contains("regret"),
+            "the redacted text is still in the file"
+        );
+        assert_eq!(transcript.remove_event("$mine"), 0, "twice is a no-op");
+    }
+
+    #[test]
+    fn a_correction_keeps_the_line_count_in_step_with_the_file() {
+        // The count is a cache, and a roll is decided by it: a rewrite that
+        // left it stale would roll the file early or never.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::with_rotation(dir.path().join("room.jsonl"), 4, 1);
+        for index in 0..3 {
+            transcript.append_seen(&event(&format!("$e{index}"), "x", None));
+        }
+        assert_eq!(transcript.remove_event("$e0"), 1);
+        // Two on disk. Two more appends is four, which is the cap, so nothing
+        // has rolled yet; the third one rolls it.
+        transcript.append_seen(&event("$e3", "x", None));
+        transcript.append_seen(&event("$e4", "x", None));
+        assert_eq!(names_in(dir.path()), ["room.jsonl"], "it rolled early");
+        transcript.append_seen(&event("$e5", "x", None));
+        assert_eq!(names_in(dir.path()), ["room.jsonl", "room.jsonl.1"]);
+    }
+
+    #[test]
+    fn a_correction_writes_a_0600_file_and_leaves_nothing_staged() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let transcript = Transcript::new(dir.path().join("room.jsonl"));
+        transcript.append_seen(&event("$a", "before", None));
+        assert_eq!(transcript.apply_edit(&edit_of("$a", HUMAN, "after")), 1);
+
+        assert_eq!(
+            names_in(dir.path()),
+            ["room.jsonl"],
+            "the staged file is still there"
+        );
+        let mode = fs::metadata(&transcript.path)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a rewritten transcript is world-readable");
+    }
+
+    #[test]
+    fn a_line_a_correction_cannot_read_is_kept_rather_than_lost() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("room.jsonl");
+        let transcript = Transcript::new(path.clone());
+        transcript.append_seen(&event("$a", "before", None));
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("the transcript is there");
+        handle.write_all(b"{not json at all\n").expect("written");
+        drop(handle);
+
+        assert_eq!(transcript.apply_edit(&edit_of("$a", HUMAN, "after")), 1);
+        let text = fs::read_to_string(&path).expect("readable");
+        assert!(
+            text.contains("{not json at all"),
+            "a line this build cannot parse was thrown away by a correction"
+        );
+        assert!(text.contains("after"));
     }
 
     #[test]

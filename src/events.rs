@@ -42,6 +42,9 @@ pub const EMOTE_MSGTYPE: &str = "m.emote";
 pub const THREAD_REL_TYPE: &str = "m.thread";
 pub const REACTION_TYPE: &str = "m.reaction";
 pub const ANNOTATION_REL_TYPE: &str = "m.annotation";
+pub const REPLACE_REL_TYPE: &str = "m.replace";
+pub const MESSAGE_TYPE: &str = "m.room.message";
+pub const REDACTION_TYPE: &str = "m.room.redaction";
 
 /// The msgtypes that are a line of conversation. Everything else a room
 /// carries - an image, a file, a location - is not something somebody said.
@@ -54,23 +57,150 @@ pub const MESSAGE_MSGTYPES: [&str; 3] = [TEXT_MSGTYPE, NOTICE_MSGTYPE, EMOTE_MSG
 /// reading the room should not have to filter it out itself.
 #[must_use]
 pub fn is_message_source(source: &Value) -> bool {
-    if source.get("type").and_then(Value::as_str) != Some("m.room.message") {
-        return false;
+    skip_reason(source).is_none()
+}
+
+/// Why this raw event is not a line of conversation, or `None` when it is one.
+///
+/// The other half of [`is_message_source`], and the reason there is only one
+/// filter: the connector drops the same events the MCP server hides, and an
+/// operator wondering where a picture went finds the answer in the log rather
+/// than in this file. Nothing is allocated for an event that passes.
+#[must_use]
+pub fn skip_reason(source: &Value) -> Option<String> {
+    let kind = source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("no type");
+    if kind != MESSAGE_TYPE {
+        return Some(format!("{kind} is not a message"));
     }
     let Some(content) = source.get("content").filter(|value| value.is_object()) else {
-        return false;
+        return Some("no content (redacted, or not an event at all)".to_owned());
     };
-    let msgtype = content
-        .get("msgtype")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let Some(msgtype) = content.get("msgtype").and_then(Value::as_str) else {
+        return Some("no msgtype (a redacted husk, or state-shaped)".to_owned());
+    };
     if !MESSAGE_MSGTYPES.contains(&msgtype) {
-        return false;
+        return Some(format!("{msgtype} is not a line of conversation"));
     }
-    content
-        .get("body")
+    let body = content.get("body").and_then(Value::as_str).unwrap_or("");
+    if body.trim().is_empty() {
+        return Some(format!("an empty {msgtype} body"));
+    }
+    None
+}
+
+/// A correction to something that is already in the transcript.
+///
+/// Neither one is a new line: they change what an OLD line says, or take it
+/// away. They are read before the message filter, because an edit is a
+/// perfectly ordinary `m.room.message` and a redaction is not a message at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Correction {
+    /// An `m.replace`: the target's text becomes this one's.
+    Edit(Edit),
+    /// An `m.room.redaction`: the target's text goes away.
+    Redaction(Redaction),
+}
+
+/// One `m.replace`, read as what it does rather than as what it looks like.
+///
+/// The event's own `body` is the `* corrected text` fallback that clients
+/// without edit support show, and it is deliberately not here: the only text an
+/// edit carries is `m.new_content`'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    /// The edit's own event id, for the consumed ledger.
+    pub event_id: String,
+    /// The event whose text this replaces.
+    pub target: String,
+    /// Who sent the edit. Only the original's own author may rewrite it.
+    pub sender: String,
+    pub body: String,
+    pub formatted_body: Option<String>,
+    pub mentions: BTreeSet<String>,
+}
+
+/// One `m.room.redaction`, and what it takes away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redaction {
+    /// The redaction's own event id, for the consumed ledger.
+    pub event_id: String,
+    /// The event whose content the homeserver has just thrown away.
+    pub redacts: String,
+    pub sender: String,
+}
+
+/// Read one raw event as a correction, or `None` when it is not one.
+#[must_use]
+pub fn correction_from(source: &Value) -> Option<Correction> {
+    match source.get("type").and_then(Value::as_str) {
+        Some(REDACTION_TYPE) => redaction_from(source).map(Correction::Redaction),
+        Some(MESSAGE_TYPE) => edit_from(source).map(Correction::Edit),
+        _ => None,
+    }
+}
+
+/// The `m.replace` half: `m.relates_to` says what it replaces, `m.new_content`
+/// says what with.
+fn edit_from(source: &Value) -> Option<Edit> {
+    let content = source.get("content").filter(|value| value.is_object())?;
+    let relates_to = content.get("m.relates_to").and_then(Value::as_object)?;
+    if relates_to.get("rel_type").and_then(Value::as_str) != Some(REPLACE_REL_TYPE) {
+        return None;
+    }
+    let target = relates_to
+        .get("event_id")
         .and_then(Value::as_str)
-        .is_some_and(|body| !body.trim().is_empty())
+        .filter(|id| !id.is_empty())?;
+    let new_content = content
+        .get("m.new_content")
+        .filter(|value| value.is_object())?;
+    let body = new_content.get("body").and_then(Value::as_str)?;
+    let formatted_body = new_content
+        .get("formatted_body")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some(Edit {
+        event_id: event_id_of(source),
+        target: target.to_owned(),
+        sender: sender_of(source),
+        body: body.to_owned(),
+        mentions: parse_mentions(new_content, formatted_body.as_deref()),
+        formatted_body,
+    })
+}
+
+/// The redaction half. Room version 11 moved `redacts` into the content and
+/// older rooms keep it at the top level, so both are read.
+fn redaction_from(source: &Value) -> Option<Redaction> {
+    let redacts = source
+        .pointer("/content/redacts")
+        .and_then(Value::as_str)
+        .or_else(|| source.get("redacts").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())?;
+    Some(Redaction {
+        event_id: event_id_of(source),
+        redacts: redacts.to_owned(),
+        sender: sender_of(source),
+    })
+}
+
+fn event_id_of(source: &Value) -> String {
+    source
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn sender_of(source: &Value) -> String {
+    source
+        .get("sender")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// `@bot-a:example.com` -> `bot-a`.
@@ -296,11 +426,7 @@ pub fn from_source(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let (thread_root, reply_to, reply_is_fallback) = parse_relations(content);
-    let sender = source
-        .get("sender")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let sender = sender_of(source);
     let event_room_id = if room_id.is_empty() {
         source
             .get("room_id")
@@ -322,11 +448,7 @@ pub fn from_source(
         rules.bot_localpart_patterns,
     );
     RoomEvent {
-        event_id: source
-            .get("event_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        event_id: event_id_of(source),
         room_id: event_room_id,
         sender,
         sender_display: display_name,
@@ -792,5 +914,167 @@ mod tests {
             &json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": "   "}})
         ));
         assert!(!is_message_source(&json!({"type": "m.room.message"})));
+    }
+
+    #[test]
+    fn what_is_dropped_says_why_it_was_dropped() {
+        // The debug line an operator reads when a picture is met with silence.
+        for (source, reason) in [
+            (
+                json!({"type": "m.room.message", "content": {"msgtype": "m.image", "body": "cat.png"}}),
+                "m.image is not a line of conversation",
+            ),
+            (
+                json!({"type": "m.reaction", "content": {}}),
+                "m.reaction is not a message",
+            ),
+            (
+                json!({"type": "m.room.message", "content": {}}),
+                "no msgtype (a redacted husk, or state-shaped)",
+            ),
+            (
+                json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": " "}}),
+                "an empty m.text body",
+            ),
+        ] {
+            assert_eq!(skip_reason(&source).as_deref(), Some(reason));
+        }
+        assert_eq!(
+            skip_reason(&json!({
+                "type": "m.room.message",
+                "content": {"msgtype": "m.emote", "body": "waves"},
+            })),
+            None
+        );
+    }
+
+    /// One `m.replace` as a client sends it: the fallback body the room sees,
+    /// and the real text in `m.new_content`.
+    fn edit_source(target: &str, sender: &str, new_body: &str) -> Value {
+        json!({
+            "type": "m.room.message",
+            "event_id": "$edit",
+            "sender": sender,
+            "content": {
+                "msgtype": "m.text",
+                "body": format!("* {new_body}"),
+                "m.new_content": { "msgtype": "m.text", "body": new_body },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": target },
+            },
+        })
+    }
+
+    #[test]
+    fn an_edit_is_read_as_the_new_text_and_never_as_the_fallback() {
+        let Some(Correction::Edit(edit)) =
+            correction_from(&edit_source("$original", HUMAN, "what I meant"))
+        else {
+            panic!("an m.replace is a correction");
+        };
+        assert_eq!(edit.event_id, "$edit");
+        assert_eq!(edit.target, "$original");
+        assert_eq!(edit.sender, HUMAN);
+        assert_eq!(
+            edit.body, "what I meant",
+            "the `* ...` fallback is what the room shows, never what I read"
+        );
+        assert!(edit.formatted_body.is_none());
+        assert!(edit.mentions.is_empty());
+    }
+
+    #[test]
+    fn an_edit_carries_the_new_content_s_own_mentions_and_html() {
+        let source = json!({
+            "type": "m.room.message",
+            "event_id": "$edit",
+            "sender": HUMAN,
+            "content": {
+                "msgtype": "m.text",
+                "body": "* bot-a, look again",
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": "bot-a, look again",
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": format!("<a href=\"https://matrix.to/#/{ME}\">bot-a</a>, look again"),
+                },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$original" },
+            },
+        });
+        let Some(Correction::Edit(edit)) = correction_from(&source) else {
+            panic!("an m.replace is a correction");
+        };
+        assert_eq!(edit.mentions, BTreeSet::from([ME.to_owned()]));
+        assert!(
+            edit.formatted_body
+                .is_some_and(|html| html.contains("bot-a"))
+        );
+    }
+
+    #[test]
+    fn a_plain_message_and_a_reply_are_not_corrections() {
+        assert_eq!(
+            correction_from(&source(&plain("hello"), HUMAN, "$e", 0)),
+            None
+        );
+        let reply = json!({
+            "type": "m.room.message",
+            "event_id": "$e",
+            "sender": HUMAN,
+            "content": {
+                "msgtype": "m.text",
+                "body": "yes",
+                "m.relates_to": { "m.in_reply_to": { "event_id": "$original" } },
+            },
+        });
+        assert_eq!(correction_from(&reply), None);
+    }
+
+    #[test]
+    fn an_m_replace_without_new_content_corrects_nothing() {
+        // A half-written edit must not blank the line it points at.
+        let source = json!({
+            "type": "m.room.message",
+            "event_id": "$edit",
+            "sender": HUMAN,
+            "content": {
+                "msgtype": "m.text",
+                "body": "* oops",
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$original" },
+            },
+        });
+        assert_eq!(correction_from(&source), None);
+    }
+
+    #[test]
+    fn a_redaction_is_read_from_both_places_the_room_version_puts_it() {
+        // Room version 11 moved `redacts` into the content; older rooms keep it
+        // at the top level, and a connector meets both.
+        for source in [
+            json!({
+                "type": "m.room.redaction",
+                "event_id": "$redaction",
+                "sender": HUMAN,
+                "redacts": "$original",
+                "content": { "reason": "wrong room" },
+            }),
+            json!({
+                "type": "m.room.redaction",
+                "event_id": "$redaction",
+                "sender": HUMAN,
+                "content": { "redacts": "$original" },
+            }),
+        ] {
+            let Some(Correction::Redaction(redaction)) = correction_from(&source) else {
+                panic!("an m.room.redaction is a correction");
+            };
+            assert_eq!(redaction.event_id, "$redaction");
+            assert_eq!(redaction.redacts, "$original");
+            assert_eq!(redaction.sender, HUMAN);
+        }
+        assert_eq!(
+            correction_from(&json!({"type": "m.room.redaction", "content": {}})),
+            None,
+            "a redaction that names nothing redacts nothing"
+        );
     }
 }

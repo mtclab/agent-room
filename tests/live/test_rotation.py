@@ -38,6 +38,7 @@ from conftest import (
     messages,
     post,
     relates_to,
+    transcript_path,
     wait_for,
     wait_for_join,
 )
@@ -57,16 +58,6 @@ MENTIONS = 25
 #: Where a connector's own log says it rolled, and where it says it could not.
 ROLLED = "rolled the transcript"
 COULD_NOT_ROLL = "cannot roll the transcript"
-
-
-def transcript_path(connector: Connector, room_id: str) -> Path:
-    """The live transcript for `room_id` under this connector's state dir.
-
-    The layout and the sanitisation are `config::room_state_path`'s, pinned by
-    `tests/state_compat.rs`: `<state_dir>/rooms/<room id>.jsonl`, with anything
-    outside `[A-Za-z0-9_.-]` replaced by an underscore.
-    """
-    return connector.state_dir / "rooms" / (re.sub(r"[^A-Za-z0-9_.-]", "_", room_id) + ".jsonl")
 
 
 def archive(live: Path, index: int) -> Path:

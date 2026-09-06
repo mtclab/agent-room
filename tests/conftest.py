@@ -440,8 +440,24 @@ async def post(
             "is_falling_back": True,
             "m.in_reply_to": {"event_id": thread_root},
         }
+    return await send_content(human, room_id, content)
+
+
+async def send_content(
+    human: AsyncClient,
+    room_id: str,
+    content: dict[str, Any],
+    event_type: str = "m.room.message",
+) -> str:
+    """Post one raw event as the human, riding out the rate limit the same way.
+
+    What `post()` is built on, and what a gate about something OTHER than typed
+    text uses directly: a picture, a file, an `m.replace` edit. The content is
+    written out in the gate rather than assembled here, because the shape is
+    exactly what such a gate is about.
+    """
     for _attempt in range(RATE_LIMIT_RETRIES):
-        response = await human.room_send(room_id, "m.room.message", content)
+        response = await human.room_send(room_id, event_type, content)
         event_id = getattr(response, "event_id", None)
         if event_id:
             return str(event_id)
@@ -450,6 +466,40 @@ async def post(
         wait_ms = getattr(response, "retry_after_ms", None) or 1000
         await asyncio.sleep(min(wait_ms / 1000, 10.0))
     raise AssertionError(f"the human could not post: {response}")
+
+
+async def redact(human: AsyncClient, room_id: str, event_id: str, reason: str) -> str:
+    """Take an event back, as the person who made the room can for anybody's."""
+    response = await human.room_redact(room_id, event_id, reason=reason)
+    redaction = getattr(response, "event_id", None)
+    assert redaction, f"the human could not redact {event_id}: {response}"
+    return str(redaction)
+
+
+def transcript_path(connector: Connector, room_id: str) -> Path:
+    """The live transcript for `room_id` under this connector's state dir.
+
+    The layout and the sanitisation are `config::room_state_path`'s, pinned by
+    `tests/state_compat.rs`: `<state_dir>/rooms/<room id>.jsonl`, with anything
+    outside `[A-Za-z0-9_.-]` replaced by an underscore.
+    """
+    return connector.state_dir / "rooms" / (re.sub(r"[^A-Za-z0-9_.-]", "_", room_id) + ".jsonl")
+
+
+def transcript_records(connector: Connector, room_id: str) -> list[dict[str, Any]]:
+    """The agent's own memory of a room, as it is on disk right now.
+
+    This is what a turn is handed as history (`transcript::recent`), so a gate
+    about what the agent remembers reads it rather than guessing from the room.
+    """
+    path = transcript_path(connector, room_id)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
 
 
 def localpart(user_id: str) -> str:
