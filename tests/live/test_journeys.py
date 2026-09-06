@@ -140,11 +140,15 @@ async def test_g2_an_unaddressed_message_is_left_alone(
     assert by_sender(events, S3_BOT_B) == [], "bot D answered an unaddressed message"
 
     # Silence proves nothing unless the bots were alive to break it: a dead
-    # connector would pass the assertions above. Address them and they must answer.
+    # connector would pass the assertions above. Address them and they must
+    # answer - by `m.mentions` alone. Since rc.3 an `@id` typed in the body is
+    # an address too, and the echo brain repeats the body, so ids in the body
+    # would have the two bots addressing each other until the pair budget
+    # stopped them (three answers each, not one). That loop is G3's gate.
     await post(
         human,
         room_s3,
-        f"{S3_BOT_A} {S3_BOT_B} now I am asking you",
+        "now I am asking you",
         mentions=[S3_BOT_A, S3_BOT_B],
     )
     events = await wait_for(

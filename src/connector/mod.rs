@@ -845,6 +845,7 @@ fn last_speaker(recent: &[RoomEvent], ev: &RoomEvent) -> Option<LastSpeaker> {
                 && thread.is_none_or(|root| other.thread_root_or_self() == root)
         })
         .map(|other| LastSpeaker {
+            event_id: other.event_id.clone(),
             sender: other.sender.clone(),
             ts: other.ts,
             conversation: other.thread_root_or_self().to_owned(),

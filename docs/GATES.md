@@ -2577,3 +2577,33 @@ ledger::tests::a_redaction`: 36 passed).
 - **The budgets' counters and `posts`.** A redacted post stays counted. The
   budgets count how much the agent has SAID, and a message being deleted does not
   hand it a fresh licence to talk.
+
+## The follow-up after an uninvited line, 2026-09-06
+
+Found by re-running G1-G12 on rc.5 before merging the rc.6 slices, which no
+release since rc.2 had done: PRs 5-9 each re-ran the gates they touched (G5-G8,
+N1-N4, C-1..4) and G9 and G11 had been red since rc.3 without anybody knowing.
+The rc.6 slice A run, and a control run of the same three gates on a main-built
+binary, failed identically.
+
+| Gate | On rc.5 | Cause |
+|---|---|---|
+| G2 | the two echo bots answered the alive-check three times each, not once | the gate's alive-check carried both bot ids in its BODY; since rc.3 an `@id` typed in the body is an address, and the echo brain repeats the body, so the bots addressed each other until the pair budget stopped them. A stale gate, not a defect: the bounded loop is G3's subject. The alive-check now addresses by `m.mentions` alone. |
+| G9 | "back at my desk" was answered; the second waiting impulse never spoke | the follow-up arm (3f): the agent had spoken last (its impulse) and a human line arrived inside 120 s |
+| G11 | the agent spoke twice off one accumulation | the same: the inner thought was the agent's last line, and the next human line became a follow-up |
+
+**Fix.** `LastSpeaker` carries the event id and `policy::follow_up` requires the
+ledger's record of THAT event to be tier 1 or 2. An unprompted (tier 3) line is
+not the first half of an exchange.
+
+| Unit gate | Proves |
+|---|---|
+| `policy::a_line_after_my_unprompted_post_is_not_a_follow_up` | after a tier-3 post the next human line is `consider`, after a tier-2 answer it is `reply` |
+| `policy::a_follow_up_is_broken_by_any_other_speaker` (revised) | the ledger must hold the exact line the transcript says was mine |
+
+**Teeth.** With `&& post.tier != 3` removed from the guard, the new gate fails
+(`an impulse claimed the next human line as a follow-up: follow-up: I spoke
+last here 3 s ago`); restored, it passes.
+
+**Live.** G1-G12 and N1-N4 re-run on the musl binary after the fix; recorded
+in the rc.6 release entry below.

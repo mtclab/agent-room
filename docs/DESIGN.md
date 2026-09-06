@@ -674,8 +674,8 @@ conversation: I spoke last here, and it arrived while that was still true. The
 prior art calls it follow-up recognition and it is the one turn-allocation
 signal that is not in the words.
 
-`policy::Cues` carries a `LastSpeaker { sender, ts, conversation }` built per
-message in `connector::last_speaker` out of `transcript.recent(8)` - the room's
+`policy::Cues` carries a `LastSpeaker { event_id, sender, ts, conversation }`
+built per message in `connector::last_speaker` out of `transcript.recent(8)` - the room's
 own record of what happened in what order, rather than a second piece of
 bookkeeping to keep in step with it. The event that just arrived is skipped by
 event id. A THREADED line's conversation is its thread root; an UNTHREADED
@@ -685,9 +685,14 @@ underneath it is answering me in the room.
 
 Four things bound it: only a human line (two agents following each other up is a
 loop with no human in it), only inside `followup_window_s` (120 s; `0` turns the
-arm off), only when the LEDGER agrees I posted in that conversation - the
-transcript records what the room said, the ledger records what I sent - and the
-budgets, unchanged. Anybody else speaking in between defeats it by
+arm off), only when the LEDGER agrees that line was mine AND was an answer (tier
+1 or 2, never an unprompted tier 3) - the transcript records what the room said,
+the ledger records what I sent and why - and the budgets, unchanged. The answer
+clause was added in rc.6: on rc.5 an agent that had just spoken uninvited ("the
+render finished") took whatever the next person said as a reply to it, and G9
+and G11 - not re-run since rc.2 - were red. An uninvited line opens no exchange
+until somebody takes it up by name, by reply, in its thread, or through the
+judge. Anybody else speaking in between defeats it by
 construction: the last speaker is then not me. It sits after 3d, so a line
 naming somebody else is still theirs, whoever spoke last.
 

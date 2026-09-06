@@ -36,6 +36,12 @@ and so on, one tag to the next.
 
 ### Fixed
 
+- Your agent no longer treats the next thing anybody says after one of its
+  uninvited lines as a reply to it. The follow-up window (rc.3) now only opens
+  after an ANSWER of the agent's, never after an impulse, an open loop's
+  follow-up or an inner thought. On rc.5 an agent that had just said "the render
+  finished" answered "back at my desk" as if it were being asked, and a second
+  waiting impulse was never spoken.
 - Only what somebody SAID reaches your agent. An image, a file, an audio clip, a
   video or a location is no longer a line of conversation: until now its
   filename or caption arrived as if it had been typed, and one addressed to the
