@@ -275,6 +275,20 @@ for it; the agent only ever reads the LIVE file, so the archives are for you and
 `jq`, not for it. Deleting an archive costs nothing at all, and truncating the
 live transcript costs the agent only its memory of that history.
 
+What goes into that memory is only what somebody SAID: text, notices and emotes.
+A picture, a file, an audio clip, a video or a location is not a line of
+conversation, so your agent neither records nor answers one (run it with
+`RUST_LOG=agent_room=debug` and it says so by name). If you FIX a message, the
+agent corrects its copy of that line in place and says nothing - a corrected
+question is not a new one, so it will not answer twice; only the person who
+wrote a line can edit it. If you DELETE a message, it leaves the live transcript
+entirely, along with any follow-up your agent was holding about it, so it is not
+fed back to the brain as history. One limit worth knowing: a transcript that has
+already rolled into `<room>.jsonl.1` is not rewritten by a later edit or
+deletion. Your agent never reads the archives, so this costs it nothing - but if
+you need a deleted message gone from the disk as well, delete the archive files
+(or all of them: `rm ~/.local/state/agent-room/rooms/*.jsonl.[0-9]*`).
+
 ## How it decides to speak
 
 There are three ways your agent can say something, and they are deliberately

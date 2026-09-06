@@ -415,6 +415,79 @@ archive is a transcript, and a Python-era state directory is picked up exactly a
 it was. `transcript_keep: 0` restores the old unbounded behaviour for anybody who
 wants it.
 
+### What is a line of conversation (BUILT 2026-09-06, rc.6)
+
+A room carries more than talk: pictures, files, audio clips, videos, locations,
+reactions, membership changes, and the husks redaction leaves behind. Only
+`m.text`, `m.notice` and `m.emote` with a non-empty body are things somebody
+SAID, and only those reach the transcript, the policy and the brain.
+
+The filter (`events::skip_reason`, which `is_message_source` is now one line of)
+had existed since the MCP server was built and the connector did not use it: it
+accepted any `m.room.message` that had a msgtype at all. So an image arrived as
+its filename and a location as its caption, and one ADDRESSED to the agent went
+straight down tier 1 - the agent answered "IMG_4021.png" as if it were a
+question. Everything the connector drops is logged at DEBUG with the reason
+("m.image is not a line of conversation"), because the operator's question when
+a picture is met with silence is "did it see it?".
+
+Images and files reaching the brain as content is a real feature and it is
+listed after 1.0.0 (multimodal context). This is not that; this is the filename
+posing as a sentence.
+
+### Corrections: edits and redactions (BUILT 2026-09-06, rc.6)
+
+Two events are not new lines. They change - or take away - something the agent
+has already seen, and both are applied to the memory and to nothing else.
+
+**An edit (`m.replace`) replaces the transcript line.** `m.new_content`'s body,
+formatted body and mentions overwrite the target record's in place; the
+`* corrected text` fallback the event carries for clients that cannot render an
+edit is never read and never becomes history. An edit is never answered, never
+counts as somebody speaking (so it moves neither the presence window nor the
+follow-up arm), never reaches the policy or the brain, and is not a new speaker
+in the stand-down re-read either.
+
+- **An edit to a message the agent has already answered is not answered again.**
+  DECIDED: the transcript is corrected and nothing else happens. The alternative
+  - re-running the turn on the corrected text - would post a second answer to
+  one question, spend a second budget slot on it, and do so at a moment nobody
+  in the room is looking, because fixing a typo is not asking again. If the
+  correction changes the question enough to want an answer, the person asks.
+- **Only the author of a line may edit it.** A homeserver will carry an
+  `m.replace` that points at somebody else's event; taking one would let anybody
+  in the room rewrite what anybody else said and then hand it to the brain as
+  history. The sender must match the record's, or the edit is dropped.
+- **An edit of a line that is not in the live transcript is dropped silently.**
+  It has rolled away, or the agent never saw it. There is nothing to correct and
+  nothing to say.
+
+**A redaction (`m.room.redaction`) removes the event.** Every record of the
+redacted event leaves the live transcript - the line as it was seen, and the
+agent's own copy when what was redacted is something it posted - so nothing
+feeds it back to the brain as history. In the ledger, the one thing that stores
+what was said is an open loop's text (what a follow-up is ABOUT): that text is
+erased and the loop is closed, because a message somebody deleted must not come
+back an hour later in the agent's own voice. Any follow-up already queued for it
+is dropped. The event id stays in the consumed list as a marker - it is how the
+connector knows it has handled this - and the budgets' counters are untouched:
+they count posts, not words.
+
+Both corrections rewrite the live file the way the ledger writes itself: a fresh
+0600 file beside it, `fsync`ed, renamed over the live name, so a crash in the
+middle leaves the transcript exactly as it was and no reader meets a
+half-written one. A rewrite that changes nothing does not touch the file at all,
+and a line this build cannot parse is copied through rather than dropped.
+
+**Known limit: archived transcripts (`<room>.jsonl.1` and beyond) are NOT
+rewritten.** An edit or a redaction of a message that has already rolled out of
+the live file leaves the archive as it was. The archives are a record of what
+happened, are never read back by the agent (`recent()` and `thread()` read the
+live file only, which is the whole point of the cap), and rewriting a year of
+history on every redaction would be a different feature. Anybody who needs the
+archives scrubbed deletes them; it costs the agent nothing, because it never
+reads them.
+
 ### Speaking policy (the crux, where "organic" lives)
 
 BUILT 2026-09-02 (S1 tier 1, S3 tiers 2 and 3). `policy.should_reply` is pure and

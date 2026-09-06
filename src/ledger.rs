@@ -455,6 +455,36 @@ impl Ledger {
         }
     }
 
+    /// Forget the text of an event somebody has redacted.
+    ///
+    /// The ledger keeps one piece of what was said: the text of an open loop,
+    /// which is what a follow-up is ABOUT. A redacted message must not come
+    /// back an hour later in the agent's own voice, so the text goes and the
+    /// loop closes with it - a promise about a message that no longer exists is
+    /// not a promise worth keeping. The event id stays: it is how the ledger
+    /// knows it has already handled this.
+    ///
+    /// Returns the loops it emptied, so the caller can drop any follow-up
+    /// waiting on one.
+    pub fn redact_event(&mut self, event_id: &str) -> Vec<Loop> {
+        let mut emptied = Vec::new();
+        for loop_ in &mut self.loops {
+            if loop_.event_id != event_id {
+                continue;
+            }
+            loop_.text.clear();
+            if loop_.state != STATE_CLOSED {
+                STATE_CLOSED.clone_into(&mut loop_.state);
+                "the message was redacted".clone_into(&mut loop_.reason);
+            }
+            emptied.push(loop_.clone());
+        }
+        if !emptied.is_empty() {
+            self.save();
+        }
+        emptied
+    }
+
     /// Somebody came back to this thread, so I do not have to.
     ///
     /// Both open and already-raised loops close: if a follow-up is in flight
@@ -998,6 +1028,36 @@ mod tests {
         assert_eq!(loop_.state, "raised");
         assert!((loop_.due_ts - 42.0).abs() < f64::EPSILON);
         assert_eq!(loop_.thread_root, "$root");
+    }
+
+    #[test]
+    fn a_redaction_empties_the_loop_and_survives_a_restart_that_way() {
+        // The text of an open loop is the one thing the ledger keeps of what
+        // was said, and a follow-up would say it back to the room. It goes when
+        // the message goes - on disk, not only in memory.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let clock = FakeClock::new();
+        {
+            let mut ledger = ledger(dir.path(), &clock, BudgetsConfig::default());
+            ledger.open_loop("$mine", "$root", "the thing I should not have asked", 42.0);
+            let emptied = ledger.redact_event("$mine");
+            assert_eq!(emptied.len(), 1);
+            assert!(
+                ledger.due_loops(1_000_000_000.0).is_empty(),
+                "a redacted loop is still due"
+            );
+            assert_eq!(ledger.redact_event("$nothing-of-mine").len(), 0);
+        }
+        let reloaded = ledger(dir.path(), &clock, BudgetsConfig::default());
+        let loop_ = reloaded
+            .loop_by_event("$mine")
+            .expect("the loop is on record");
+        assert!(
+            loop_.text.is_empty(),
+            "the redacted text came back from disk"
+        );
+        assert_eq!(loop_.state, STATE_CLOSED);
+        assert_eq!(loop_.reason, "the message was redacted");
     }
 
     #[test]

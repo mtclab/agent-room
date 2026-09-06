@@ -16,6 +16,12 @@ and so on, one tag to the next.
 
 ### Added
 
+- Edits are understood. When somebody fixes a message (`m.replace`), your agent
+  corrects that line in its transcript in place and does nothing else: a
+  corrected question is not a new one, so it is not answered again, it does not
+  count as somebody speaking, and the `* corrected text` fallback never becomes
+  history. Only the person who wrote a line can edit it, and an edit of a line
+  that has already rolled out of the live transcript is dropped.
 - This changelog. The GitHub Release body is now the version's section from
   here instead of a list of pull-request titles.
 - `docs/ROADMAP.md`: what 1.0.0 means, what each remaining release candidate has
@@ -30,6 +36,17 @@ and so on, one tag to the next.
 
 ### Fixed
 
+- Only what somebody SAID reaches your agent. An image, a file, an audio clip, a
+  video or a location is no longer a line of conversation: until now its
+  filename or caption arrived as if it had been typed, and one addressed to the
+  agent was answered as a question. Each skipped event says why at DEBUG
+  (`RUST_LOG=agent_room=debug`).
+- A deleted message is forgotten. On a redaction, every record of that event
+  leaves the live transcript and any follow-up your agent was holding about it
+  is dropped, so it is no longer fed back to the brain as history until the file
+  happens to roll. Transcripts that have already rolled into `<room>.jsonl.N`
+  are not rewritten - your agent never reads them, and deleting them costs it
+  nothing.
 - `examples/docker/compose.yaml`: the commented-out pull line named rc.3; it now
   names the current release.
 

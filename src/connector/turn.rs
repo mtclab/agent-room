@@ -37,7 +37,8 @@ use crate::presence::PresenceBook;
 
 use super::unprompted::{self, Candidate};
 use super::{
-    LAST_SPEAKER_TAIL, RoomWorker, WorkerState, last_speaker, normalise_event, rules_from,
+    LAST_SPEAKER_TAIL, RoomWorker, WorkerState, last_speaker, normalise_event, read_source,
+    rules_from,
 };
 
 /// How often the typing indicator is refreshed while a brain is thinking. The
@@ -593,10 +594,19 @@ impl Runner {
         };
         let mut out = Vec::with_capacity(chunk.len());
         for raw in &chunk {
+            let Some(source) = read_source(raw.raw().json().get()) else {
+                continue;
+            };
+            // A correction is not somebody answering: an edit of a line that
+            // was already there must not read as a new one, here least of all -
+            // this list is what decides whether to stand down.
+            if crate::events::correction_from(&source).is_some() {
+                continue;
+            }
             if let Some(ev) = normalise_event(
                 Some(&room),
                 room_id,
-                raw.raw().json().get(),
+                &source,
                 rules_from(&self.bot_user_ids, &self.bot_patterns),
             )
             .await
@@ -764,17 +774,16 @@ mod tests {
 
     use super::*;
     use std::collections::HashSet;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::brain::Judgement;
     use crate::config::PolicyConfig;
-    use crate::connector::testkit::{self, FakeClock};
+    use crate::connector::testkit::{self, FakeClock, config};
     use crate::events::{RoomEvent, from_source};
     use crate::policy::{Cues, Decision, should_reply};
     use crate::transcript::Transcript;
 
-    const ME: &str = "@bot-a:example.com";
+    const ME: &str = testkit::ME;
     const HUMAN: &str = "@human:example.com";
     /// The line from the room log this whole path exists for: it selects
     /// nobody, hands the turn to the room, and asks it something.
@@ -815,26 +824,6 @@ mod tests {
         async fn judge(&self, _ctx: &BrainContext) -> Judgement {
             self.judged.fetch_add(1, Ordering::SeqCst);
             Judgement::no("this judge refuses everything")
-        }
-    }
-
-    fn config(policy: PolicyConfig, state_dir: &Path) -> Config {
-        Config {
-            homeserver: "http://127.0.0.1:1".to_owned(),
-            user_id: ME.to_owned(),
-            access_token_file: None,
-            password: None,
-            rooms: vec![testkit::ROOM_ID.to_owned()],
-            persona_file: None,
-            state_dir: state_dir.to_path_buf(),
-            brain: None,
-            policy,
-            mcp: crate::config::McpConfig::default(),
-            tls: crate::config::TlsConfig::default(),
-            history_limit: crate::config::default_history_limit(),
-            transcript_keep: crate::transcript::DEFAULT_KEEP,
-            transcript_archives: crate::transcript::DEFAULT_ARCHIVES,
-            allow_wedged_device: false,
         }
     }
 
