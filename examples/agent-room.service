@@ -28,6 +28,12 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=10
+# Exit 3 is "this device is wedged": the token's device published its encryption
+# keys from a store this one is not, so every start ends the same way and only a
+# person can fix it (docs/ONBOARDING.md, "Back it up"). Without this line the
+# unit retries that every ten seconds for ever, which is a busy log and a
+# homeserver being knocked on by an agent that can never work.
+RestartPreventExitStatus=3
 NoNewPrivileges=yes
 
 [Install]

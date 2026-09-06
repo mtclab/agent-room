@@ -28,6 +28,8 @@ services:
     # SIGTERM lets an in-flight reply finish and the ledgers flush.
     stop_grace_period: 30s
     # A wedged device exits 3 and must NOT be restarted in a loop: read the log.
-    # compose has no per-code policy, so RestartSec-like backoff is the guard.
+    # compose has no per-exit-code policy (systemd has RestartPreventExitStatus),
+    # so the choice is `restart: on-failure:5` or watching for the line. README,
+    # "Exit code 3 restarts for ever under compose".
     healthcheck:
       disable: true

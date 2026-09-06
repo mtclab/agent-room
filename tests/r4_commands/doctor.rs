@@ -33,14 +33,23 @@ fn config(dir: &Path, homeserver: &str) -> Config {
     if !token.exists() {
         agent_room::config::write_secret_file(&token, "syt_fake").expect("the token");
     }
+    // A config as `init` leaves it: the state directory made 0700 and a persona
+    // written. Both are rows of their own now, and the happy path is the one
+    // that has to show them passing.
+    let state = dir.join("state");
+    agent_room::config::create_private_dir(&state).expect("the state dir");
+    let persona = dir.join("persona.md");
+    if !persona.exists() {
+        std::fs::write(&persona, "I am a test agent.\n").expect("the persona");
+    }
     Config {
         homeserver: homeserver.to_owned(),
         user_id: ME.to_owned(),
         access_token_file: Some(token),
         password: None,
         rooms: vec![ROOM_ID.to_owned()],
-        persona_file: None,
-        state_dir: dir.join("state"),
+        persona_file: Some(persona),
+        state_dir: state,
         brain: Some(BrainConfig {
             kind: BrainKind::Echo,
             openai_compat: None,
@@ -96,7 +105,9 @@ async fn a_config_that_will_work_passes_every_row() {
             "brain".to_owned(),
             "device".to_owned(),
             "homeserver".to_owned(),
+            "persona".to_owned(),
             room_row(),
+            "state_dir".to_owned(),
             "token".to_owned(),
             "token file".to_owned(),
         ]
@@ -206,6 +217,175 @@ async fn the_tls_key_is_held_to_the_same_rule() {
     std::fs::set_permissions(&key, PermissionsExt::from_mode(0o640)).expect("chmod");
     let checks = named(Doctor::new(&cfg, Path::new(CONFIG_PATH), None).check_permissions());
     assert_eq!(checks["tls key"], Status::Fail);
+}
+
+// -- the state directory and the persona -------------------------------------
+
+/// The local rows, by name, with no homeserver in the picture at all.
+fn local(cfg: &Config) -> BTreeMap<String, Check> {
+    Doctor::new(cfg, Path::new(CONFIG_PATH), None)
+        .check_local()
+        .into_iter()
+        .map(|check| (check.name.clone(), check))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_state_directory_anybody_can_read_fails_with_chmod_700() {
+    // Teeth: it holds the crypto store (this device's identity), the
+    // transcripts of every room and the budgets. 0755 on it is every one of
+    // those readable by anyone with an account on the machine, and nothing else
+    // in the table would say a word about it.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "https://matrix.example.com");
+    std::fs::set_permissions(&cfg.state_dir, PermissionsExt::from_mode(0o755)).expect("chmod");
+    let checks = local(&cfg);
+    assert_eq!(checks["state_dir"].status, Status::Fail, "{checks:?}");
+    assert!(checks["state_dir"].detail.contains("0755"), "{checks:?}");
+    assert!(checks["state_dir"].fix.contains("chmod 700"), "{checks:?}");
+    assert_eq!(
+        exit_code(&checks.values().cloned().collect::<Vec<Check>>()),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_state_directory_that_is_not_there_yet_skips_rather_than_failing() {
+    // `doctor` before the first `run` is the normal case, and `run` creates it.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "https://matrix.example.com");
+    std::fs::remove_dir_all(&cfg.state_dir).expect("rmdir");
+    let checks = local(&cfg);
+    assert_eq!(checks["state_dir"].status, Status::Skip);
+    assert!(checks["state_dir"].detail.contains("not there yet"));
+}
+
+#[tokio::test]
+async fn a_state_dir_that_is_a_file_fails() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = config(dir.path(), "https://matrix.example.com");
+    let file = dir.path().join("not-a-directory");
+    std::fs::write(&file, "oops").expect("write");
+    cfg.state_dir = file;
+    let checks = local(&cfg);
+    assert_eq!(checks["state_dir"].status, Status::Fail);
+    assert!(checks["state_dir"].detail.contains("not a directory"));
+}
+
+#[tokio::test]
+async fn a_state_directory_this_user_cannot_write_fails() {
+    // The point of writing a probe file rather than reading the mode: an agent
+    // that cannot write its ledger forgets what it consumed and answers the
+    // room twice after every restart, and the mode bits alone never say so.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "https://matrix.example.com");
+    std::fs::set_permissions(&cfg.state_dir, PermissionsExt::from_mode(0o500)).expect("chmod");
+    let really_read_only = std::fs::write(cfg.state_dir.join("probe"), b"x").is_err();
+    let checks = local(&cfg);
+    if really_read_only {
+        assert_eq!(checks["state_dir"].status, Status::Fail, "{checks:?}");
+        assert!(checks["state_dir"].detail.contains("not writable"));
+    } else {
+        // Running as root, where the mode bits are advice. Then the row is
+        // telling the truth by passing: this user CAN write there.
+        assert_eq!(checks["state_dir"].status, Status::Pass, "{checks:?}");
+    }
+    std::fs::set_permissions(&cfg.state_dir, PermissionsExt::from_mode(0o700)).expect("chmod");
+}
+
+#[tokio::test]
+async fn the_probe_file_does_not_stay_behind() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "https://matrix.example.com");
+    assert_eq!(local(&cfg)["state_dir"].status, Status::Pass);
+    let left: Vec<PathBuf> = std::fs::read_dir(&cfg.state_dir)
+        .expect("readable")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert!(left.is_empty(), "doctor left something behind: {left:?}");
+}
+
+#[tokio::test]
+async fn a_persona_that_cannot_be_read_or_is_empty_fails() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = config(dir.path(), "https://matrix.example.com");
+    let persona = cfg.persona_file.clone().expect("a persona file");
+    assert_eq!(local(&cfg)["persona"].status, Status::Pass);
+
+    std::fs::write(&persona, "   \n\n").expect("write");
+    let checks = local(&cfg);
+    assert_eq!(checks["persona"].status, Status::Fail, "{checks:?}");
+    assert!(checks["persona"].detail.contains("is empty"));
+
+    std::fs::remove_file(&persona).expect("unlink");
+    let checks = local(&cfg);
+    assert_eq!(checks["persona"].status, Status::Fail);
+    assert!(
+        checks["persona"]
+            .detail
+            .contains(&persona.display().to_string())
+    );
+
+    cfg.persona_file = None;
+    assert_eq!(
+        local(&cfg)["persona"].status,
+        Status::Skip,
+        "no persona_file at all is a legitimate config"
+    );
+}
+
+// -- the two warnings --------------------------------------------------------
+
+#[tokio::test]
+async fn tls_verification_off_is_a_warning_and_the_run_still_passes() {
+    // Teeth: with `verify: false` the connector hands this account's token to
+    // whatever answers, and every other row in the table still says PASS.
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = config(dir.path(), &home.base_url);
+    cfg.tls.verify = false;
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["tls"].status, Status::Warn, "{checks:?}");
+    assert!(checks["tls"].detail.contains("tls.verify"));
+    assert!(checks["tls"].fix.contains("tls.verify: true"));
+    assert_eq!(code(&checks), 0, "a warning is not a failure");
+}
+
+#[test]
+fn the_loose_permission_hatch_is_a_warning_row_when_it_is_in_force() {
+    // The flag rather than the environment, so this says nothing about the
+    // variable every other test in the suite depends on being unset.
+    let row = agent_room::doctor::perms_hatch(true).expect("the hatch is a row");
+    assert_eq!(row.status, Status::Warn);
+    assert_eq!(row.name, "perms");
+    assert!(
+        row.detail
+            .contains(agent_room::config::ALLOW_LOOSE_PERMS_ENV)
+    );
+    assert!(row.fix.contains("chmod 600"));
+    assert!(
+        agent_room::doctor::perms_hatch(false).is_none(),
+        "no hatch, no row"
+    );
+}
+
+#[test]
+fn a_warning_prints_its_fix_and_is_counted_apart_from_the_failures() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "https://matrix.example.com");
+    let checks = vec![
+        Check::pass("token file", "0600"),
+        Check::warn("perms", "the hatch is set", "unset it"),
+    ];
+    let report = format_report(&cfg, Path::new(CONFIG_PATH), &checks);
+    assert!(report.contains("WARN  perms"), "{report}");
+    assert!(report.contains("fix: unset it"), "{report}");
+    assert!(
+        report.contains("1 passed, 0 failed, 0 skipped, 1 warned"),
+        "{report}"
+    );
+    assert_eq!(exit_code(&checks), 0);
 }
 
 // -- the homeserver ----------------------------------------------------------
@@ -589,6 +769,103 @@ async fn a_key_protected_endpoint_fails_without_the_key() {
     let checks = rows(&cfg, Some(&home)).await;
     assert_eq!(checks["brain"].status, Status::Fail);
     assert!(checks["brain"].detail.contains("401"));
+}
+
+// -- the judge ---------------------------------------------------------------
+
+/// The judge's knobs, on a config that already has an openai brain.
+fn with_judge(cfg: &mut Config, base_url: &str, model: &str, api_key: &str) {
+    let openai = cfg
+        .brain
+        .as_mut()
+        .and_then(|brain| brain.openai_compat.as_mut())
+        .expect("openai_compat section");
+    base_url.clone_into(&mut openai.judge_base_url);
+    model.clone_into(&mut openai.judge_model);
+    api_key.clone_into(&mut openai.judge_api_key);
+}
+
+#[tokio::test]
+async fn a_judge_that_shares_the_brain_is_not_a_row_of_its_own() {
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start().await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    let checks = rows(&cfg, Some(&home)).await;
+    assert!(
+        !checks.contains_key("judge"),
+        "the brain row already IS that endpoint and that model: {checks:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_judge_endpoint_that_is_down_fails_on_its_own_row() {
+    // Teeth: the reply model answers, so `brain` is green and the table says
+    // the config works - and the agent never speaks unprompted at all, because
+    // every tier-2 line asks the judge first and the judge is not there. This
+    // is the row that tells a friend which of the two endpoints it is.
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start().await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    with_judge(&mut cfg, "http://127.0.0.1:1/v1", "", "");
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["brain"].status, Status::Pass, "{checks:?}");
+    assert_eq!(checks["judge"].status, Status::Fail, "{checks:?}");
+    assert!(
+        checks["judge"]
+            .detail
+            .contains("http://127.0.0.1:1/v1/models")
+    );
+    assert!(checks["judge"].fix.contains("judge_base_url"));
+    assert_eq!(code(&checks), 1);
+}
+
+#[tokio::test]
+async fn a_judge_on_its_own_endpoint_is_asked_with_its_own_key() {
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start().await;
+    let judge = ModelsEndpoint::start_with_key(Some("judge-key")).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    with_judge(&mut cfg, &judge.base_url, "qwen3", "judge-key");
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["judge"].status, Status::Pass, "{checks:?}");
+    assert!(checks["judge"].detail.contains(&judge.base_url));
+
+    // And without it, the same endpoint refuses: the key that is sent is the
+    // judge's own, never the reply endpoint's.
+    let mut wrong = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    wrong
+        .brain
+        .as_mut()
+        .and_then(|brain| brain.openai_compat.as_mut())
+        .expect("openai_compat section")
+        .api_key = "judge-key".to_owned();
+    with_judge(&mut wrong, &judge.base_url, "qwen3", "");
+    let checks = rows(&wrong, Some(&home)).await;
+    assert_eq!(checks["judge"].status, Status::Fail, "{checks:?}");
+    assert!(checks["judge"].detail.contains("401"));
+}
+
+#[tokio::test]
+async fn a_judge_model_the_endpoint_does_not_serve_fails_on_the_judge_row() {
+    // A judge model of its own on the SAME endpoint: the row is that endpoint
+    // asked about that model, which is the mistake it exists to catch.
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| state.joined_rooms = vec![ROOM_ID.to_owned()]);
+    let models = ModelsEndpoint::start().await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = openai_config(dir.path(), &home.base_url, &models.base_url, "qwen3");
+    with_judge(&mut cfg, "", "qwen3-tiny", "");
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks["brain"].status, Status::Pass);
+    assert_eq!(checks["judge"].status, Status::Fail, "{checks:?}");
+    assert!(checks["judge"].detail.contains("qwen3-tiny"));
+    assert!(checks["judge"].detail.contains("it has qwen3"));
 }
 
 fn write_fake_claude(dir: &Path, version: &str, code: i32) -> PathBuf {

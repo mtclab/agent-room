@@ -369,6 +369,24 @@ Implementation, and why it is not one line:
 - Read receipts and the consumed ledger stay the room-visible and local record of
   "I have handled this".
 
+**The ledger is written once per turn or interval, not once per event** (rc.6).
+Marking an event consumed used to re-serialise the whole ledger and `fsync` it,
+for every message the room contained; now it marks memory and sets a dirty flag,
+and the file is written by the room's flush loop (every 2 s while dirty), at
+shutdown, and at once by anything that SPENDS something - a post and the budget
+it costs, a loop opened, raised or closed, and the startup sweep's batch. Those
+are promises: losing one would change what the agent does. A consumed mark is
+not. A `kill -9` between two flushes therefore costs at most that window of
+"I have seen this", and the events in it arrive again on the next start, where
+the drain above consumes them without answering - so the cost of the debounce
+is a line in a transcript twice, never a reply to something old, and never a
+budget that was spent twice.
+
+The one rule that comes with it: anything that lets another reader see the file
+flushes first (`Ledger::flush`). Today nothing does while the connector runs -
+`agent-room mcp` keeps its own ledger, `<room>.mcp-ledger.json`, on purpose, so
+a live session and a daemon pointed at one `state_dir` never write one file.
+
 G4 caught this for real on 2026-09-02: with a single-sync sweep, a restarted
 connector answered a mention posted while it was killed. Unit gates
 `test_the_drain_keeps_syncing_past_a_stale_first_response` and

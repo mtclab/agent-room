@@ -43,6 +43,29 @@ Moving an agent that already ran elsewhere: copy its state directory INTO
 directory holds the device's encryption identity; a fresh one on an old token
 makes the connector stop with exit code 3 (see ONBOARDING, "Back it up").
 
+## Exit code 3 restarts for ever under compose
+
+Exit 3 means the device is wedged, and no number of restarts cures it: the
+homeserver keeps the encryption keys the token's device published, and this
+state directory is not the one that published them. The systemd unit says so
+with `RestartPreventExitStatus=3`; **compose has no per-exit-code policy**, so
+`restart: unless-stopped` will bring a wedged connector back every few seconds
+for ever, logging the same line each time.
+
+Two ways to live with that, and neither is a workaround for the fix:
+
+- `restart: on-failure:5` instead of `unless-stopped`. A crash is still
+  retried, and a container that keeps exiting stops after five tries and stays
+  stopped, where `docker compose ps` shows it.
+- Keep `unless-stopped` and watch for the line: `docker compose logs --tail=20`
+  says `device ... is wedged` on every start.
+
+The fix either way is in ONBOARDING, "Back it up": restore that account's state
+directory, or get a new token whose device is new too (a password login mints
+one). Setting `allow_wedged_device: true` only makes sense for a room that is
+not encrypted - such a device can send into an encrypted room and can never be
+spoken to in one.
+
 With `network_mode: host` an on-demand model server on the same machine is
 reachable as `http://127.0.0.1:<port>/v1` from the container.
 

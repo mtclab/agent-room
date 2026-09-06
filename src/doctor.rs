@@ -20,7 +20,9 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::config::{BrainKind, Config, require_private_mode};
+use crate::config::{
+    ALLOW_LOOSE_PERMS_ENV, BrainKind, Config, loose_perms_allowed, require_private_mode,
+};
 use crate::cs_api::{CommandClient, CsError, authenticate};
 use crate::matrix::{self, DeviceCheck, WEDGE_CURE};
 
@@ -41,6 +43,10 @@ pub enum Status {
     Pass,
     Fail,
     Skip,
+    /// It works, and somebody should know about it anyway: an escape hatch that
+    /// is in force, a check that has been turned off. Never changes the exit
+    /// code - a warning that fails a script is a warning nobody keeps.
+    Warn,
 }
 
 impl Status {
@@ -50,6 +56,7 @@ impl Status {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
             Self::Skip => "SKIP",
+            Self::Warn => "WARN",
         }
     }
 }
@@ -97,6 +104,22 @@ impl Check {
             fix: fix.into(),
         }
     }
+
+    /// A row that does not fail the run but says something out loud. The `fix`
+    /// is "how to make this row go away", and it prints like a failure's.
+    #[must_use]
+    pub fn warn(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: Status::Warn,
+            detail: detail.into(),
+            fix: fix.into(),
+        }
+    }
 }
 
 /// Runs the checks. Every network call goes through the injected client.
@@ -117,6 +140,26 @@ impl<'a> Doctor<'a> {
     }
 
     // -- permissions -----------------------------------------------------
+
+    /// Everything that can be answered without a homeserver: the secrets on
+    /// disk, the state directory, the persona, and the two escape hatches that
+    /// silently change what the rest of the rows mean.
+    ///
+    /// It runs whatever else happens - a homeserver that never answers must not
+    /// hide a state directory the world can read.
+    #[must_use]
+    pub fn check_local(&self) -> Vec<Check> {
+        let mut checks = self.check_permissions();
+        checks.push(self.check_state_dir());
+        checks.push(self.check_persona());
+        if let Some(warning) = perms_hatch(loose_perms_allowed()) {
+            checks.push(warning);
+        }
+        if let Some(warning) = self.check_tls_verify() {
+            checks.push(warning);
+        }
+        checks
+    }
 
     /// The secrets on disk: whoever can read them can be this account.
     #[must_use]
@@ -142,6 +185,107 @@ impl<'a> Doctor<'a> {
             ));
         }
         checks
+    }
+
+    /// The state directory: there, private, and writable BY THIS USER.
+    ///
+    /// Three different silences hide in this one row. A directory the connector
+    /// cannot write is an agent that never remembers what it consumed and
+    /// answers the room twice after every restart; a directory group or other
+    /// can read is the crypto store, the transcripts and the budgets readable
+    /// by anyone on the machine; and a `state_dir:` with a typo in it is a
+    /// second agent's worth of state in a place nobody backs up.
+    ///
+    /// Writable is PROVEN by writing: a mode says what the bits are, not what
+    /// this user may do on this filesystem (a read-only mount, a full disk and
+    /// somebody else's directory all answer the same way).
+    fn check_state_dir(&self) -> Check {
+        let dir = &self.cfg.state_dir;
+        let name = "state_dir";
+        let shown = dir.display();
+        if !dir.exists() {
+            return Check::skip(
+                name,
+                format!("{shown} is not there yet; `run` creates it 0700"),
+            );
+        }
+        if !dir.is_dir() {
+            return Check::fail(
+                name,
+                format!("{shown} is not a directory"),
+                "point state_dir: at a directory this account owns",
+            );
+        }
+        if let Err(exc) = require_private_mode(dir, name) {
+            return Check::fail(
+                name,
+                exc.to_string(),
+                format!(
+                    "chmod 700 {shown} - it holds the crypto store, the transcripts and the budgets"
+                ),
+            );
+        }
+        let probe = dir.join(format!(".doctor-probe.{}", std::process::id()));
+        if let Err(exc) = std::fs::write(&probe, b"agent-room doctor\n") {
+            return Check::fail(
+                name,
+                format!("{shown} is not writable: {exc}"),
+                "give this account write access to state_dir, or point it somewhere it has",
+            );
+        }
+        if let Err(exc) = std::fs::remove_file(&probe) {
+            debug!(
+                "could not remove the state_dir probe {}: {exc}",
+                probe.display()
+            );
+        }
+        Check::pass(name, format!("{shown} is 0700 and writable"))
+    }
+
+    /// The persona: the file that decides what the agent sounds like.
+    ///
+    /// An unreadable persona stops `run` at start-up, and an empty one is an
+    /// agent with nothing to be - both are worth knowing before the room finds
+    /// out. No `persona_file:` at all is a legitimate config (the brain gets no
+    /// persona), so that skips rather than fails.
+    fn check_persona(&self) -> Check {
+        let name = "persona";
+        let Some(path) = &self.cfg.persona_file else {
+            return Check::skip(name, "no persona_file: the brain is given none");
+        };
+        match self.cfg.read_persona() {
+            Err(exc) => Check::fail(
+                name,
+                exc.to_string(),
+                format!("create {} and make it readable", path.display()),
+            ),
+            Ok(text) if text.is_empty() => Check::fail(
+                name,
+                format!("{} is empty", path.display()),
+                "write who this agent is in it (`init` leaves a template)",
+            ),
+            Ok(text) => Check::pass(
+                name,
+                format!("{} is {} characters", path.display(), text.chars().count()),
+            ),
+        }
+    }
+
+    /// TLS with verification off: the connection is encrypted and it is not
+    /// authenticated, so anything on the path can be the homeserver - and this
+    /// account's token is handed to it on the first request.
+    ///
+    /// Not gated on `tls.enabled`, which is about the CLIENT certificate this
+    /// connector presents: `verify: false` reaches the HTTP client either way.
+    fn check_tls_verify(&self) -> Option<Check> {
+        (!self.cfg.tls.verify).then(|| {
+            Check::warn(
+                "tls",
+                "tls.verify is false: the homeserver's certificate is not checked, \
+                 so anything on the path can be the homeserver",
+                "set tls.verify: true and give tls.ca_file the CA that signed it",
+            )
+        })
     }
 
     // -- the homeserver --------------------------------------------------
@@ -356,6 +500,57 @@ impl<'a> Doctor<'a> {
 
     // -- the brain -------------------------------------------------------
 
+    /// The brain, and the judge when it is a second endpoint or a second model.
+    ///
+    /// Two rows because they are two ways to be silent: the reply model being
+    /// down stops the answer, and the JUDGE being down stops the agent ever
+    /// deciding to speak at all - and a judge is exactly the thing an operator
+    /// points at a small second server and then forgets.
+    async fn check_brains(&self) -> Vec<Check> {
+        let mut checks = vec![self.check_brain().await];
+        if let Some(judge) = self.check_judge().await {
+            checks.push(judge);
+        }
+        checks
+    }
+
+    /// The judge's endpoint, when the config gives it one of its own.
+    ///
+    /// Nothing to check when the judge is the reply model on the reply
+    /// endpoint: that IS the brain row.
+    async fn check_judge(&self) -> Option<Check> {
+        let openai = self
+            .cfg
+            .brain
+            .as_ref()
+            .filter(|brain| brain.kind == BrainKind::OpenaiCompat)?
+            .openai_compat
+            .as_ref()?;
+        if openai.judge_base_url.is_empty() && openai.judge_model.is_empty() {
+            return None;
+        }
+        let base_url = if openai.judge_base_url.is_empty() {
+            &openai.base_url
+        } else {
+            &openai.judge_base_url
+        };
+        let model = if openai.judge_model.is_empty() {
+            &openai.model
+        } else {
+            &openai.judge_model
+        };
+        Some(
+            check_openai(
+                "judge",
+                base_url,
+                model,
+                &openai.resolved_judge_api_key(),
+                "brain.openai_compat.judge_base_url",
+            )
+            .await,
+        )
+    }
+
     async fn check_brain(&self) -> Check {
         let Some(brain) = &self.cfg.brain else {
             return Check::skip(
@@ -366,7 +561,14 @@ impl<'a> Doctor<'a> {
         match brain.kind {
             BrainKind::OpenaiCompat => match &brain.openai_compat {
                 Some(openai) => {
-                    check_openai(&openai.base_url, &openai.model, &openai.resolved_api_key()).await
+                    check_openai(
+                        "brain",
+                        &openai.base_url,
+                        &openai.model,
+                        &openai.resolved_api_key(),
+                        "brain.openai_compat.base_url",
+                    )
+                    .await
                 }
                 None => Check::skip("brain", "no openai_compat section to check"),
             },
@@ -387,7 +589,7 @@ impl<'a> Doctor<'a> {
 
     /// Every check, in the order the connector meets them.
     pub async fn run(mut self) -> Vec<Check> {
-        let mut checks = self.check_permissions();
+        let mut checks = self.check_local();
         let api = match self.api.take() {
             Some(api) => api,
             None => match CommandClient::new(self.cfg) {
@@ -405,7 +607,7 @@ impl<'a> Doctor<'a> {
                         "not checked: there is no usable connection",
                     ));
                     checks.extend(self.skip_rooms("there is no usable connection"));
-                    checks.push(self.check_brain().await);
+                    checks.extend(self.check_brains().await);
                     return checks;
                 }
             },
@@ -423,7 +625,7 @@ impl<'a> Doctor<'a> {
                 "not checked: the homeserver did not answer",
             ));
             checks.extend(self.skip_rooms("the homeserver did not answer"));
-            checks.push(self.check_brain().await);
+            checks.extend(self.check_brains().await);
             return checks;
         }
         let (token, _me) = self.check_token(api).await;
@@ -431,7 +633,7 @@ impl<'a> Doctor<'a> {
         checks.push(token);
         if !token_ok {
             checks.extend(self.skip_rooms("the token was not accepted"));
-            checks.push(self.check_brain().await);
+            checks.extend(self.check_brains().await);
             return checks;
         }
         checks.push(self.check_device(api).await);
@@ -450,7 +652,7 @@ impl<'a> Doctor<'a> {
                 checks.extend(self.skip_rooms("the homeserver stopped answering"));
             }
         }
-        checks.push(self.check_brain().await);
+        checks.extend(self.check_brains().await);
         checks
     }
 
@@ -520,7 +722,17 @@ fn mode_check(name: &str, path: &Path, why: &str) -> Check {
 }
 
 /// `GET {base_url}/models` - the cheapest question an endpoint answers.
-async fn check_openai(base_url: &str, model: &str, api_key: &str) -> Check {
+///
+/// `name` is the row it answers for (the reply brain or the judge) and `knob`
+/// the config key a person edits when it is wrong, so one implementation can
+/// tell a friend which of the two endpoints they mistyped.
+async fn check_openai(
+    name: &'static str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    knob: &str,
+) -> Check {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(BRAIN_TIMEOUT_S))
@@ -528,7 +740,7 @@ async fn check_openai(base_url: &str, model: &str, api_key: &str) -> Check {
     {
         Ok(client) => client,
         Err(exc) => {
-            return Check::fail("brain", format!("cannot build an HTTP client: {exc}"), "");
+            return Check::fail(name, format!("cannot build an HTTP client: {exc}"), "");
         }
     };
     let mut request = client.get(&url);
@@ -539,9 +751,9 @@ async fn check_openai(base_url: &str, model: &str, api_key: &str) -> Check {
         Ok(response) => response,
         Err(exc) => {
             return Check::fail(
-                "brain",
+                name,
                 format!("{url} did not answer: {exc}"),
-                "start the model server, or fix brain.openai_compat.base_url",
+                format!("start the model server, or fix {knob}"),
             );
         }
     };
@@ -549,24 +761,43 @@ async fn check_openai(base_url: &str, model: &str, api_key: &str) -> Check {
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
     if status != 200 {
         return Check::fail(
-            "brain",
+            name,
             format!("{url} answered HTTP {status}"),
-            "check base_url (it usually ends in /v1) and the api_key",
+            format!("check {knob} (it usually ends in /v1) and the api key beside it"),
         );
     }
     let served = model_ids(&body);
     if !served.is_empty() && !served.contains(model) {
         let listed: Vec<&str> = served.iter().map(String::as_str).collect();
         return Check::fail(
-            "brain",
+            name,
             format!(
                 "{url} does not serve '{model}'; it has {}",
                 listed.join(", ")
             ),
-            "set brain.openai_compat.model to one of those",
+            format!("set the model beside {knob} to one of those"),
         );
     }
-    Check::pass("brain", format!("{url} answers and serves {model}"))
+    Check::pass(name, format!("{url} answers and serves {model}"))
+}
+
+/// The loose-permissions escape hatch, as a row: it is set, and it makes every
+/// 0600 rule in this table advisory.
+///
+/// Takes the flag rather than reading the environment, so a test can have the
+/// row without exporting anything into the process every other test shares.
+#[must_use]
+pub fn perms_hatch(allow_loose: bool) -> Option<Check> {
+    allow_loose.then(|| {
+        Check::warn(
+            "perms",
+            format!(
+                "{ALLOW_LOOSE_PERMS_ENV}=1 is set: a secret this run can read, \
+                 anyone on this machine may be able to read too"
+            ),
+            format!("chmod 600 the secrets and unset {ALLOW_LOOSE_PERMS_ENV}"),
+        )
+    })
 }
 
 async fn check_claude(claude_bin: &str) -> Check {
@@ -676,14 +907,20 @@ pub fn format_report(cfg: &Config, config_path: &Path, checks: &[Check]) -> Stri
             check.name,
             check.detail
         ));
-        if !check.fix.is_empty() && check.status == Status::Fail {
+        if !check.fix.is_empty() && matches!(check.status, Status::Fail | Status::Warn) {
             lines.push(format!("      {:width$}  fix: {}", "", check.fix));
         }
     }
     let count = |status: Status| checks.iter().filter(|c| c.status == status).count();
     lines.push(String::new());
+    // The warnings are counted only when there are some: a tally of zero on
+    // every run trains the eye to skip the line the one warning appears on.
+    let warned = match count(Status::Warn) {
+        0 => String::new(),
+        warned => format!(", {warned} warned (the exit code is not)"),
+    };
     lines.push(format!(
-        "{} passed, {} failed, {} skipped",
+        "{} passed, {} failed, {} skipped{warned}",
         count(Status::Pass),
         count(Status::Fail),
         count(Status::Skip)

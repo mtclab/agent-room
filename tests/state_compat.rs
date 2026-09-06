@@ -105,6 +105,9 @@ fn a_promise_the_python_made_is_not_dropped_when_this_build_writes_the_file() {
     assert_eq!(ledger.loops[0].state, "open");
 
     ledger.mark_consumed("$something-new");
+    // The consumed mark is debounced (rc.6), so a reader flushes first: that is
+    // the rule, and this test is one of the readers.
+    ledger.flush();
     let written: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("written")).expect("valid JSON");
     assert_eq!(written["loops"][0]["text"], "check the deploy log");
