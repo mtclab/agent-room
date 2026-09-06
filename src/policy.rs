@@ -103,6 +103,8 @@ impl Decision {
 /// is where the room's own order of events is; the guard here only reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LastSpeaker {
+    /// The line itself, so the ledger can say what KIND of line it was.
+    pub event_id: String,
     pub sender: String,
     /// The homeserver's timestamp, in epoch seconds.
     pub ts: f64,
@@ -351,8 +353,13 @@ pub fn should_reply<S: std::hash::BuildHasher>(
 /// - only a HUMAN line, because two agents following each other up is a loop
 ///   with no human in it;
 /// - only inside `followup_window_s`, and `0` turns the arm off entirely;
-/// - and only when the LEDGER agrees I posted in that conversation: the
-///   transcript records what the room said, the ledger records what I sent.
+/// - and only when the LEDGER agrees that line was mine AND was an ANSWER: the
+///   transcript records what the room said, the ledger records what I sent and
+///   why. An impulse, an open loop's follow-up or an inner thought (tier 3) is
+///   a line I spoke uninvited, and it opens no exchange until somebody takes it
+///   up - by name, by reply, in its thread, or through the judge. Without this
+///   an agent that had just said "the render finished" would claim whatever
+///   the next person said as a reply to it (rc.5 defect, gates G9 and G11).
 ///
 /// Anybody else speaking in between defeats it by construction - the last
 /// speaker is then not me - and the budgets below still apply, because being
@@ -379,11 +386,11 @@ fn follow_up(
     if dt > window {
         return None;
     }
-    if !ledger
+    let answered = ledger
         .posts
         .iter()
-        .any(|post| post.thread_root == last.conversation)
-    {
+        .any(|post| post.event_id == last.event_id && post.tier != 3);
+    if !answered {
         return None;
     }
     Some(format!("follow-up: I spoke last here {dt:.0} s ago"))
@@ -624,6 +631,7 @@ mod tests {
     /// `who` spoke `ago` seconds before the event under test, in `$conv`.
     fn spoke_last(who: &str, ago: f64) -> LastSpeaker {
         LastSpeaker {
+            event_id: "$mine".to_owned(),
             sender: who.to_owned(),
             ts: EVENT_TS - ago,
             conversation: CONVERSATION.to_owned(),
@@ -1565,10 +1573,11 @@ mod tests {
             assert!(decision.unaddressed, "{other}");
         }
 
-        // I spoke last, but somewhere else: the ledger is the record of what I
-        // actually sent, and it has nothing in THIS conversation.
+        // I spoke last, but the transcript's line is not one the ledger sent:
+        // the ledger is the record of what I actually posted, and it has no
+        // such event.
         let elsewhere = LastSpeaker {
-            conversation: "$another".to_owned(),
+            event_id: "$not-mine-by-the-ledger".to_owned(),
             ..spoke_last(ME, 5.0)
         };
         assert_eq!(
@@ -1594,6 +1603,35 @@ mod tests {
             "{}",
             from_a_bot.reason
         );
+    }
+
+    /// G9 and G11 on rc.5: an impulse posted "the render finished", the human
+    /// said "back at my desk" 3 s later, and the agent answered it as a
+    /// follow-up - it had spoken last, after all. An uninvited line is not the
+    /// first half of an exchange.
+    #[test]
+    fn a_line_after_my_unprompted_post_is_not_a_follow_up() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, "", None, 3);
+        let ev = event(EventSpec {
+            body: "back at my desk".to_owned(),
+            ..EventSpec::default()
+        });
+        let decision = decide_after(&ev, &led, &policy(), spoke_last(ME, 3.0));
+        assert_eq!(
+            decision.verdict,
+            Verdict::Consider,
+            "an impulse claimed the next human line as a follow-up: {}",
+            decision.reason
+        );
+
+        // The same line after an ANSWER of mine in that conversation is one.
+        let mut led = ledger(dir.path(), &clock);
+        led.record_post("$mine", CONVERSATION, HUMAN, None, 2);
+        let decision = decide_after(&ev, &led, &policy(), spoke_last(ME, 3.0));
+        assert_eq!(decision.verdict, Verdict::Reply, "{}", decision.reason);
     }
 
     #[test]
