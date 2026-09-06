@@ -30,9 +30,9 @@ Everything here runs locally. There is no CI (private repo, house rule).
 - Teeth runner: `[AGENT_ROOM_LIVE=1] tests/live/.venv/bin/python
   tests/live/teeth.py [G1 ...]` applies one mutation at a time to `src/`,
   rebuilds the release binary, runs only the gate that guard protects, and
-  restores the file with `git checkout` (verified clean). `G1-G12`, `M2/M3/M5`
+  restores the file with `git checkout` (verified clean). `G1-G13`, `M2/M3/M5`
   and `D1` are live journeys, `C-1`-`C-4` live conversation journeys, `C1`/`C2`
-  live Claude gates, `U8-U26` offline cargo gates.
+  live Claude gates, `U8-U32` offline cargo gates.
 
 The commands in the older sections are the ones that were run at the time; a
 `.venv/bin/pytest` there is the root venv that carried both the Python
@@ -2715,3 +2715,133 @@ proves it). The gate that proves a FLUSH writes is
 one and has nothing else in between - re-aimed, the same mutant failed it on the
 missing file. Recorded rather than quietly re-run: a mutant that survives is
 always information about the gate.
+
+# Rooms: aliases and invitations (1.0.0-rc.6, 2026-09-06)
+
+Three of the defects the code review behind `docs/ROADMAP.md` found in what
+already shipped. None of them was found by running the product, and all three
+are about WHICH ROOMS an agent is in rather than what it says in them.
+
+**An alias is a name, not a room.** `init` and `doctor` accepted
+`#room:server` from S5 onwards, and the connector then refused the config they
+had just written (`rooms: ... is not a room id`, from `RoomId::parse` in
+`Connector::new` and `matrix::join_rooms`). `agent-room mcp` was the worse
+half: `/join/{roomIdOrAlias}` takes either, so it JOINED, reported itself
+healthy, and then 404ed on every `/rooms/{alias}/...` path there is - because
+no other Matrix endpoint takes an alias. `rooms:` is now resolved once at
+start-up (the connector through the SDK, the session through `GET
+/directory/room/{alias}`) and the room id is what everything below that uses;
+an entry that resolves to nothing is exit 2.
+
+The state files deliberately keep the CONFIGURED name (`RoomWorker::state_key`):
+a room named by its id keeps the ledger and transcript it already has, and the
+impulse inlet - a directory `agent-room impulse --room` writes and the connector
+polls - stays the one name both processes share.
+
+**An agent that has to be restarted to be let into a room is an agent nobody can
+invite.** Joining happened once, at start-up. The person who wants the agent
+somewhere is in the room; the operator is somewhere else. An invitation received
+while running is now joined when the sender is somebody the agent ALREADY SHARES
+A ROOM WITH, or is listed in the new `policy.accept_invites_from` (default
+empty, and the way a first invitation works before there is a shared room).
+Anybody else's is logged at INFO and left where it is - never rejected, because
+that is a question for the operator, and rejecting it throws the question away.
+
+**`agent-room mcp` would post plaintext into an encrypted room.** The session
+server is pure Client-Server with no crypto store, so an `m.room.message` into
+an encrypted room is not refused by anything: it arrives readable, in a room
+whose whole point is that it is not. It now checks `m.room.encryption` for each
+configured room at start-up and refuses to serve at all if one is encrypted,
+naming the room (exit 2); `doctor` fails that row for a session config and
+passes it for a connector's, which encrypts.
+
+## Unit gates, 2026-09-06
+
+`make gate`: **393 tests** (280 in the crate, 97 R4 commands, 8
+state-compat, 2 encrypted-room, 4 changelog, the publish scrub and the
+knob-coverage gate), clippy pedantic clean with warnings as errors, `cargo fmt
+--check` clean. `make lint-live`: clean, 14 files.
+`cargo test --test knob_coverage`: **82 knobs in the schema, 82 turned off
+their default by a test** (81 before this slice; the new one is
+`policy.accept_invites_from`).
+
+| Guard | Gate |
+|---|---|
+| a room alias is resolved ONCE, and nothing afterwards is asked about it | `mcp::an_alias_is_resolved_once_and_nothing_afterwards_is_asked_about_it` - an alias config against the fake homeserver: `room_list` reports the ROOM ID, both forms reach the room, exactly one `/directory/room/` request was made, and NO other request path carries the alias. A `/join/#alias` would count, because that is exactly what used to "work" and leave every later path 404ing |
+| a room's state files stay named after what was CONFIGURED | `mcp::an_alias_configured_room_keeps_its_state_under_the_configured_name` - `room_impulse` called with the room ID writes into the inlet named after the ALIAS, and the id-named one does not exist. That directory is the contract between a session and the connector that reads it |
+| an alias that names no room stops the server | `mcp::an_alias_that_resolves_to_nothing_stops_the_server_before_it_serves` |
+| a room id needs no homeserver, and junk is exit 2 | `matrix::a_room_id_resolves_to_itself_and_asks_the_homeserver_nothing` and `matrix::a_room_that_is_neither_an_id_nor_an_alias_stops_the_connector` - the connector's half, including the server-less room id that room version 12 mints |
+| `mcp` refuses to serve an encrypted room | `mcp::an_encrypted_room_stops_the_server_before_it_serves` - through the real `serve()`, which is what the CLI turns into exit 2: the refusal names the room, the algorithm and `agent-room run`, and the fake homeserver received nothing at all |
+| ... and every tool refuses too, with nothing posted | `mcp::an_encrypted_room_refuses_every_tool_too_and_posts_nothing` |
+| a room that is NOT encrypted is untouched (the negative control) | `mcp::a_room_that_is_not_encrypted_starts_the_way_it_always_did` - the same probe, the 404 a homeserver gives for a state event that is not there, and a session that starts and reads |
+| doctor says why, on a live session's config only | `doctor::an_encrypted_room_fails_the_row_for_a_live_sessions_config_only` - FAIL naming the algorithm, with a fix that says `agent-room run`; the SAME room in a connector's config passes, because the connector encrypts |
+| the inviter is the sender of MY invite | `connector::the_inviter_is_the_sender_of_my_own_invite_and_nobody_else` - somebody else's join in the same stripped state, an invitation addressed to another account, my own join, a name event and unparseable junk: none of them is an invitation to me |
+| a member of a room I am in may invite me | `connector::an_invitation_is_taken_up_from_somebody_i_am_already_in_a_room_with` - and the reason names the room, because the log is where an operator reads it |
+| a stranger needs `accept_invites_from` | `connector::a_stranger_is_only_let_in_by_the_configured_list` - no shared room and not on the list is None; on the list is a reason that names the knob; and the shipped list is empty |
+
+## Live gate G13, 2026-09-06
+
+`tests/live/test_journeys.py`, on the echo brain, no quota. Three rooms: the
+configured one, one the agent is invited to by a member of it, and one it is
+invited to by an account it shares nothing with.
+
+| Gate | Journey | Guard it protects |
+|---|---|---|
+| G13 | One connector on bot C, configured for room A alone. Bot D - invited to room A by the fixture and never joined, so not a MEMBER of anything bot C is in - invites bot C to room S; the human, who is in room A, invites bot C to room M. Both invitations go out before the wait, so one sync round carries both. Bot C joins room M and NOT room S; a name typed in room M is answered there, in a thread, by an agent never configured for that room; and the log carries both decisions by name | `connector::accept_invites`, `inviter_in` and `invite_reason` on the wire, plus `open_invited_room` - the joined room only answers because it got a worker, a transcript and its names |
+
+Bot D being INVITED to room A and never joining is the sharper half of that
+control: the guard asks for a JOINED member, and an invitation nobody accepted
+is not one.
+
+The `rooms_to_be_invited_to` fixture is why `fresh_room` now separates "who is
+invited" from "who is cleaned up": room M is created with nobody invited (the
+invitation is the test), and room S is cleaned up for bot C as well, precisely
+because bot C must not be in it.
+
+**G13 was not run in this slice.** It is written, lint-clean and in
+`tests/live/teeth.py` with its mutant; the live accounts are shared and the live
+set is run sequentially, so it belongs to the next live sweep.
+
+## Teeth run, 2026-09-06
+
+One mutation at a time in `src/`, and only the gate that guard protects run
+against it, then the file restored. The six offline mutants are `U27-U32` in
+`tests/live/teeth.py`; all six FAILED with their guard removed. (The times are
+inflated - another build had the box at load 20 throughout - and say nothing
+about the gates.)
+
+| Gate | Guard removed | Result | Time |
+|---|---|---|---|
+| U27 | `cs_api::resolve_rooms`: the alias branch (`if true`, so an alias is passed through as if it named a room) | FAILED - `room_list` reported the alias where the room id belongs | 138 s |
+| U28 | `mcp_server::configured`: the state path keyed by the room id instead of the configured name | FAILED - the impulse landed in the id-named inlet, where a connector configured with the alias never looks | 514 s |
+| U29 | `mcp_server::ensure_ready`: the `m.room.encryption` probe, answering "not encrypted" without asking | FAILED - `serve()` started on an encrypted room | 370 s |
+| U30 | `doctor::check_room`: the encrypted-room row on a session config | FAILED - `Check { status: Pass, detail: "joined" }` on an encrypted room | 672 s |
+| U31 | `connector::inviter_in`: the state-key and membership conditions, leaving "the first member event's sender" | FAILED - somebody else's join read as an invitation | 154 s |
+| U32 | `connector::invite_reason`: the `accept_invites_from` check, so anybody may invite | FAILED - a stranger with an empty list was let in | 591 s |
+| G13 | `connector::accept_invites`: the loop over the sync response's invitations (`.take(0)`) - the product of 2026-09-05 exactly, where the only way into a room is `rooms:` and a restart | not run (live) | - |
+
+## What this slice looked at and left alone
+
+- **A live session in an encrypted room** is refused rather than made to work.
+  Making it work means a crypto store for the session client, which is on the
+  after-1.0.0 list in `docs/ROADMAP.md` and is not a slice you do on the way
+  past.
+- **`doctor` still resolves an alias per room row**, which is one directory
+  lookup per configured room rather than one per run. It is a diagnostic command
+  a person waits three seconds for; the connector and the session both resolve
+  once.
+- **The connector's ALIAS branch has no offline gate of its own.** The fake
+  homeserver speaks the Client-Server API, which is what `mcp` and `doctor` use;
+  the connector resolves through the SDK. Its other two branches are gated
+  (`matrix::a_room_id_resolves_to_itself_...`, `..._stops_the_connector`), the
+  shape it shares with the session is gated through `mcp`, and `doctor`'s alias
+  row has been gated since R4. A live journey on an alias-configured connector
+  is the honest way to close it, and is worth one at the next live sweep.
+- **A room joined from an invitation is not written back to `config.yaml`.**
+  `rooms:` is the operator's statement of where the agent belongs, and a process
+  that edited it would be making that decision for them. The log line says the
+  room lasts until the process stops.
+- **A join that the homeserver refuses is retried**, because the decision was
+  yes and the homeserver got in the way; only a decision is remembered. Not
+  gated: it needs a homeserver that refuses one join and allows the next, which
+  the fake cannot be talked into without becoming a different fake.

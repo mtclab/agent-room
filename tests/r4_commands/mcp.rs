@@ -1098,3 +1098,220 @@ async fn room_impulse_refuses_an_empty_line() {
     assert_eq!(refused.is_error, Some(true));
     assert!(!impulse_dir(&session.dir.path().join("state"), ROOM_ID).exists());
 }
+
+// -- the rooms this session was pointed at ------------------------------------
+
+/// A session on a config of its own: any rooms, and a homeserver a test can
+/// teach about aliases and encryption before the first call.
+fn session_for(dir: &tempfile::TempDir, home: &FakeHomeserver, rooms: Vec<String>) -> RoomClient {
+    let mut cfg = config(dir, &home.base_url, PostAs::Notice, PolicyConfig::default());
+    cfg.rooms = rooms;
+    let cfg = Arc::new(cfg);
+    let api = CommandClient::new(&cfg).expect("a plain HTTP client");
+    RoomClient::new(cfg, api, FakeClock::new().as_clock()).expect("the session client builds")
+}
+
+const ALIAS: &str = "#the-room:example.com";
+
+#[tokio::test]
+async fn an_alias_is_resolved_once_and_nothing_afterwards_is_asked_about_it() {
+    // `init` and `doctor` have always accepted `#alias:server`. A session
+    // configured with one used to JOIN by alias and then 404 on every
+    // `/rooms/{alias}/...` path there is, because an alias is a NAME for a room
+    // and not a room. It is resolved once, at start-up, and the id is what
+    // every path below that uses.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| {
+        state.members.insert(HUMAN.to_owned(), "Alex".to_owned());
+        state.aliases.insert(ALIAS.to_owned(), ROOM_ID.to_owned());
+        state.add("hello there", HUMAN);
+    });
+    let rooms = session_for(&dir, &home, vec![ALIAS.to_owned()]);
+    rooms
+        .start_up()
+        .await
+        .expect("an alias that resolves starts");
+    let tools = AgentRoomServer::new(Arc::new(rooms));
+
+    // The room the session reports is the ROOM, not the name it was given.
+    let listed = payload(&call(tools.room_list().await));
+    assert_eq!(listed[0]["room_id"], json!(ROOM_ID));
+
+    // And both forms reach it: the id `room_list` just handed out, and the
+    // alias whoever wrote the config still has in front of them.
+    for named in [ROOM_ID, ALIAS] {
+        let read = call(tools.room_read(Parameters(read_params(named))).await);
+        assert_ne!(read.is_error, Some(true), "reading {named}: {read:?}");
+        assert_eq!(bodies(&payload(&read)), vec!["hello there".to_owned()]);
+    }
+
+    // The one request that may name the alias is the directory lookup that
+    // resolved it. `/join/#alias` counts: it is what used to "work" and leave
+    // every later path 404ing.
+    home.with(|state| {
+        let leaked: Vec<String> = state
+            .requests
+            .iter()
+            .filter(|seen| seen.path.contains(ALIAS) && !seen.path.contains("/directory/room/"))
+            .map(|seen| seen.path.clone())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "these paths still carry the alias: {leaked:?}"
+        );
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|seen| seen.path.contains("/directory/room/"))
+                .count(),
+            1,
+            "the alias is resolved ONCE, not per call"
+        );
+    });
+}
+
+#[tokio::test]
+async fn an_alias_configured_room_keeps_its_state_under_the_configured_name() {
+    // The impulse inlet is a DIRECTORY a connector polls, and `agent-room
+    // impulse --room` writes to the one named after `rooms:`. So a session that
+    // resolved an alias must still drop its impulse where that connector looks,
+    // even when the tool was called with the room id.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| {
+        state.aliases.insert(ALIAS.to_owned(), ROOM_ID.to_owned());
+    });
+    let rooms = session_for(&dir, &home, vec![ALIAS.to_owned()]);
+    rooms
+        .start_up()
+        .await
+        .expect("an alias that resolves starts");
+    let tools = AgentRoomServer::new(Arc::new(rooms));
+
+    let written = call(tools.room_impulse(Parameters(ImpulseParams {
+        room_id: ROOM_ID.to_owned(),
+        text: "the render finished".to_owned(),
+        kind: "render".to_owned(),
+    })));
+    assert_ne!(written.is_error, Some(true), "{written:?}");
+    let state_dir = dir.path().join("state");
+    assert_eq!(
+        read_impulses(&impulse_dir(&state_dir, ALIAS), 3600.0).len(),
+        1
+    );
+    assert!(
+        !impulse_dir(&state_dir, ROOM_ID).exists(),
+        "the inlet is named after the room id, where no connector configured \
+         with the alias would ever look"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_that_resolves_to_nothing_stops_the_server_before_it_serves() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    let rooms = session_for(&dir, &home, vec![ALIAS.to_owned()]);
+    let exc = rooms
+        .start_up()
+        .await
+        .expect_err("an alias that names no room is a config nothing can run on");
+    let text = format!("{exc}");
+    assert!(text.contains(ALIAS), "{text}");
+    assert!(text.contains("does not resolve"), "{text}");
+}
+
+#[tokio::test]
+async fn an_encrypted_room_stops_the_server_before_it_serves() {
+    // `agent-room mcp` is a plain Client-Server client: no crypto store, no
+    // device identity, no room keys. Posting into an encrypted room does not
+    // FAIL - it works, and puts a readable line in a room whose whole point is
+    // that its contents are not readable. So it does not start.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| {
+        state
+            .encrypted
+            .insert(ROOM_ID.to_owned(), "m.megolm.v1.aes-sha2".to_owned());
+    });
+    let mut cfg = config(
+        &dir,
+        &home.base_url,
+        PostAs::Notice,
+        PolicyConfig::default(),
+    );
+    cfg.rooms = vec![ROOM_ID.to_owned()];
+    // Through `serve`, which is what the CLI calls and turns into exit 2.
+    let exc = agent_room::mcp_server::serve(cfg)
+        .await
+        .expect_err("an encrypted room must stop the server");
+    let text = format!("{exc}");
+    assert!(
+        text.contains(ROOM_ID),
+        "the refusal must name the room: {text}"
+    );
+    assert!(text.contains("encrypted"), "{text}");
+    assert!(text.contains("m.megolm.v1.aes-sha2"), "{text}");
+    assert!(
+        text.contains("agent-room run"),
+        "it must say what to do instead: {text}"
+    );
+    home.with(|state| {
+        assert!(
+            state.sent.is_empty(),
+            "the session sent something into an encrypted room: {:?}",
+            state.sent
+        );
+    });
+}
+
+#[tokio::test]
+async fn an_encrypted_room_refuses_every_tool_too_and_posts_nothing() {
+    // The same guard from the other side: whatever started the tools, a room
+    // that must never see plaintext refuses on the tool as well, and nothing
+    // reaches the room.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| {
+        state
+            .encrypted
+            .insert(ROOM_ID.to_owned(), "m.megolm.v1.aes-sha2".to_owned());
+    });
+    let rooms = session_for(&dir, &home, vec![ROOM_ID.to_owned()]);
+    let tools = AgentRoomServer::new(Arc::new(rooms));
+    let refused = call(
+        tools
+            .room_post(Parameters(post_params(ROOM_ID, "hello")))
+            .await,
+    );
+    assert_eq!(refused.is_error, Some(true));
+    assert!(error_text(&refused).contains("encrypted"), "{refused:?}");
+    home.with(|state| assert!(state.sent.is_empty(), "{:?}", state.sent));
+}
+
+#[tokio::test]
+async fn a_room_that_is_not_encrypted_starts_the_way_it_always_did() {
+    // The negative control for the two above: the same probe, the answer a
+    // homeserver gives for a state event that is not there, and a session that
+    // starts and reads.
+    let session = Session::new().await;
+    session.home.with(|state| state.add("hello there", HUMAN));
+    let read = call(
+        session
+            .tools
+            .room_read(Parameters(read_params(ROOM_ID)))
+            .await,
+    );
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+    assert_eq!(bodies(&payload(&read)), vec!["hello there".to_owned()]);
+    session.home.with(|state| {
+        assert!(
+            state
+                .requests
+                .iter()
+                .any(|seen| seen.path.ends_with("/state/m.room.encryption")),
+            "nothing ever asked whether the room was encrypted"
+        );
+    });
+}

@@ -215,19 +215,29 @@ async def human(tokens: Tokens) -> AsyncIterator[AsyncClient]:
 
 @asynccontextmanager
 async def fresh_room(
-    human: AsyncClient, tokens: Tokens, names: tuple[str, ...]
+    human: AsyncClient,
+    tokens: Tokens,
+    names: tuple[str, ...],
+    invite_names: tuple[str, ...] | None = None,
 ) -> AsyncIterator[str]:
     """One private room for one test, forgotten by everyone at teardown.
 
     Only the bots a test actually needs are invited: an invitation is visible to
     the account that gets it, and these accounts have work of their own.
+
+    `invite_names` splits "who is invited" from "who is cleaned up", which the
+    invitation gate needs in both directions: a room the agent must be invited
+    to DURING the test (invited by nobody, cleaned up for it anyway) and one it
+    must refuse to join (invited to by a stranger, cleaned up for it in case the
+    guard is broken and it joins).
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    invited = names if invite_names is None else invite_names
     response = await human.room_create(
         name=f"agent-room-test-{stamp}",
         topic="agent-room live gate; created and forgotten by the test suite",
         preset=RoomPreset.private_chat,
-        invite=[f"@{name}:{SERVER_NAME}" for name in names],
+        invite=[f"@{name}:{SERVER_NAME}" for name in invited],
         is_direct=False,
     )
     room_id = getattr(response, "room_id", None)
@@ -256,6 +266,33 @@ async def room_s3(human: AsyncClient, tokens: Tokens) -> AsyncIterator[str]:
     """A fresh private room with the S3 pair (bot C, bot D)."""
     async with fresh_room(human, tokens, (S3_BOT_A_NAME, S3_BOT_B_NAME)) as room_id:
         yield room_id
+
+
+@pytest.fixture
+async def rooms_to_be_invited_to(
+    human: AsyncClient, tokens: Tokens
+) -> AsyncIterator[tuple[str, str]]:
+    """Two rooms bot C is not in and has not been asked into: `(member, stranger)`.
+
+    The invitation gate needs the invitation itself to happen while the
+    connector is running, which no fixture can arrange - so these are created
+    empty and invited from inside the test. The FIRST is where the human (whom
+    bot C already shares a room with) invites it; the SECOND has bot D in it and
+    nobody else bot C knows, so bot D's invitation is a stranger's.
+
+    Both are cleaned up for bot C whether or not it joined: the second one is
+    there precisely to prove it did not.
+    """
+    async with (
+        fresh_room(human, tokens, (S3_BOT_A_NAME,), invite_names=()) as from_member,
+        fresh_room(
+            human,
+            tokens,
+            (S3_BOT_A_NAME, S3_BOT_B_NAME),
+            invite_names=(S3_BOT_B_NAME,),
+        ) as from_stranger,
+    ):
+        yield from_member, from_stranger
 
 
 @dataclass
@@ -668,8 +705,10 @@ async def wait_for(
     return events
 
 
-async def wait_for_join(human: AsyncClient, room_id: str, user_ids: list[str]) -> None:
-    deadline = time.monotonic() + 60
+async def wait_for_join(
+    human: AsyncClient, room_id: str, user_ids: list[str], seconds: float = 60
+) -> None:
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         response = await human.joined_members(room_id)
         members = {m.user_id for m in getattr(response, "members", [])}

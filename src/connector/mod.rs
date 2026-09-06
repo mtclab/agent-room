@@ -28,16 +28,17 @@ pub mod turn;
 pub mod unprompted;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
-use matrix_sdk::sync::{JoinedRoomUpdate, State};
+use matrix_sdk::sync::{JoinedRoomUpdate, State, SyncResponse};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use regex::Regex;
 use serde_json::Value;
@@ -218,6 +219,13 @@ impl WorkerState {
 /// Serialises brain turns for one room and coalesces what arrives mid-run.
 pub struct RoomWorker {
     pub room_id: OwnedRoomId,
+    /// What this room's files under `state_dir/rooms/` are named after: the
+    /// string the operator wrote in `rooms:`, so an id-configured room keeps
+    /// the ledger and transcript it has always had, and an alias-configured one
+    /// gets files named after the alias - which is also what `agent-room
+    /// impulse --room` and the MCP inlet write to. A room joined from an
+    /// invitation has no configured name and uses its room id.
+    pub state_key: String,
     pub transcript: Transcript,
     pub state: Mutex<WorkerState>,
 }
@@ -235,7 +243,19 @@ pub struct Connector {
     account_display: Option<String>,
     bot_user_ids: Vec<String>,
     bot_patterns: Vec<Regex>,
-    workers: HashMap<OwnedRoomId, Arc<RoomWorker>>,
+    /// One worker per room being watched, by room id. Behind a lock and not a
+    /// plain map because the set can GROW while the process runs: an invitation
+    /// this agent takes up (see [`Connector::accept_invites`]) gets a worker of
+    /// its own, exactly like a configured room. Filled in `run`, once the
+    /// homeserver has said what any alias in `rooms:` means.
+    workers: RwLock<HashMap<OwnedRoomId, Arc<RoomWorker>>>,
+    /// Every invitation already decided about, so an invitation this agent is
+    /// not taking up is read - and logged - once per process rather than on
+    /// every sync that carries it.
+    decided_invites: Mutex<HashSet<OwnedRoomId>>,
+    /// The shutdown signal, cloned for each room's loops. `None` until `run`
+    /// has it; a room that arrives later gets its loops from here.
+    stop: Option<watch::Receiver<bool>>,
     /// Who the homeserver says is around. Fed by `m.presence` in every sync.
     presence: Arc<Mutex<PresenceBook>>,
     /// False until the startup backlog sweep is done: nothing seen before that
@@ -265,29 +285,6 @@ impl Connector {
             .policy
             .compiled_bot_patterns()
             .map_err(|exc| anyhow!("{exc}"))?;
-        let now = clock();
-        let mut workers = HashMap::new();
-        for room_id in &cfg.rooms {
-            let parsed = RoomId::parse(room_id)
-                .map_err(|exc| anyhow!("rooms: {room_id} is not a room id: {exc}"))?;
-            let ledger = Ledger::load(
-                &cfg.room_state_path(room_id, ".ledger.json"),
-                cfg.policy.budgets.clone(),
-                Arc::clone(&clock),
-            );
-            workers.insert(
-                parsed.clone(),
-                Arc::new(RoomWorker {
-                    room_id: parsed,
-                    transcript: Transcript::with_rotation(
-                        cfg.room_state_path(room_id, ".jsonl"),
-                        cfg.transcript_keep,
-                        cfg.transcript_archives,
-                    ),
-                    state: Mutex::new(WorkerState::new(ledger, now)),
-                }),
-            );
-        }
         Ok(Self {
             me: cfg.user_id.clone(),
             cfg,
@@ -297,13 +294,86 @@ impl Connector {
             account_display: None,
             bot_user_ids: Vec::new(),
             bot_patterns,
-            workers,
+            // Empty until `run`: a `rooms:` entry can be an ALIAS, and only the
+            // homeserver knows which room that is.
+            workers: RwLock::new(HashMap::new()),
+            decided_invites: Mutex::new(HashSet::new()),
+            stop: None,
             presence: Arc::new(Mutex::new(PresenceBook::new())),
             live: Arc::new(AtomicBool::new(false)),
             clock,
             tasks: Mutex::new(Vec::new()),
             room_loops: Mutex::new(Vec::new()),
         })
+    }
+
+    /// One worker per configured room, keyed by the room id the homeserver
+    /// resolved it to.
+    ///
+    /// The state files keep the name the operator wrote (`state_key`), so a
+    /// room configured by id has exactly the ledger and transcript it had
+    /// before aliases worked at all, and `agent-room impulse --room` keeps
+    /// writing where this connector reads.
+    fn open_rooms(&self, rooms: &[(String, OwnedRoomId)]) {
+        let now = (self.clock)();
+        let mut workers = self.write_workers();
+        for (configured, room_id) in rooms {
+            workers.insert(
+                room_id.clone(),
+                Arc::new(self.build_worker(room_id, configured, now)),
+            );
+        }
+    }
+
+    /// One room's ledger, transcript and state, all named after `state_key`.
+    fn build_worker(&self, room_id: &RoomId, state_key: &str, now: f64) -> RoomWorker {
+        let ledger = Ledger::load(
+            &self.cfg.room_state_path(state_key, ".ledger.json"),
+            self.cfg.policy.budgets.clone(),
+            Arc::clone(&self.clock),
+        );
+        RoomWorker {
+            room_id: room_id.to_owned(),
+            state_key: state_key.to_owned(),
+            transcript: Transcript::with_rotation(
+                self.cfg.room_state_path(state_key, ".jsonl"),
+                self.cfg.transcript_keep,
+                self.cfg.transcript_archives,
+            ),
+            state: Mutex::new(WorkerState::new(ledger, now)),
+        }
+    }
+
+    fn read_workers(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<OwnedRoomId, Arc<RoomWorker>>> {
+        self.workers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_workers(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<OwnedRoomId, Arc<RoomWorker>>> {
+        self.workers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The worker for one room, or None when this connector does not watch it.
+    fn worker(&self, room_id: &RoomId) -> Option<Arc<RoomWorker>> {
+        self.read_workers().get(room_id).cloned()
+    }
+
+    /// Every room being watched right now. A snapshot, so nothing holds the
+    /// lock across an await.
+    fn worker_ids(&self) -> Vec<OwnedRoomId> {
+        self.read_workers().keys().cloned().collect()
+    }
+
+    /// Every worker right now, for the same reason.
+    fn all_workers(&self) -> Vec<Arc<RoomWorker>> {
+        self.read_workers().values().map(Arc::clone).collect()
     }
 
     fn rules(&self) -> BotRules<'_> {
@@ -325,6 +395,7 @@ impl Connector {
         http: reqwest::Client,
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
+        self.stop = Some(stop.clone());
         self.me = matrix::authenticate(&self.client, &self.cfg, &http).await?;
         info!(
             "authenticated as {} (device {})",
@@ -338,7 +409,12 @@ impl Connector {
         // device's keys - stop, instead of failing every sync for ever.
         let mut wedge = self.client.subscribe_to_duplicate_key_upload_errors();
         self.bot_user_ids = self.cfg.policy.bot_user_ids.clone();
-        let joined = matrix::join_rooms(&self.client, &self.cfg.rooms).await;
+        // An alias is a name, not a room: resolve it once, here, and let the
+        // room id be what everything below this line works with.
+        let rooms = matrix::resolve_rooms(&self.client, &self.cfg.rooms).await?;
+        self.open_rooms(&rooms);
+        let wanted: Vec<OwnedRoomId> = rooms.iter().map(|(_configured, id)| id.clone()).collect();
+        let joined = matrix::join_rooms(&self.client, &wanted).await;
         if joined.is_empty() {
             bail!("could not join any configured room");
         }
@@ -363,15 +439,20 @@ impl Connector {
             })
             .filter(|name| !name.trim().is_empty());
         self.consume_backlog().await?;
-        for room_id in self.workers.keys() {
-            self.refresh_names(room_id).await;
+        for room_id in self.worker_ids() {
+            self.refresh_names(&room_id).await;
         }
-        let spam = maybe_start_spam(&self.client, &self.cfg.rooms);
-        self.start_room_loops(&stop).await;
+        let spam_rooms: Vec<String> = wanted.iter().map(ToString::to_string).collect();
+        let spam = maybe_start_spam(&self.client, &spam_rooms);
+        self.start_room_loops().await;
         info!(
             "connector {} watching {}",
             self.me,
-            self.cfg.rooms.join(", ")
+            self.worker_ids()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+                .join(", ")
         );
 
         let mut retry = SyncRetry::default();
@@ -429,34 +510,55 @@ impl Connector {
     /// about. The flush loop always runs too: consumed marks are debounced
     /// (see [`Ledger::flush`]), and this is what bounds how much of that a
     /// crash can cost. The heartbeat only runs when somebody asked for a timer.
-    async fn start_room_loops(&self, stop: &watch::Receiver<bool>) {
+    async fn start_room_loops(&self) {
         let minutes = self.cfg.policy.heartbeat_minutes;
         if minutes > 0 {
             info!("heartbeat on: every {minutes} min in a room quiet that long");
         }
+        for worker in self.all_workers() {
+            self.start_loops_for(&worker).await;
+        }
+    }
+
+    /// One room's clocks. Called for every configured room at startup, and for
+    /// a room joined from an invitation the moment it gets a worker - so a room
+    /// that arrived at runtime has an impulse inlet, a follow-up arm and (when
+    /// one is configured) a heartbeat, exactly like a configured one.
+    async fn start_loops_for(&self, worker: &Arc<RoomWorker>) {
+        let Some(stop) = self.stop.as_ref() else {
+            // Only reachable before `run` has the signal, which is before any
+            // room exists. Spawning a loop nothing can stop would leak it.
+            warn!(
+                "{}: no stop signal yet; no room loops started",
+                worker.room_id
+            );
+            return;
+        };
         let mut loops = self.room_loops.lock().await;
-        for worker in self.workers.values() {
+        let runner = self.runner();
+        let polled = Arc::clone(worker);
+        let mut stop_rx = stop.clone();
+        loops.push(tokio::spawn(async move {
+            runner.unprompted_loop(polled, &mut stop_rx).await;
+        }));
+        // The ledger flush: consumed marks are debounced (see [`Ledger::flush`])
+        // and this tick bounds how much of that a crash can cost. A room joined
+        // at runtime gets one too, or its marks would only reach disk at exit.
+        let flushed = Arc::clone(worker);
+        let mut stop_rx = stop.clone();
+        loops.push(tokio::spawn(async move {
+            Self::flush_loop(flushed, &mut stop_rx).await;
+        }));
+        let minutes = self.cfg.policy.heartbeat_minutes;
+        if minutes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let period_s = minutes as f64 * 60.0;
             let runner = self.runner();
-            let polled = Arc::clone(worker);
+            let worker = Arc::clone(worker);
             let mut stop_rx = stop.clone();
             loops.push(tokio::spawn(async move {
-                runner.unprompted_loop(polled, &mut stop_rx).await;
+                runner.heartbeat_loop(worker, period_s, &mut stop_rx).await;
             }));
-            let flushed = Arc::clone(worker);
-            let mut stop_rx = stop.clone();
-            loops.push(tokio::spawn(async move {
-                Self::flush_loop(flushed, &mut stop_rx).await;
-            }));
-            if minutes > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                let period_s = minutes as f64 * 60.0;
-                let runner = self.runner();
-                let worker = Arc::clone(worker);
-                let mut stop_rx = stop.clone();
-                loops.push(tokio::spawn(async move {
-                    runner.heartbeat_loop(worker, period_s, &mut stop_rx).await;
-                }));
-            }
         }
     }
 
@@ -524,7 +626,7 @@ impl Connector {
             }
         }
         self.brain.close().await;
-        for worker in self.workers.values() {
+        for worker in self.all_workers() {
             // The last flush of the process: whatever the debounce was still
             // holding goes to disk before the binary does.
             worker.state.lock().await.ledger.flush();
@@ -569,19 +671,25 @@ impl Connector {
             .await?;
         self.record_presence(&response).await;
         let mut total = self.record_backlog(&response).await;
-        for room_id in self.workers.keys() {
-            total += self.snapshot_room(room_id).await;
+        for room_id in self.worker_ids() {
+            total += self.snapshot_room(&room_id).await;
         }
+        // An invitation that arrived while this process was DOWN is in this
+        // response and in no later one - the token moves past it here - so it
+        // is read with the backlog rather than after it. The room loops have
+        // not started yet, so `start_room_loops` below picks up whatever this
+        // joins along with the configured rooms.
+        self.accept_invites(&response, false).await;
         self.live.store(true, Ordering::SeqCst);
         info!("backlog swallowed: {total} events consumed without replying");
         Ok(())
     }
 
     /// Record one sync response as backlog: transcript yes, policy never.
-    async fn record_backlog(&self, response: &matrix_sdk::sync::SyncResponse) -> usize {
+    async fn record_backlog(&self, response: &SyncResponse) -> usize {
         let mut total = 0;
         for (room_id, update) in &response.rooms.joined {
-            let Some(worker) = self.workers.get(room_id) else {
+            let Some(worker) = self.worker(room_id) else {
                 continue;
             };
             let room = self.client.get_room(room_id);
@@ -595,7 +703,7 @@ impl Connector {
                 // applied rather than consumed: the transcript is memory, and
                 // memory of a line somebody has since deleted is the defect.
                 if let Some(correction) = correction_from(&source) {
-                    Self::apply_correction(worker, &mut state, &correction);
+                    Self::apply_correction(&worker, &mut state, &correction);
                     continue;
                 }
                 let Some(ev) = self.normalise(room.as_ref(), room_id, &source).await else {
@@ -619,7 +727,7 @@ impl Connector {
 
     /// Consume what `/messages` says the room already contains.
     async fn snapshot_room(&self, room_id: &RoomId) -> usize {
-        let Some(worker) = self.workers.get(room_id) else {
+        let Some(worker) = self.worker(room_id) else {
             return 0;
         };
         let Some(room) = self.client.get_room(room_id) else {
@@ -645,7 +753,7 @@ impl Connector {
                 continue;
             };
             if let Some(correction) = correction_from(&source) {
-                Self::apply_correction(worker, &mut state, &correction);
+                Self::apply_correction(&worker, &mut state, &correction);
                 continue;
             }
             let Some(ev) = self.normalise(Some(&room), room_id, &source).await else {
@@ -678,10 +786,14 @@ impl Connector {
     // -- event handling --------------------------------------------------
 
     /// One sync response: presence, the messages, and the typing notices.
-    async fn handle_sync(&self, response: &matrix_sdk::sync::SyncResponse) {
+    async fn handle_sync(&self, response: &SyncResponse) {
         self.record_presence(response).await;
+        // Before the rooms already being watched: an invitation taken up here
+        // is a room from the next sync on, and nothing in this one belongs to
+        // it yet.
+        self.accept_invites(response, true).await;
         for (room_id, update) in &response.rooms.joined {
-            if !self.workers.contains_key(room_id) {
+            if self.worker(room_id).is_none() {
                 continue;
             }
             // Before the messages, not after: a line that arrives in the same
@@ -701,7 +813,7 @@ impl Connector {
     /// `m.presence` for everyone we share a room with. Cheap, and the whole
     /// point of the unprompted feature: nobody announces things to an empty
     /// room.
-    async fn record_presence(&self, response: &matrix_sdk::sync::SyncResponse) {
+    async fn record_presence(&self, response: &SyncResponse) {
         if response.presence.is_empty() {
             return;
         }
@@ -750,6 +862,120 @@ impl Connector {
         is_bot_user(user_id, &self.bot_user_ids, &self.bot_patterns)
     }
 
+    // -- invitations -------------------------------------------------------
+
+    /// Take up the invitations in one sync response that this agent should.
+    ///
+    /// An agent that has to be restarted to be let into a room is an agent
+    /// nobody can invite: the person who wants it there is in the room already,
+    /// and the operator is somewhere else. So an invitation is joined when the
+    /// person who sent it is somebody this agent ALREADY SHARES A ROOM WITH -
+    /// they can talk to it where it is, so they can ask it somewhere else - or
+    /// when the operator listed them in `policy.accept_invites_from`.
+    ///
+    /// Anything else is logged at INFO and left exactly where it is. Not
+    /// rejected: a stranger's invitation is a question for the operator, and
+    /// declining it on their behalf would throw the question away.
+    ///
+    /// `start_loops` is false only during the startup sweep, where
+    /// `start_room_loops` is about to give every room its clocks anyway.
+    async fn accept_invites(&self, response: &SyncResponse, start_loops: bool) {
+        for (room_id, update) in &response.rooms.invited {
+            if self.worker(room_id).is_some() || !self.first_look_at(room_id).await {
+                continue;
+            }
+            let raw: Vec<&str> = update
+                .invite_state
+                .events
+                .iter()
+                .map(|event| event.json().get())
+                .collect();
+            let Some(inviter) = inviter_in(&raw, &self.me) else {
+                info!(
+                    "{room_id}: invited, but the invitation does not say who by; leaving it \
+                     alone"
+                );
+                continue;
+            };
+            let shared = self.shares_a_room_with(&inviter).await;
+            let Some(reason) = invite_reason(
+                shared.as_deref(),
+                &inviter,
+                &self.cfg.policy.accept_invites_from,
+            ) else {
+                info!(
+                    "{room_id}: {inviter} invited me and is not somebody I share a room with; \
+                     leaving it alone (add them to policy.accept_invites_from, or add the room \
+                     to rooms:)"
+                );
+                continue;
+            };
+            info!("{room_id}: joining an invitation from {inviter} - {reason}");
+            if let Err(exc) = self.client.join_room_by_id(room_id).await {
+                // The decision was yes and the homeserver got in the way, which
+                // is not the same thing as having decided: forget it, so the
+                // next sync that still carries the invitation tries again.
+                error!("{room_id}: {inviter} invited me but the join failed: {exc}");
+                self.decided_invites.lock().await.remove(room_id);
+                continue;
+            }
+            self.open_invited_room(room_id, start_loops).await;
+        }
+    }
+
+    /// True the FIRST time this process is asked about `room_id`.
+    ///
+    /// An invitation stays in the sync stream until it is answered, and an
+    /// invitation this agent is leaving alone is answered by nobody. Deciding
+    /// once per process is what keeps that from becoming one log line per sync
+    /// for as long as the invitation stands.
+    async fn first_look_at(&self, room_id: &RoomId) -> bool {
+        self.decided_invites.lock().await.insert(room_id.to_owned())
+    }
+
+    /// A room this agent shares with `user_id`, or None.
+    ///
+    /// Read out of the member store the sync has already filled - no HTTP - and
+    /// only ever for somebody who just sent an invitation.
+    async fn shares_a_room_with(&self, user_id: &str) -> Option<OwnedRoomId> {
+        let user = UserId::parse(user_id).ok()?;
+        for room_id in self.worker_ids() {
+            let Some(room) = self.client.get_room(&room_id) else {
+                continue;
+            };
+            if let Ok(Some(member)) = room.get_member_no_sync(&user).await
+                && *member.membership() == MembershipState::Join
+            {
+                return Some(room_id);
+            }
+        }
+        None
+    }
+
+    /// Give a room joined from an invitation everything a configured room has.
+    ///
+    /// It is NOT written back into the config: `rooms:` is the operator's
+    /// statement of where this agent belongs, and a process that edited it
+    /// would be deciding that on their behalf. So the room lasts until the next
+    /// restart unless somebody adds it - which the log line says.
+    async fn open_invited_room(&self, room_id: &RoomId, start_loops: bool) {
+        let worker = Arc::new(self.build_worker(room_id, room_id.as_str(), (self.clock)()));
+        self.write_workers()
+            .insert(room_id.to_owned(), Arc::clone(&worker));
+        // Whatever the room already holds is history, exactly as at startup:
+        // an agent that has just walked in does not answer what was said
+        // before it arrived.
+        self.snapshot_room(room_id).await;
+        self.refresh_names(room_id).await;
+        if start_loops {
+            self.start_loops_for(&worker).await;
+        }
+        info!(
+            "{room_id}: joined and now watched like a configured room; it lasts until this \
+             process stops - add it to rooms: to keep it"
+        );
+    }
+
     // -- who this room can call whom ---------------------------------------
 
     /// Rebuild one room's names from the member store.
@@ -758,7 +984,7 @@ impl Connector {
     /// HTTP - and only runs at startup and when a membership event says the
     /// answer may have changed.
     async fn refresh_names(&self, room_id: &RoomId) {
-        let Some(worker) = self.workers.get(room_id) else {
+        let Some(worker) = self.worker(room_id) else {
             return;
         };
         let Some(room) = self.client.get_room(room_id) else {
@@ -945,6 +1171,55 @@ fn is_member_event<T>(raw: &Raw<T>) -> bool {
         .is_some_and(|kind| kind == "m.room.member")
 }
 
+/// Who invited `me`, out of an invitation's stripped room state.
+///
+/// The invitation carries a handful of state events the homeserver thinks a
+/// client needs to render it - the name, the topic, some memberships. Exactly
+/// one of them is the invitation itself: an `m.room.member` whose STATE KEY is
+/// this account and whose membership is `invite`. Its sender is the person who
+/// asked. Anything looser (the first member event, say, or the first sender)
+/// would read somebody else's join as an invitation.
+pub(crate) fn inviter_in(events: &[&str], me: &str) -> Option<String> {
+    for raw in events {
+        let Ok(event) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("m.room.member")
+            || event.get("state_key").and_then(Value::as_str) != Some(me)
+            || event.pointer("/content/membership").and_then(Value::as_str) != Some("invite")
+        {
+            continue;
+        }
+        return event
+            .get("sender")
+            .and_then(Value::as_str)
+            .filter(|sender| !sender.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    None
+}
+
+/// Why an invitation from `inviter` is one to take up, or None to leave it.
+///
+/// Two ways in and no third. `shared` is a room this agent is already in with
+/// them, which is the one that matters day to day: somebody who can talk to the
+/// agent where it is can ask it somewhere else, and nobody else can. `listed`
+/// is `policy.accept_invites_from`, for the first invitation - the one that puts
+/// the agent in its first room, where there is no shared room to be in yet.
+pub(crate) fn invite_reason(
+    shared: Option<&RoomId>,
+    inviter: &str,
+    listed: &[String],
+) -> Option<String> {
+    if let Some(room_id) = shared {
+        return Some(format!("we are both in {room_id}"));
+    }
+    listed
+        .iter()
+        .any(|user_id| user_id == inviter)
+        .then(|| "they are in policy.accept_invites_from".to_owned())
+}
+
 /// Who spoke last in the conversation `ev` belongs to, out of the transcript.
 ///
 /// The transcript is the room's own record of what happened in what order, so
@@ -1073,7 +1348,7 @@ pub(crate) async fn normalise_event(
 
 impl Connector {
     async fn on_message(&self, room_id: &RoomId, raw: &str) {
-        let Some(worker) = self.workers.get(room_id) else {
+        let Some(worker) = self.worker(room_id) else {
             return;
         };
         let Some(source) = read_source(raw) else {
@@ -1083,7 +1358,7 @@ impl Connector {
         // `m.room.message` and a redaction is not a message at all.
         if let Some(correction) = correction_from(&source) {
             let mut state = worker.state.lock().await;
-            Self::apply_correction(worker, &mut state, &correction);
+            Self::apply_correction(&worker, &mut state, &correction);
             return;
         }
         let room = self.client.get_room(room_id);
@@ -1117,13 +1392,13 @@ impl Connector {
             // answer.
             let thread = ev.thread_root_or_self().to_owned();
             state.ledger.note_event(&thread, ev.is_bot);
-            self.decide(worker, &mut state, &ev)
+            self.decide(&worker, &mut state, &ev)
         };
         // Before the back-off, not after it: the whole cost of an on-demand
         // model is the loading, and the one moment we know a turn may be coming
         // is now.
         warm_for(self.brain.as_ref(), room_id, &decision).await;
-        self.route(worker, decision, ev).await;
+        self.route(&worker, decision, ev).await;
     }
 
     /// Somebody else spoke here, so anything I left open here is closed.
@@ -1451,6 +1726,103 @@ mod tests {
         assert_eq!(whose, "@bot-b:example.com");
     }
 
+    // -- invitations ------------------------------------------------------
+    //
+    // An invitation is two decisions, and both are pure: WHO asked (out of the
+    // stripped state the homeserver sends with it) and whether that is somebody
+    // this agent takes a room from. Everything around them - the join, the
+    // worker, the room loops - is a live gate's job (C-5).
+
+    /// One stripped state event, as an invitation carries it.
+    fn stripped(kind: &str, sender: &str, state_key: &str, membership: &str) -> String {
+        serde_json::json!({
+            "type": kind,
+            "sender": sender,
+            "state_key": state_key,
+            "content": { "membership": membership },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_inviter_is_the_sender_of_my_own_invite_and_nobody_else() {
+        // The invitation carries whatever state the homeserver thinks a client
+        // needs to render it, and most of it is other people's memberships.
+        // Reading the first member event, or the first sender, would make
+        // somebody else's join look like an invitation.
+        let events = [
+            stripped("m.room.member", HUMAN, HUMAN, "join"),
+            stripped("m.room.member", "@stranger:example.com", ME, "invite"),
+        ];
+        let raw: Vec<&str> = events.iter().map(String::as_str).collect();
+        assert_eq!(
+            inviter_in(&raw, ME).as_deref(),
+            Some("@stranger:example.com")
+        );
+
+        // An invitation for somebody ELSE in the same room is not mine.
+        let others = [stripped(
+            "m.room.member",
+            HUMAN,
+            "@bot-b:example.com",
+            "invite",
+        )];
+        let raw: Vec<&str> = others.iter().map(String::as_str).collect();
+        assert_eq!(inviter_in(&raw, ME), None);
+
+        // Neither is a join of my own, which is what a room I am already in
+        // sends. Same type, same state key, different membership.
+        let joined = [stripped("m.room.member", HUMAN, ME, "join")];
+        let raw: Vec<&str> = joined.iter().map(String::as_str).collect();
+        assert_eq!(inviter_in(&raw, ME), None);
+
+        // And nothing at all out of a name, a topic, or unparseable junk.
+        let noise = [
+            r#"{"type": "m.room.name", "sender": "@x:example.com", "content": {"name": "x"}}"#
+                .to_owned(),
+            "{not json".to_owned(),
+        ];
+        let raw: Vec<&str> = noise.iter().map(String::as_str).collect();
+        assert_eq!(inviter_in(&raw, ME), None);
+        assert_eq!(inviter_in(&[], ME), None);
+    }
+
+    #[test]
+    fn an_invitation_is_taken_up_from_somebody_i_am_already_in_a_room_with() {
+        // The rule that carries the day-to-day case: somebody who can talk to
+        // this agent where it is can ask it somewhere else, and nobody else
+        // can. The reason names the room, because that is what the log has to
+        // say to be worth reading.
+        let room = RoomId::parse(testkit::ROOM_ID).expect("a room id");
+        let reason = invite_reason(Some(&room), HUMAN, &[]).expect("a member may invite me");
+        assert!(reason.contains(testkit::ROOM_ID), "{reason}");
+    }
+
+    #[test]
+    fn a_stranger_is_only_let_in_by_the_configured_list() {
+        // The first invitation of all - the one that puts an agent in its first
+        // room - comes from somebody it shares no room with, because there is
+        // no room yet. `policy.accept_invites_from` is the operator saying so
+        // in advance, and it is the ONLY other way in.
+        let stranger = "@friend:example.com";
+        assert_eq!(invite_reason(None, stranger, &[]), None);
+        assert_eq!(
+            invite_reason(None, stranger, &["@somebody-else:example.com".to_owned()]),
+            None
+        );
+        let policy = PolicyConfig {
+            accept_invites_from: vec!["@friend:example.com".to_owned()],
+            ..PolicyConfig::default()
+        };
+        let reason = invite_reason(None, stranger, &policy.accept_invites_from)
+            .expect("a listed user may invite me");
+        assert!(reason.contains("accept_invites_from"), "{reason}");
+
+        // And the default list lets nobody in, which is what makes an agent
+        // nobody has configured unreachable by a stranger.
+        assert!(PolicyConfig::default().accept_invites_from.is_empty());
+    }
+
     /// One event as the homeserver sends it, threaded or not.
     fn event(event_id: &str, sender: &str, ts: f64, thread_root: Option<&str>) -> RoomEvent {
         let mut content = serde_json::json!({ "msgtype": "m.text", "body": "hello" });
@@ -1679,8 +2051,8 @@ mod tests {
         }
     }
 
-    fn only_room(connector: &Connector) -> &Arc<RoomWorker> {
-        connector.workers.values().next().expect("one room")
+    fn only_room(connector: &Connector) -> Arc<RoomWorker> {
+        connector.all_workers().into_iter().next().expect("one room")
     }
 
     #[tokio::test(start_paused = true)]

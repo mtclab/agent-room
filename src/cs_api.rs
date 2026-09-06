@@ -373,6 +373,26 @@ impl CommandClient {
         Ok((status == 200).then_some(body))
     }
 
+    /// The room's encryption algorithm, or None when the room is not encrypted.
+    ///
+    /// `m.room.encryption` is the whole answer to "would a message I send here
+    /// be plaintext?": the state event exists exactly when the room is
+    /// encrypted, and a homeserver that does not have it answers 404, which
+    /// [`Self::room_state_event`] reports as None.
+    ///
+    /// # Errors
+    /// When the homeserver cannot be reached.
+    pub async fn room_encryption(&self, room_id: &str) -> Result<Option<String>> {
+        let content = self.room_state_event(room_id, "m.room.encryption").await?;
+        Ok(content.map(|content| {
+            content
+                .get("algorithm")
+                .and_then(Value::as_str)
+                .unwrap_or("an algorithm it did not name")
+                .to_owned()
+        }))
+    }
+
     /// Resolve a room alias to a room id.
     ///
     /// # Errors
@@ -563,6 +583,43 @@ pub async fn authenticate(api: &CommandClient, cfg: &Config) -> Result<String> {
             "the homeserver would not confirm the token it just issued",
         )),
     }
+}
+
+/// Turn `rooms:` into room ids, once.
+///
+/// The same job `matrix::resolve_rooms` does for the connector, over the
+/// Client-Server API rather than the SDK: `GET /directory/room/{alias}`. An
+/// alias is a NAME for a room, so a session that was configured with one
+/// resolves it here and works with the id afterwards - `/rooms/{alias}/...` is
+/// a 404 on every endpoint there is.
+///
+/// Returns `(as configured, room id)` in the configured order. An entry that is
+/// already a room id is passed through untouched, so nothing is asked of the
+/// homeserver for the ordinary config.
+///
+/// # Errors
+/// When an alias does not resolve, or the homeserver cannot be reached.
+pub async fn resolve_rooms(api: &CommandClient, rooms: &[String]) -> Result<Vec<(String, String)>> {
+    let mut resolved = Vec::new();
+    for room in rooms {
+        if !room.starts_with('#') {
+            resolved.push((room.clone(), room.clone()));
+            continue;
+        }
+        match api.resolve_alias(room).await? {
+            Ok(room_id) => {
+                info!("{room} is {room_id}");
+                resolved.push((room.clone(), room_id));
+            }
+            Err(message) => {
+                return Err(CsError::refused(format!(
+                    "rooms: {room} does not resolve on this homeserver ({message}); check the \
+                     alias, or use the room id (!id:server)"
+                )));
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Join every configured room, returning the ones that worked.

@@ -11,8 +11,14 @@ user_id: "@my-agent:example.com"
 # exactly one of:
 access_token_file: ~/.config/agent-room/token   # 0600
 # password: "..."                                # logs in at start, token cached 0600
+# Room ids or aliases; an alias is resolved once at startup and the id is used
+# afterwards. The per-room files under state_dir are named after what you write
+# HERE, so changing an entry from an alias to its id (or back) starts that room
+# a fresh ledger and transcript - and `agent-room impulse --room` takes the same
+# string this list does.
 rooms:
   - "!roomid:example.com"
+  # - "#the-room:example.com"
 persona_file: ~/.config/agent-room/persona.md   # written by `agent-room init`
 state_dir: ~/.local/state/agent-room            # per-room JSONL transcript + ledgers
 # Only for rooms that are NOT encrypted: keep running on a device whose keys
@@ -191,6 +197,14 @@ policy:
   # decay, tier2_per_hour_max and the stand-down re-read). `all` answers other
   # agents but never joins in uninvited; `none` ignores them entirely.
   bot_to_bot: mentions             # none | mentions | all | conversational
+  # INVITATIONS, while it is running. An invitation from somebody the agent
+  # already shares a room with is joined by itself: they can talk to it where it
+  # is, so they can ask it somewhere else. Anybody else is logged and left alone
+  # - not rejected, because that is a question for you - unless you name them
+  # here. This is also how the FIRST invitation works, before there is a shared
+  # room to be in. A room joined this way lasts until the next restart; add it
+  # to rooms: to keep it.
+  accept_invites_from: []          # e.g. ["@a-friend:example.com"]
   bot_user_ids: []                 # extra user ids that count as bots
   bot_localpart_patterns: []       # localpart regexes that count as bots, e.g. ["^bot-"]
   budgets:

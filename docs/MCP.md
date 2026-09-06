@@ -81,6 +81,24 @@ policy:
     per_hour_max: 30
 ```
 
+- **The room must not be encrypted.** `agent-room mcp` is a plain
+  Client-Server client - no crypto store, no device identity, no room keys - so
+  a message it posts into an encrypted room is not refused by anything: it
+  arrives as readable plaintext in a room whose whole point is that its contents
+  are not readable, and every other client shows it as the one line anybody can
+  read. So the server checks each configured room's `m.room.encryption` when it
+  starts, and refuses to start at all if one of them is encrypted, naming the
+  room and saying why (exit 2). `agent-room doctor` on the same config fails
+  that room's row with the same reason, so you find out before you register the
+  server rather than after. The connector (`agent-room run`) has the store and
+  encrypts properly, so that is what an encrypted room gets; a live session in
+  an encrypted room needs a crypto store for the session client, which is on the
+  list for after 1.0.0 (`docs/ROADMAP.md`).
+- **A room alias works.** `rooms: ["#the-room:example.com"]` is resolved to its
+  room id once, when the server starts, and every path after that uses the id
+  (`/rooms/{alias}/...` is a 404 on every Matrix endpoint there is). The tools
+  take either form, `room_list` reports the id, and the session's ledger and
+  impulse inlet under `state_dir` stay named after what you wrote in `rooms:`.
 - **The token file must be 0600.** The server refuses to start otherwise, before
   it serves anything: the token is the account.
 - **Give the session its own `state_dir`.** It keeps its budget ledger there
@@ -161,11 +179,14 @@ into by its policy, a session has to choose:
 
 ## Watch out for
 
-- **The first tool call is where the network happens.** The server starts
-  instantly and authenticates and joins on the first call, so a wrong token or a
-  homeserver that is down shows up as a readable tool error rather than an MCP
-  server that will not come up. Nothing retries: a homeserver that is not there
-  is an error in under a second, not a call that never returns.
+- **The first tool call is still where most of the network happens.** The
+  server authenticates and joins at start-up now, but only to answer the two
+  questions that can make a config unusable - what an alias names, and whether a
+  room is encrypted. Anything that might work next time is left where it always
+  was: a wrong token or a homeserver that is down shows up as a readable tool
+  error rather than an MCP server that will not come up. Nothing retries: a
+  homeserver that is not there is an error in under a second, not a call that
+  never returns.
 - **`room_threads` on an old homeserver.** `/threads` is Matrix v1.4; without
   it the counts are worked out from the last few hundred messages, so they are a
   floor rather than the server's own total.

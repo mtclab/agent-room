@@ -95,6 +95,10 @@ pub struct State {
     pub invited_from_sync: usize,
     pub invited: Vec<String>,
     pub aliases: BTreeMap<String, String>,
+    /// Which rooms have `m.room.encryption`, and with which algorithm. Every
+    /// other room answers 404 the way a homeserver does for a state event that
+    /// is not there.
+    pub encrypted: BTreeMap<String, String>,
     /// Stop answering `/joined_rooms` altogether, mid-run.
     pub rooms_go_away: bool,
     pub login_token: String,
@@ -132,6 +136,7 @@ impl State {
             invited_from_sync: 0,
             invited: Vec::new(),
             aliases: BTreeMap::new(),
+            encrypted: BTreeMap::new(),
             rooms_go_away: false,
             login_token: "syt_from_login".to_owned(),
             login_error: None,
@@ -478,6 +483,16 @@ fn route(
             .collect();
         return Some((200, json!({ "joined": joined })));
     }
+    if path.ends_with("/state/m.room.encryption") {
+        let room = room_in_path(path);
+        return Some(match state.encrypted.get(&room) {
+            Some(algorithm) => (200, json!({ "algorithm": algorithm })),
+            None => (
+                404,
+                json!({"errcode": "M_NOT_FOUND", "error": "Event not found."}),
+            ),
+        });
+    }
     if path.ends_with("/state/m.room.name") {
         return Some(match &state.name {
             Some(name) => (200, json!({ "name": name })),
@@ -560,6 +575,14 @@ fn route(
         return Some((200, json!({ "event_id": event_id })));
     }
     panic!("the fake homeserver was asked for {method} {path}");
+}
+
+/// The room id out of `/_matrix/client/v3/rooms/{room}/...`, already decoded.
+fn room_in_path(path: &str) -> String {
+    path.split_once("/rooms/")
+        .and_then(|(_before, rest)| rest.split('/').next())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// `/messages`, newest first, with `from` as an index into that ordering.

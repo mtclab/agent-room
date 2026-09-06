@@ -483,6 +483,24 @@ impl<'a> Doctor<'a> {
             }
         }
         if joined.contains(&room_id) {
+            // A config with no brain is a live session's (`agent-room mcp`),
+            // and that client has no crypto store: an encrypted room is the one
+            // place it must never post. The connector encrypts, so the same
+            // room in a connector's config is not a failure at all.
+            if self.cfg.brain.is_none()
+                && let Some(algorithm) = api.room_encryption(&room_id).await?
+            {
+                return Ok(Check::fail(
+                    name,
+                    format!(
+                        "joined, and it is ENCRYPTED ({algorithm}): `agent-room mcp` has no \
+                         crypto store, so anything it posted here would be plaintext in an \
+                         encrypted room"
+                    ),
+                    "run a connector (`agent-room run`) for this room instead, or take it out \
+                     of rooms: in this session's config",
+                ));
+            }
             return Ok(Check::pass(name, "joined"));
         }
         if invited.contains(&room_id) {

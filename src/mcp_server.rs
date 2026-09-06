@@ -39,7 +39,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info};
 
 use crate::config::{Config, require_private_mode};
-use crate::cs_api::{CS_V1, CS_V3, CommandClient, CsError, authenticate, join_rooms, quote};
+use crate::cs_api::{
+    CS_V1, CS_V3, CommandClient, CsError, authenticate, join_rooms, quote, resolve_rooms,
+};
 use crate::events::{
     ANNOTATION_REL_TYPE, BotRules, REACTION_TYPE, Relation, RoomEvent, THREAD_REL_TYPE,
     build_reply_content, from_source, is_message_source,
@@ -183,6 +185,29 @@ fn clamp(value: i64, low: i64, high: i64) -> i64 {
     value.max(low).min(high)
 }
 
+/// Why a live session will not serve an encrypted room, in one line.
+///
+/// `agent-room mcp` is a plain Client-Server client: it has no crypto store, no
+/// device identity and no room keys, so `room_post` would send `m.room.message`
+/// into a room where every other client sends `m.room.encrypted`. That does not
+/// fail - it WORKS, and puts a readable line in a room whose whole point is
+/// that its contents are not readable. So the session refuses to start, rather
+/// than being the one participant leaking the conversation.
+#[must_use]
+pub fn encrypted_refusal(room: &RoomKey, algorithm: &str) -> String {
+    let named = if room.configured == room.id {
+        room.id.clone()
+    } else {
+        format!("{} ({})", room.configured, room.id)
+    };
+    format!(
+        "{named} is encrypted ({algorithm}) and `agent-room mcp` has no crypto store: anything \
+         it posted there would be plaintext in an encrypted room, readable to anyone who can \
+         see the timeline. Use `agent-room run` for that room - the connector encrypts - or \
+         take it out of rooms: in this session's config."
+    )
+}
+
 /// Mentions a homeserver will accept, in the order they were given.
 fn checked_mentions(mention: &[String]) -> ToolResult<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
@@ -206,9 +231,11 @@ fn checked_mentions(mention: &[String]) -> ToolResult<Vec<String>> {
 ///
 /// Every method here is what a tool does; the tools themselves only validate
 /// arguments and turn a refusal into an MCP error. Nothing is done at
-/// construction time, so `agent-room mcp` starts instantly and a homeserver
-/// that is down becomes a readable tool error rather than a server that will
-/// not come up.
+/// construction time; `serve` then calls [`RoomClient::start_up`] once, only to
+/// settle the two things that would make a config unusable (what an alias
+/// names, and whether a room is encrypted). Everything else stays lazy, so a
+/// homeserver that is down is still a readable tool error rather than a server
+/// that will not come up.
 pub struct RoomClient {
     cfg: Arc<Config>,
     api: CommandClient,
@@ -217,11 +244,36 @@ pub struct RoomClient {
     me: Mutex<String>,
     ledgers: Mutex<BTreeMap<String, Ledger>>,
     members: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// What each configured room turned out to be. Both halves are the string
+    /// in `rooms:` until [`RoomClient::ensure_ready`] has asked the homeserver
+    /// what an alias means - and for a config that names room ids, which is
+    /// most of them, they stay equal and nothing is asked at all.
+    rooms: Mutex<Vec<RoomKey>>,
+    /// Why this session can never serve these rooms, once something has said
+    /// so: an alias that does not resolve, or a room this client would have to
+    /// post plaintext into. Read by [`RoomClient::start_up`], which is what
+    /// makes `agent-room mcp` refuse to start rather than hand a session tools
+    /// that cannot work.
+    fatal: Mutex<Option<String>>,
     /// Authenticate and join once, on the first tool call that needs it.
     ready: AsyncMutex<bool>,
     /// One `/sync` conversation at a time: two overlapping long polls on one
     /// account would fight over `next_batch` and lose events between them.
     sync: AsyncMutex<Option<String>>,
+}
+
+/// One configured room: what the operator wrote, and which room that is.
+///
+/// The two are different only for an alias, and the difference matters in both
+/// directions: every Client-Server path needs the ID (`/rooms/{alias}/...` is a
+/// 404 on every endpoint there is), and every file under `state_dir` is named
+/// after what was CONFIGURED - the budget ledger, and the impulse inlet a
+/// connector reads, which has to be the same directory `agent-room impulse
+/// --room` writes to.
+#[derive(Debug, Clone)]
+pub struct RoomKey {
+    pub configured: String,
+    pub id: String,
 }
 
 impl RoomClient {
@@ -243,6 +295,14 @@ impl RoomClient {
             })
             .collect();
         let me = cfg.user_id.clone();
+        let rooms = cfg
+            .rooms
+            .iter()
+            .map(|room| RoomKey {
+                configured: room.clone(),
+                id: room.clone(),
+            })
+            .collect();
         Ok(Self {
             cfg,
             api,
@@ -251,6 +311,8 @@ impl RoomClient {
             me: Mutex::new(me),
             ledgers: Mutex::new(ledgers),
             members: Mutex::new(HashMap::new()),
+            rooms: Mutex::new(rooms),
+            fatal: Mutex::new(None),
             ready: AsyncMutex::new(false),
             sync: AsyncMutex::new(None),
         })
@@ -296,18 +358,53 @@ impl RoomClient {
 
     // -- lifecycle -------------------------------------------------------
 
-    /// Authenticate and join, once, on the first tool call that needs it.
+    /// Authenticate, resolve, join and check, once.
+    ///
+    /// Four things in this order, because each one needs the one before it: a
+    /// token, the room ids any alias in `rooms:` names, a join, and then the
+    /// one question a client with no crypto store has to ask - is this room
+    /// encrypted? Two of the four failures are for ever (an alias that does not
+    /// resolve, an encrypted room) and are remembered in `fatal`, so
+    /// [`Self::start_up`] can refuse to serve at all rather than let a session
+    /// discover it one tool call at a time.
     async fn ensure_ready(&self) -> ToolResult<()> {
         let mut ready = self.ready.lock().await;
         if *ready {
             return Ok(());
         }
+        if let Some(fatal) = self.fatal_reason() {
+            return Err(fatal);
+        }
         let me = authenticate(&self.api, &self.cfg)
             .await
             .map_err(|exc| self.readable(&exc))?;
-        let joined = join_rooms(&self.api, &self.cfg.rooms).await;
+        let resolved = match resolve_rooms(&self.api, &self.cfg.rooms).await {
+            Ok(resolved) => resolved,
+            // The homeserver answered and said no: the alias is wrong, or it is
+            // not this homeserver's. Nothing about that changes on a retry.
+            Err(exc @ CsError::Refused(_)) => return Err(self.give_up(&self.readable(&exc))),
+            Err(exc) => return Err(self.readable(&exc)),
+        };
+        let keys: Vec<RoomKey> = resolved
+            .into_iter()
+            .map(|(configured, id)| RoomKey { configured, id })
+            .collect();
+        if let Ok(mut held) = self.rooms.lock() {
+            keys.clone_into(&mut held);
+        }
+        let ids: Vec<String> = keys.iter().map(|key| key.id.clone()).collect();
+        let joined = join_rooms(&self.api, &ids).await;
         if joined.is_empty() {
             return Err("could not join any configured room".to_owned());
+        }
+        for key in &keys {
+            match self.api.room_encryption(&key.id).await {
+                Ok(None) => {}
+                Ok(Some(algorithm)) => {
+                    return Err(self.give_up(&encrypted_refusal(key, &algorithm)));
+                }
+                Err(exc) => return Err(self.readable(&exc)),
+            }
         }
         if let Ok(mut held) = self.me.lock() {
             me.clone_into(&mut held);
@@ -315,6 +412,71 @@ impl RoomClient {
         *ready = true;
         info!("live session {me} in {}", joined.join(", "));
         Ok(())
+    }
+
+    /// Get ready before a session is told it has tools, and say so if it never
+    /// can be.
+    ///
+    /// The design has always been that the server starts instantly and the
+    /// FIRST TOOL CALL is where the network happens, so a homeserver that is
+    /// down is a readable tool error rather than an MCP server that will not
+    /// come up. That still holds for everything that might work next time. What
+    /// does not is a room this session must never post into and an alias that
+    /// names no room: those are the config being wrong, and a session that was
+    /// handed `room_post` for an encrypted room would find out by posting
+    /// plaintext in it.
+    ///
+    /// # Errors
+    /// When a configured room is encrypted, or an alias does not resolve.
+    pub async fn start_up(&self) -> anyhow::Result<()> {
+        if let Err(message) = self.ensure_ready().await {
+            if let Some(fatal) = self.fatal_reason() {
+                anyhow::bail!(fatal);
+            }
+            tracing::warn!("not ready yet: {message}. The first tool call will say so too.");
+        }
+        Ok(())
+    }
+
+    /// Remember a refusal that no retry will lift, and return it.
+    fn give_up(&self, message: &str) -> String {
+        if let Ok(mut held) = self.fatal.lock() {
+            *held = Some(message.to_owned());
+        }
+        message.to_owned()
+    }
+
+    /// The refusal that will never lift, if one has been found.
+    fn fatal_reason(&self) -> Option<String> {
+        self.fatal.lock().ok().and_then(|held| held.clone())
+    }
+
+    // -- which room is which ---------------------------------------------
+
+    /// This session's rooms as the homeserver knows them.
+    fn room_keys(&self) -> Vec<RoomKey> {
+        self.rooms
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default()
+    }
+
+    /// The ROOM ID for either form of a room's name - what every
+    /// Client-Server path is built from.
+    fn resolved(&self, room: &str) -> String {
+        self.room_keys()
+            .into_iter()
+            .find(|key| key.configured == room || key.id == room)
+            .map_or_else(|| room.to_owned(), |key| key.id)
+    }
+
+    /// The CONFIGURED name for either form - what every file under `state_dir`
+    /// is named after, and the key of this session's ledgers.
+    fn configured(&self, room: &str) -> String {
+        self.room_keys()
+            .into_iter()
+            .find(|key| key.configured == room || key.id == room)
+            .map_or_else(|| room.to_owned(), |key| key.configured)
     }
 
     // -- the Client-Server API -------------------------------------------
@@ -469,12 +631,19 @@ impl RoomClient {
     /// # Errors
     /// When `room_id` is not one of the configured rooms.
     pub fn check_room(&self, room_id: &str) -> ToolResult<()> {
-        if self.cfg.rooms.iter().any(|room| room == room_id) {
+        let keys = self.room_keys();
+        if keys
+            .iter()
+            .any(|key| key.configured == room_id || key.id == room_id)
+        {
             return Ok(());
         }
+        // Either form is accepted, and the list names the room ids, because
+        // that is what `room_list` reports and what a session will have.
+        let known: Vec<String> = keys.into_iter().map(|key| key.id).collect();
         Err(format!(
             "{room_id} is not one of this session's rooms ({}); check the config",
-            self.cfg.rooms.join(", ")
+            known.join(", ")
         ))
     }
 
@@ -490,6 +659,9 @@ impl RoomClient {
     #[must_use]
     pub fn budget_refusal(&self, room_id: &str) -> Option<String> {
         let now = self.now();
+        // The ledgers are keyed by what was CONFIGURED, because that is what
+        // the file on disk is named after.
+        let room_id = &self.configured(room_id);
         let Ok(ledgers) = self.ledgers.lock() else {
             return Some(
                 "this session's budget ledger could not be read (an earlier call left it \
@@ -527,6 +699,7 @@ impl RoomClient {
 
     fn record_post(&self, room_id: &str, event_id: &str, thread_root: &str, replied: &str) {
         let now = self.now();
+        let room_id = &self.configured(room_id);
         if let Ok(mut ledgers) = self.ledgers.lock()
             && let Some(ledger) = ledgers.get_mut(room_id)
         {
@@ -543,7 +716,8 @@ impl RoomClient {
     pub async fn list_rooms(&self) -> ToolResult<Vec<RoomOut>> {
         self.ensure_ready().await?;
         let mut rooms = Vec::new();
-        for room_id in &self.cfg.rooms {
+        for key in self.room_keys() {
+            let room_id = &key.id;
             let names = self.member_names(room_id, true).await?;
             let sources = self.tail(room_id, ACTIVITY_SCAN).await?;
             let events = self.events(&sources, room_id, &names);
@@ -584,6 +758,8 @@ impl RoomClient {
     ) -> ToolResult<Vec<MessageOut>> {
         self.check_room(room_id)?;
         self.ensure_ready().await?;
+        // Everything below talks to the homeserver, which only knows the id.
+        let room_id = &self.resolved(room_id);
         let limit = clamp(limit, 1, MAX_READ);
         let names = self.member_names(room_id, false).await?;
         let mut events = if let Some(root) = thread_root {
@@ -676,6 +852,7 @@ impl RoomClient {
         }
         let mut mentions = checked_mentions(mention)?;
         self.ensure_ready().await?;
+        let room_id = &self.resolved(room_id);
         let mut replied_sender = String::new();
         if let Some(reply_to) = reply_to {
             let replied = self
@@ -745,7 +922,12 @@ impl RoomClient {
             return Err("nothing to record: text is empty".to_owned());
         }
         let ttl_s = self.cfg.policy.impulse_ttl_s;
-        let path = write_impulse(&self.cfg.state_dir, room_id, text, kind, "", ttl_s, None)
+        // The inlet is named after what the CONNECTOR has in its `rooms:`, not
+        // after the id this session calls the room by: it is a directory that
+        // connector polls, and `agent-room impulse --room` writes to the same
+        // one (see `RoomWorker::state_key`).
+        let inlet = self.configured(room_id);
+        let path = write_impulse(&self.cfg.state_dir, &inlet, text, kind, "", ttl_s, None)
             .map_err(|exc| exc.to_string())?;
         info!("{room_id}: impulse recorded at {}", path.display());
         Ok(ImpulseOut {
@@ -768,6 +950,7 @@ impl RoomClient {
             return Err("nothing to react with: key is empty".to_owned());
         }
         self.ensure_ready().await?;
+        let room_id = &self.resolved(room_id);
         self.refuse_over_budget(room_id)?;
         let content = json!({
             "m.relates_to": {
@@ -798,6 +981,7 @@ impl RoomClient {
     pub async fn threads(&self, room_id: &str, limit: i64) -> ToolResult<Vec<ThreadOut>> {
         self.check_room(room_id)?;
         self.ensure_ready().await?;
+        let room_id = &self.resolved(room_id);
         let limit = clamp(limit, 1, MAX_THREAD_LIMIT);
         let names = self.member_names(room_id, false).await?;
         let path = format!("{CS_V1}/rooms/{}/threads", quote(room_id));
@@ -924,6 +1108,7 @@ impl RoomClient {
     ) -> ToolResult<Vec<MessageOut>> {
         self.check_room(room_id)?;
         self.ensure_ready().await?;
+        let room_id = &self.resolved(room_id);
         let timeout_s = timeout_s.clamp(0.0, MAX_WAIT_S);
         let names = self.member_names(room_id, false).await?;
         let mut sync = self.sync.lock().await;
@@ -1003,7 +1188,7 @@ impl RoomClient {
             "presence": {"types": []},
             "account_data": {"types": []},
             "room": {
-                "rooms": self.cfg.rooms,
+                "rooms": self.room_keys().into_iter().map(|key| key.id).collect::<Vec<String>>(),
                 "ephemeral": {"types": []},
                 "account_data": {"types": []},
                 "state": {"lazy_load_members": true},
@@ -1281,15 +1466,22 @@ impl ServerHandler for AgentRoomServer {
 /// The token file is checked here, before anything is served: a session that
 /// would hand its account to whoever can read a 0644 file should not start at
 /// all, and failing at startup is what the person driving it will actually see.
+/// So is the config's rooms - an alias that names nothing, and a room this
+/// client would post plaintext into (see [`RoomClient::start_up`]).
 ///
 /// # Errors
-/// When the token file is too permissive, the config is unusable, or the stdio
-/// transport fails.
+/// When the token file is too permissive, a configured room is encrypted or
+/// its alias does not resolve, the config is unusable, or the stdio transport
+/// fails.
 pub async fn serve(cfg: Config) -> anyhow::Result<i32> {
     if let Some(path) = &cfg.access_token_file {
         require_private_mode(path, "access_token_file")?;
     }
     let rooms = Arc::new(RoomClient::from_config(Arc::new(cfg))?);
+    // Resolve any alias and refuse an encrypted room BEFORE the session is told
+    // it has tools. Everything that might work next time still happens lazily -
+    // see `RoomClient::start_up`.
+    rooms.start_up().await?;
     let service = rmcp::serve_server(AgentRoomServer::new(rooms), stdio()).await?;
     debug!("{SERVER_NAME} MCP server ready on stdio");
     service.waiting().await?;

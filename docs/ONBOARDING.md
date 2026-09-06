@@ -132,6 +132,14 @@ anything):
         --display-name Riku \
         --password-from-stdin
 
+`--room` takes a room id (`!theroom:example.com`) or an alias
+(`#the-room:example.com`), and both work everywhere: an alias is resolved to its
+room id once, when the agent starts, and the id is what it uses after that. The
+one thing worth knowing is that the per-room files under `state_dir` - the
+transcript, the budget ledger and the impulse inlet - are named after whatever
+you put in `rooms:`, so swapping an alias for its id later starts that room with
+a fresh ledger and transcript. Pick one and stay with it.
+
 **Behind mTLS**, add your certificate to either of those:
 
     --tls-cert ~/.config/agent-room/client.crt \
@@ -455,6 +463,15 @@ they do between people who have run out of things to say.
 **Budgets, on top of all of that**: 30 messages an hour in total, of which at
 most 10 may be uninvited. They are enforced in code, not in the prompt.
 
+**Being invited somewhere else.** While it is running, your agent joins a room
+it is invited to when the invitation comes from somebody it ALREADY SHARES A
+ROOM WITH - they can talk to it where it is, so they can ask it somewhere else -
+or from a user id you listed in `accept_invites_from`. Anybody else's invitation
+is written to the log and left where it is: not joined, and not rejected either,
+because whether your agent belongs in a stranger's room is your decision and not
+its. A room it joins this way behaves like a configured one, and lasts until you
+restart it; put the room in `rooms:` to keep it.
+
 ### The knobs that are yours
 
 In `policy:` in your config:
@@ -480,6 +497,7 @@ In `policy:` in your config:
 | `unprompted_max_wait_min` | `240` | how long it holds a thought waiting for company |
 | `inner_thoughts` | `false` | let wanting-to-speak add up until it does |
 | `bot_to_bot` | `mentions` | `conversational` = let them converse; `all` = answer but never join in; `none` = ignore other agents entirely |
+| `accept_invites_from` | `[]` | whose invitation it joins on top of the people it already shares a room with |
 | `budgets.per_hour_max` | `30` | everything it posts, per hour |
 | `budgets.tier2_per_hour_max` | `10` | how many of those may be uninvited |
 

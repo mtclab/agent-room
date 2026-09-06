@@ -887,6 +887,72 @@ room counts as being asked."*
 
 Knobs: `room_invitations` (true).
 
+### Rooms: aliases and invitations (BUILT 2026-09-06, 1.0.0-rc.6)
+
+Three things about WHICH rooms an agent is in, all three found by reading the
+code rather than by running it.
+
+**An alias is a name, not a room.** `init` and `doctor` had accepted
+`#room:server` since S5, and `run` refused the config they wrote: it parsed
+every `rooms:` entry with `RoomId::parse` and stopped. `agent-room mcp` was
+worse - it JOINED by alias (which works, `/join/{roomIdOrAlias}` takes either)
+and then 404ed on every `/rooms/{alias}/...` path afterwards, because no other
+Matrix endpoint takes an alias. So `rooms:` is resolved ONCE at start-up - the
+connector through the SDK, the session through `GET /directory/room/{alias}` -
+and the room id is what everything below that line uses: the workers map, the
+sync loop, every log line and every request. A resolution that fails is exit 2
+(`matrix::BadRooms`): the config names a room nothing can find, and no amount of
+retrying changes that.
+
+What the state files are named after is deliberately NOT the room id. Every file
+under `state_dir/rooms/` - the transcript, the ledger, and the impulse inlet - is
+named after the string in `rooms:`, so a room configured by id keeps exactly the
+files it has always had (`state_compat`), and a room configured by an alias gets
+files named after the alias. The inlet is why: it is a directory one process
+writes (`agent-room impulse --room`, or a session's `room_impulse`) and another
+polls, and the only name both of them have in common is the one in the config.
+The MCP server maps a tool's room id back to the configured name for exactly
+that reason. The cost is stated in `docs/ONBOARDING.md`: swapping an alias for
+its id later starts that room with a fresh ledger and transcript.
+
+**An invitation received while running is joined.** Joining used to happen once,
+at start-up, which made an agent something only its operator could put in a
+room: the person who wants it somewhere is in the room, and the operator is
+somewhere else. Now the sync stream's invitations are read, and one is taken up
+when the person who sent it is somebody this agent ALREADY SHARES A ROOM WITH -
+they can talk to it where it is, so they can ask it somewhere else - or when the
+operator listed them in `policy.accept_invites_from` (empty by default; it is
+how the FIRST invitation works, before there is a shared room to be in).
+
+Three details, each of them a decision:
+
+- **Anything else is logged at INFO and left alone, never rejected.** A
+  stranger's invitation is a question for the operator, and declining it on
+  their behalf throws the question away. It is decided once per process, so a
+  standing invitation is one log line rather than one per sync.
+- **Who invited me** is the sender of the `m.room.member` event whose state key
+  is this account and whose membership is `invite` - not the first member event
+  in the stripped state, which is usually somebody else's join.
+- **A joined room is a room like any other**: its own ledger, transcript,
+  unprompted loop and (if configured) heartbeat, and a `/messages` snapshot
+  first, so an agent that has just walked in does not answer what was said
+  before it arrived. It is NOT written back into `config.yaml`: `rooms:` is the
+  operator's statement of where this agent belongs. The log line says it lasts
+  until the process stops unless somebody adds it.
+
+Knobs: `accept_invites_from` (`[]`).
+
+**`agent-room mcp` refuses an encrypted room.** The session client is pure
+Client-Server with no crypto store (see "The store, and why E2EE lives or dies
+by it"), so a `room_post` into an encrypted room does not fail - it succeeds,
+and puts a readable line in a room whose whole point is that its contents are
+not readable. Each configured room's `m.room.encryption` is checked at start-up,
+and one that is encrypted stops the server before it serves anything, naming the
+room and saying to use `agent-room run` instead (exit 2). `doctor` fails that
+room's row for a session config with the same reason - and passes it for a
+connector config, which encrypts. A crypto store for the session client is on
+the list for after 1.0.0.
+
 ### Unprompted speech, second design (BUILT 2026-09-02, S6)
 
 Owner, 2026-09-02: *"isn't a random timer predestined, not organic?"* Yes. People

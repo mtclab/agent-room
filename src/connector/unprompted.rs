@@ -404,7 +404,10 @@ impl Runner {
     /// One pass: collect what wants saying, then say at most one of it.
     pub(crate) async fn unprompted_tick(&self, worker: &Arc<RoomWorker>) {
         let now = self.now();
-        let directory = impulse_dir(&self.cfg.state_dir, worker.room_id.as_str());
+        // The inlet is named after what the operator wrote in `rooms:`, because
+        // that is what `agent-room impulse --room` and the MCP session have to
+        // name - see `RoomWorker::state_key`.
+        let directory = impulse_dir(&self.cfg.state_dir, &worker.state_key);
         let limit_s = self.cfg.policy.unprompted_wait_limit_s();
         let (waiting, last_human_post_ts) = {
             let mut state = worker.state.lock().await;

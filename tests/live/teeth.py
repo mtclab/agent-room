@@ -5,14 +5,14 @@ script applies one surgical mutation at a time to the shipped source, rebuilds
 the release binary, runs only the gate that guard protects, records the
 outcome, and restores the file with `git checkout` (verified clean afterwards).
 
-Two kinds of gate. G1-G12, N1-N4, C-1/C-2/C-3, C1, C2, M2/M3/M5, D1 and T1 are
+Two kinds of gate. G1-G13, N1-N4, C-1/C-2/C-3, C1, C2, M2/M3/M5, D1 and T1 are
 LIVE journeys: they need `AGENT_ROOM_LIVE=1`, a homeserver in
 `~/.config/agent-room/live.env` and the bot tokens, and C1/C2 additionally spend
 the owner's Claude quota. The hyphenated C-1/C-2/C-3 are the CONVERSATION gates
 (`test_conversation.py`, no quota); C1/C2/C3 without the hyphen are the
 Claude-brain ones. Different gates, and the runner tells them apart by the exact
 name.
-U8-U23 are OFFLINE and are cargo's own tests, so they need nothing but the
+U8-U32 are OFFLINE and are cargo's own tests, so they need nothing but the
 toolchain.
 C3's teeth are not a mutation here: `AGENT_ROOM_LEAK_TEETH=1` is how that gate
 is stripped, and the run is recorded in `docs/GATES.md`.
@@ -68,8 +68,8 @@ class Mutation:
 # -- the mutations ----------------------------------------------------------
 #
 # Each entry breaks exactly one guard in `src/`, rebuilds the release binary and
-# runs only the gate that guard protects. G1-G12, N1-N4, C1-C3, M2/M3/M5, D1 and
-# T1 are live journeys driven through the rebuilt binary; U8-U18 are cargo's own
+# runs only the gate that guard protects. G1-G13, N1-N4, C1-C3, M2/M3/M5, D1 and
+# T1 are live journeys driven through the rebuilt binary; U8-U32 are cargo's own
 # offline gates and need no homeserver.
 
 #: The `Relation` literal `room_post` builds. Kept out of the table because a
@@ -115,6 +115,30 @@ THREAD_RELATION = """            &Relation {
                 reply_to,
                 thread_fallback: None,
             },"""
+
+#: The three conditions that make one stripped state event MY invitation. Out of
+#: the table because a multi-line Rust condition inside a dataclass argument is
+#: unreadable, and because the mutant has to replace all three at once to
+#: compile.
+INVITER_GUARD = """        if event.get("type").and_then(Value::as_str) != Some("m.room.member")
+            || event.get("state_key").and_then(Value::as_str) != Some(me)
+            || event.pointer("/content/membership").and_then(Value::as_str) != Some("invite")
+        {"""
+
+#: What is left of the inviter test when the state key and the membership are
+#: not checked: the sender of the FIRST member event in the invitation, which is
+#: usually somebody else's join. Out of the table for the same reason as the
+#: guard it replaces.
+INVITER_MUTANT = (
+    '        if event.get("type").and_then(Value::as_str) != Some("m.room.member") {  // TEETH'
+)
+
+#: The other half of `invite_reason`: a stranger is in only if the operator
+#: listed them. Same reason it is out of the table.
+INVITE_LIST_GUARD = """    listed
+        .iter()
+        .any(|user_id| user_id == inviter)
+        .then(|| "they are in policy.accept_invites_from".to_owned())"""
 
 MUTATIONS = [
     Mutation(
@@ -613,6 +637,78 @@ MUTATIONS = [
         old=ROOM_CUE,
         new='                "- it is addressed to the room rather than to one person"',
         test="brain::judging::tests::the_judge_is_told_what_is_free_to_know_about_the_room",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    # -- PR 5: rooms - aliases and invitations (1.0.0-rc.6) ------------------
+    Mutation(
+        gate="G13",
+        guard="connector: the invitations in a sync response are read at all",
+        path=RUST_SRC / "connector" / "mod.rs",
+        old="        for (room_id, update) in &response.rooms.invited {",
+        new="        for (room_id, update) in response.rooms.invited.iter().take(0) {  // TEETH",
+        test=(
+            "tests/live/test_journeys.py::"
+            "test_g13_an_invitation_from_a_member_is_joined_and_a_strangers_is_not"
+        ),
+    ),
+    Mutation(
+        gate="U27",
+        guard="cs_api: a room alias is resolved instead of being used as a room id",
+        path=RUST_SRC / "cs_api.rs",
+        old="        if !room.starts_with('#') {",
+        new="        if true {  // TEETH: an alias is passed through as if it named a room",
+        test="mcp::an_alias_is_resolved_once_and_nothing_afterwards_is_asked_about_it",
+        marker="offline",
+        cargo_test="r4_commands",
+    ),
+    Mutation(
+        gate="U28",
+        guard="mcp: a room's files stay named after what was CONFIGURED, not its id",
+        path=RUST_SRC / "mcp_server.rs",
+        old="            .map_or_else(|| room.to_owned(), |key| key.configured)",
+        new="            .map_or_else(|| room.to_owned(), |key| key.id)  // TEETH",
+        test="mcp::an_alias_configured_room_keeps_its_state_under_the_configured_name",
+        marker="offline",
+        cargo_test="r4_commands",
+    ),
+    Mutation(
+        gate="U29",
+        guard="mcp: the encryption probe that refuses to serve an encrypted room",
+        path=RUST_SRC / "mcp_server.rs",
+        old="            match self.api.room_encryption(&key.id).await {",
+        new="            match Ok::<Option<String>, CsError>(None) {  // TEETH: never encrypted",
+        test="mcp::an_encrypted_room_stops_the_server_before_it_serves",
+        marker="offline",
+        cargo_test="r4_commands",
+    ),
+    Mutation(
+        gate="U30",
+        guard="doctor: the encrypted-room row on a live session's config",
+        path=RUST_SRC / "doctor.rs",
+        old="            if self.cfg.brain.is_none()",
+        new="            if false && self.cfg.brain.is_none()  // TEETH",
+        test="doctor::an_encrypted_room_fails_the_row_for_a_live_sessions_config_only",
+        marker="offline",
+        cargo_test="r4_commands",
+    ),
+    Mutation(
+        gate="U31",
+        guard="connector: the inviter is the sender of MY invite, not of any member event",
+        path=RUST_SRC / "connector" / "mod.rs",
+        old=INVITER_GUARD,
+        new=INVITER_MUTANT,
+        test="connector::tests::the_inviter_is_the_sender_of_my_own_invite_and_nobody_else",
+        marker="offline",
+        cargo_lib=True,
+    ),
+    Mutation(
+        gate="U32",
+        guard="connector: a stranger's invitation needs policy.accept_invites_from",
+        path=RUST_SRC / "connector" / "mod.rs",
+        old=INVITE_LIST_GUARD,
+        new='    Some("they are in policy.accept_invites_from".to_owned())  // TEETH: anybody may',
+        test="connector::tests::a_stranger_is_only_let_in_by_the_configured_list",
         marker="offline",
         cargo_lib=True,
     ),
