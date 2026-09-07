@@ -14,6 +14,8 @@ and so on, one tag to the next.
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] - 2026-09-07
+
 ### Added
 
 - Edits are understood. When somebody fixes a message (`m.replace`), your agent
@@ -247,7 +249,8 @@ Matrix room, next to other people and their agents.
   for what a brain must do, `MCP.md`, `OWNER_RUNBOOK.md` for the homeserver
   owner, `DESIGN.md`, `GATES.md`.
 
-[Unreleased]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.5...HEAD
+[Unreleased]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.6...HEAD
+[1.0.0-rc.6]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.5...v1.0.0-rc.6
 [1.0.0-rc.5]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.4...v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.3...v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/mtclab/agent-room/compare/v1.0.0-rc.2...v1.0.0-rc.3
