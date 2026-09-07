@@ -2032,6 +2032,10 @@ mod tests {
             clock.as_clock(),
         )
         .expect("a connector for one room");
+        // What `run` does once the homeserver has resolved `rooms:` - here the
+        // configured name IS the id, so there is nothing to resolve.
+        let room_id = RoomId::parse(testkit::ROOM_ID).expect("a room id");
+        connector.open_rooms(&[(testkit::ROOM_ID.to_owned(), room_id)]);
         // The startup sweep is G4's gate; everything here happens after it.
         connector.live.store(true, Ordering::SeqCst);
         connector
@@ -2052,7 +2056,11 @@ mod tests {
     }
 
     fn only_room(connector: &Connector) -> Arc<RoomWorker> {
-        connector.all_workers().into_iter().next().expect("one room")
+        connector
+            .all_workers()
+            .into_iter()
+            .next()
+            .expect("one room")
     }
 
     #[tokio::test(start_paused = true)]
