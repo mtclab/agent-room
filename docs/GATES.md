@@ -2845,3 +2845,48 @@ about the gates.)
   yes and the homeserver got in the way; only a decision is remembered. Not
   gated: it needs a homeserver that refuses one join and allows the next, which
   the fake cannot be talked into without becoming a different fake.
+
+# Release 1.0.0-rc.6 (2026-09-07)
+
+Everything merged for rc.6: PRs 13 (event correctness), 14 (runtime and
+doctor), 15 (rooms and invitations) and 16 (the follow-up after an uninvited
+line). Cut from `main` after the version bump, on this machine, with the shipped
+x86_64 binary driving every live gate.
+
+## Artefacts (`make release`)
+
+| File | Bytes | sha256 |
+|---|---|---|
+| `agent-room-1.0.0-rc.6-x86_64-unknown-linux-musl.tar.gz` | 22 496 500 | `3dbe6200f88b4c3303ed0141606ae4048dfc2a20717dad83dfb34a21ba28af62` |
+| `agent-room-1.0.0-rc.6-aarch64-unknown-linux-musl.tar.gz` | 20 685 461 | `cb97cf746f00a45fd76c2759116c05b431c09b1e1547b300a2ccdebb70b7f4a3` |
+| x86_64 binary (the one the live gates drove) | | `4e109cbe8ddf662cc68c600edd3e1f1273e0438d46c9256b55319c5e7d66ee50` |
+| aarch64 binary | | `bef024d3efb9e607...` (not executed here; CI's QEMU smoke runs it) |
+
+## Gates
+
+| Set | Result |
+|---|---|
+| `make gate` | fmt clean, clippy pedantic `-D warnings` clean, **436 tests, 0 failed** (82/82 knobs turned; publish scrub; changelog section present) |
+| `make live` (G1-G12, N1-N4, C-1..C-4, T1, X-1..X-3, G13, M1-M5, D1) | **31 passed** in 33 min on an idle box |
+
+The full live set was run FOUR times on rc.6 candidates today (PR 13, PR 15
+rebased, the bumped tree twice). Three of the four were all green. The other
+had exactly one red: **C-1** (two agents take up an invitation and run out of
+things to say), which passed alone straight afterwards in 71 s and passed in the
+next full run. Its failing assertion was not captured (the run's output was
+filtered to the summary lines - a mistake not repeated in the final run, whose
+full output is kept). Recorded as intermittent, issue opened; the soak watches
+for it. C-1 is a probabilistic gate by construction - two back-offs, a judge,
+a stand-down re-read - and the other 30 gates have not flaked in any of the
+four runs.
+
+## Two lessons that are now rules
+
+1. **A release re-runs the WHOLE live set**, not the gates its slices touched.
+   rc.3, rc.4 and rc.5 each re-ran G5-G8, N and C only; G9 and G11 had been red
+   since rc.3 and nobody knew until this release's first full run (see "The
+   follow-up after an uninvited line" above).
+2. **Nothing compiles while the live gates run.** Three full runs were false
+   red today because builders were compiling in worktrees on the same box
+   (load 15-33): connectors missed the harness's readiness window and were
+   reported as "never became ready". A live result under load is not a result.
