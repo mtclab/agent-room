@@ -40,6 +40,19 @@ and so on, one tag to the next.
   files it let through. Silent when the variable is set but every secret is
   0600 anyway.
 
+- **An invitation that arrives while the agent is running is joined.** Until
+  now the only way into a new room was to add it to `rooms:` and restart, which
+  made an agent something only its operator could put anywhere. Now an
+  invitation is taken up when it comes from somebody the agent already shares a
+  room with - they can talk to it where it is, so they can ask it somewhere
+  else - or from a user id in the new `policy.accept_invites_from` (default
+  `[]`, and the way the FIRST invitation works, before there is a shared room).
+  Anybody else's invitation is written to the log and left exactly where it is:
+  not joined, and not rejected either, because that is a question for you. A
+  room joined this way gets its own transcript, ledger and unprompted loop like
+  a configured one, and lasts until the process stops - put it in `rooms:` to
+  keep it.
+
 ### Changed
 
 - Design and plan documents no longer carry questions that were answered in
@@ -76,6 +89,25 @@ and so on, one tag to the next.
   happens to roll. Transcripts that have already rolled into `<room>.jsonl.N`
   are not rewritten - your agent never reads them, and deleting them costs it
   nothing.
+
+- **A room alias (`#room:server`) now works in `run` and `mcp`.** `init` and
+  `doctor` had accepted one since the start and the connector then refused the
+  config they wrote; `agent-room mcp` joined by alias and answered every later
+  call with a 404, because no Matrix endpoint but the join takes an alias. An
+  alias is now resolved to its room id once, at start-up, and the id is used
+  everywhere after that; an alias that names no room stops the process with one
+  line and exit 2. The per-room files under `state_dir` are still named after
+  what you wrote in `rooms:`, so a room configured by id keeps the transcript
+  and ledger it already has - and `agent-room impulse --room` keeps taking the
+  same string the config does.
+- **`agent-room mcp` no longer posts plaintext into an encrypted room.** The
+  live-session server is a plain Client-Server client with no crypto store, so
+  a message it posted into an encrypted room was not refused by anything: it
+  arrived readable in a room whose whole point is that it is not. It now checks
+  each room when it starts and refuses to serve at all if one is encrypted,
+  naming the room and saying to use `agent-room run` for it (exit 2);
+  `agent-room doctor` fails that room's row on a session config with the same
+  reason, and still passes it for a connector, which encrypts.
 - `examples/docker/compose.yaml`: the commented-out pull line named rc.3; it now
   names the current release.
 - `examples/agent-room.service` carries `RestartPreventExitStatus=3`: a wedged

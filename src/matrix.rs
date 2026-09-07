@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::encryption::recovery::RecoveryState;
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomId, RoomId, UserId};
+use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomId, RoomAliasId, RoomId, UserId};
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, SessionMeta, SessionTokens};
 use serde_json::Value;
@@ -368,21 +368,69 @@ async fn restore(
         .context("the SDK refused the restored session")
 }
 
+/// A configured room this build cannot turn into a room id. Exit 2: the config
+/// is wrong (or the alias is), and no amount of retrying will change it.
+#[derive(Debug)]
+pub struct BadRooms(pub String);
+
+impl std::fmt::Display for BadRooms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for BadRooms {}
+
+/// Turn `rooms:` into room ids, once, before anything else uses them.
+///
+/// `init` and `doctor` have always accepted `#alias:server`, and the connector
+/// refused the config they wrote. An alias is a NAME for a room - it can be
+/// re-pointed, and two of them can name one room - so it is resolved exactly
+/// once here and the id is what the ledger, the transcript, the sync loop and
+/// every log line use afterwards. Returns `(as configured, room id)` in the
+/// configured order, because the state files are still named after what the
+/// operator wrote (see `Connector::open_rooms`).
+///
+/// # Errors
+/// When an entry is neither a room id nor an alias, or the homeserver will not
+/// say what an alias means: both are `BadRooms`, and the connector exits 2.
+pub async fn resolve_rooms(
+    client: &Client,
+    rooms: &[String],
+) -> Result<Vec<(String, OwnedRoomId)>> {
+    let mut resolved = Vec::new();
+    for room in rooms {
+        if room.starts_with('#') {
+            let alias = RoomAliasId::parse(room)
+                .map_err(|exc| BadRooms(format!("rooms: {room} is not a room alias: {exc}")))?;
+            let answer = client.resolve_room_alias(&alias).await.map_err(|exc| {
+                BadRooms(format!(
+                    "rooms: {room} does not resolve on this homeserver ({exc}); check the alias, \
+                     or use the room id (!id:server)"
+                ))
+            })?;
+            info!("{room} is {}", answer.room_id);
+            resolved.push((room.clone(), answer.room_id));
+            continue;
+        }
+        let id = RoomId::parse(room)
+            .map_err(|exc| BadRooms(format!("rooms: {room} is not a room id or alias: {exc}")))?;
+        resolved.push((room.clone(), id));
+    }
+    Ok(resolved)
+}
+
 /// Join every configured room, returning the ones that worked.
 ///
 /// A room that refuses us is logged and skipped rather than fatal: one bad room
 /// id in a list of five must not keep the account out of the other four.
-pub async fn join_rooms(client: &Client, rooms: &[String]) -> Vec<OwnedRoomId> {
+pub async fn join_rooms(client: &Client, rooms: &[OwnedRoomId]) -> Vec<OwnedRoomId> {
     let mut joined = Vec::new();
     for room_id in rooms {
-        let Ok(parsed) = RoomId::parse(room_id) else {
-            tracing::error!("cannot join {room_id}: it is not a room id");
-            continue;
-        };
-        match client.join_room_by_id(&parsed).await {
+        match client.join_room_by_id(room_id).await {
             Ok(_room) => {
                 info!("joined {room_id}");
-                joined.push(parsed);
+                joined.push(room_id.clone());
             }
             Err(exc) => tracing::error!("cannot join {room_id}: {exc}"),
         }
@@ -511,6 +559,55 @@ mod tests {
             transcript_archives: crate::transcript::DEFAULT_ARCHIVES,
             allow_wedged_device: false,
         }
+    }
+
+    /// A client that has never spoken to a homeserver, for the halves of
+    /// `resolve_rooms` that need no network.
+    async fn offline_client() -> Client {
+        Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .expect("a client that has never spoken to a homeserver")
+    }
+
+    #[tokio::test]
+    async fn a_room_id_resolves_to_itself_and_asks_the_homeserver_nothing() {
+        // The ordinary config, and the one thing that must not change: a room
+        // named by its id is passed through untouched, keyed by exactly the
+        // string the operator wrote - which is what every existing state file
+        // under `state_dir/rooms/` is named after.
+        let client = offline_client().await;
+        let rooms = vec!["!room:example.com".to_owned(), "!noserver".to_owned()];
+        let resolved = resolve_rooms(&client, &rooms)
+            .await
+            .expect("room ids need no homeserver");
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|(configured, id)| (configured.as_str(), id.as_str()))
+                .collect::<Vec<(&str, &str)>>(),
+            vec![
+                ("!room:example.com", "!room:example.com"),
+                // Room version 12 mints ids with no server part; `init` has
+                // accepted them since the readiness walk and so must this.
+                ("!noserver", "!noserver"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_room_that_is_neither_an_id_nor_an_alias_stops_the_connector() {
+        // Exit 2, not a retry loop: this config names a room nothing can find,
+        // and the one line has to say which entry it was.
+        let client = offline_client().await;
+        let exc = resolve_rooms(&client, &["the-room".to_owned()])
+            .await
+            .expect_err("'the-room' is neither");
+        assert!(exc.downcast_ref::<BadRooms>().is_some(), "{exc:#}");
+        let text = format!("{exc}");
+        assert!(text.contains("the-room"), "{text}");
+        assert!(text.contains("rooms:"), "{text}");
     }
 
     #[test]

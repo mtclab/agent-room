@@ -711,6 +711,13 @@ pub struct PolicyConfig {
     pub bot_to_bot: BotToBot,
     #[serde(default)]
     pub budgets: BudgetsConfig,
+    /// Whose invitation this agent accepts while it is running, on top of the
+    /// people it already shares a room with. An invitation from anybody else is
+    /// logged and left alone - never rejected, because the person who sent it
+    /// may simply have to ask the operator first. Empty by default: an agent
+    /// that is only ever in rooms somebody it already knows put it in.
+    #[serde(default)]
+    pub accept_invites_from: Vec<String>,
     /// Extra user ids that count as bots regardless of msgtype.
     #[serde(default)]
     pub bot_user_ids: Vec<String>,
@@ -781,6 +788,7 @@ impl Default for PolicyConfig {
             impulse_ttl_s: default_impulse_ttl(),
             bot_to_bot: default_bot_to_bot(),
             budgets: BudgetsConfig::default(),
+            accept_invites_from: Vec::new(),
             bot_user_ids: Vec::new(),
             bot_localpart_patterns: Vec::new(),
         }
@@ -884,6 +892,17 @@ impl PolicyConfig {
                     "policy.topics cannot contain an empty word: it would match every line \
                      and put every message in a hurry",
                 ));
+            }
+        }
+        for user_id in &self.accept_invites_from {
+            // A typo here is silent in the worst way: the agent simply never
+            // joins, and the log says an invitation was ignored without ever
+            // saying that the list it was checked against cannot match anyone.
+            if !user_id.starts_with('@') || !user_id.contains(':') {
+                return Err(ConfigError::msg(format!(
+                    "policy.accept_invites_from {user_id:?} is not a Matrix user id \
+                     (@name:server)"
+                )));
             }
         }
         for pattern in &self.bot_localpart_patterns {

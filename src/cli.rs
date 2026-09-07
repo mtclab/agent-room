@@ -382,6 +382,12 @@ async fn run_connector(path: &std::path::Path) -> Result<i32> {
             error!("{exc}");
             return Ok(DEVICE_WEDGED);
         }
+        // A `rooms:` entry that is neither a room id nor an alias the
+        // homeserver knows is a config nothing can run on, whoever retries it.
+        if exc.downcast_ref::<matrix::BadRooms>().is_some() {
+            error!("{exc}");
+            return Ok(BAD_CONFIG);
+        }
         return Err(exc);
     }
     signals.abort();

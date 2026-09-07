@@ -882,6 +882,7 @@ mod tests {
         };
         let worker = Arc::new(RoomWorker {
             room_id: RoomId::parse(testkit::ROOM_ID).expect("a room id"),
+            state_key: testkit::ROOM_ID.to_owned(),
             transcript: Transcript::new(dir.path().join("room.jsonl")),
             state: Mutex::new(state),
         });

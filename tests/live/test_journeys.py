@@ -38,6 +38,7 @@ from conftest import (
     S3_BOT_B_NAME,
     Connector,
     Tokens,
+    agent_account,
     by_sender,
     make_connector,
     messages,
@@ -48,7 +49,7 @@ from conftest import (
     wait_for,
     wait_for_join,
 )
-from nio import AsyncClient
+from nio import AsyncClient, RoomInviteResponse
 
 pytestmark = [pytest.mark.live, LIVE_SKIP]
 
@@ -277,3 +278,71 @@ async def test_g4_a_restart_never_answers_twice_or_answers_the_backlog(
     assert fresh in {
         relates_to(reply).get("m.in_reply_to", {}).get("event_id") for reply in replies
     }
+
+
+# -- G13 ---------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+async def test_g13_an_invitation_from_a_member_is_joined_and_a_strangers_is_not(
+    tmp_path: Path,
+    tokens: Tokens,
+    human: AsyncClient,
+    room_s3: str,
+    rooms_to_be_invited_to: tuple[str, str],
+    running: list[Connector],
+) -> None:
+    """G13: an agent that has to be restarted to be let into a room is an agent
+    nobody can invite. While it is running, an invitation from somebody it
+    ALREADY SHARES A ROOM WITH is joined and the room works like a configured
+    one - a name typed in it is answered. An invitation from somebody it shares
+    no room with is left exactly where it is: not joined, and not rejected
+    either, because that is a question for the operator."""
+    from_member, from_stranger = rooms_to_be_invited_to
+    bot = make_connector(tmp_path, tokens, S3_BOT_A_NAME, room_s3)
+    bot.start()
+    running.append(bot)
+    bot.wait_ready()
+    await wait_for_join(human, room_s3, [S3_BOT_A])
+
+    # The stranger: bot D is in a room of its own and in none of bot C's, so it
+    # is exactly the account an unknown person's agent would be. It is INVITED
+    # to room_s3 by that fixture and never joins it, which is the sharper half
+    # of this control: the guard asks for a JOINED member, and an invitation
+    # nobody accepted is not one. Its invitation goes out FIRST, so the same
+    # sync round carries both and the silence about it is a decision, not a
+    # race.
+    async with agent_account(tokens, S3_BOT_B_NAME, from_stranger) as stranger:
+        sent = await stranger.room_invite(from_stranger, S3_BOT_A)
+        assert isinstance(sent, RoomInviteResponse), f"the stranger could not invite: {sent}"
+        sent = await human.room_invite(from_member, S3_BOT_A)
+        assert isinstance(sent, RoomInviteResponse), f"the human could not invite: {sent}"
+
+        # The join has to survive a whole sync round trip, so this is generous.
+        await wait_for_join(human, from_member, [S3_BOT_A], seconds=120)
+
+        members = await human.joined_members(from_stranger)
+        joined = {member.user_id for member in getattr(members, "members", [])}
+        assert S3_BOT_A not in joined, (
+            f"{S3_BOT_A} joined a room it was invited to by somebody it shares no room "
+            f"with: {sorted(joined)}"
+        )
+
+    # The room it DID join is a room like any other: a name typed in it is
+    # answered, in a thread, by an agent that was never configured for it.
+    trigger = await post_typed_name(human, from_member, S3_BOT_A_NAME, "are you here?")
+    events = await wait_for(
+        lambda evs: bool(by_sender(evs, S3_BOT_A)), human, from_member, seconds=45
+    )
+    replies = by_sender(events, S3_BOT_A)
+    assert len(replies) == 1, f"expected one reply in the room it joined, got {len(replies)}"
+    assert replies[0]["content"]["msgtype"] == "m.notice"
+    assert "echo: " in replies[0]["content"]["body"]
+    assert relates_to(replies[0])["event_id"] == trigger
+
+    # And the log says which decision it made about each invitation, because
+    # that is the only place an operator can read one.
+    log = bot.log_text()
+    assert f"{from_member}: joining an invitation from {LIVE_HUMAN}" in log, log
+    assert f"{from_stranger}: {S3_BOT_B} invited me" in log, log
+    assert "leaving it alone" in log, log

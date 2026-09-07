@@ -618,6 +618,40 @@ async fn an_alias_is_resolved_before_it_is_judged() {
     );
 }
 
+#[tokio::test]
+async fn an_encrypted_room_fails_the_row_for_a_live_sessions_config_only() {
+    // A config with no `brain:` is a live session's (`agent-room mcp`), and
+    // that client has no crypto store: it would post plaintext into a room
+    // whose whole point is that its contents are not readable. `mcp` refuses to
+    // start on such a room, so doctor has to be able to say WHY before anybody
+    // reaches that.
+    let home = FakeHomeserver::start(ROOM_ID, ME).await;
+    home.with(|state| {
+        state.joined_rooms = vec![ROOM_ID.to_owned()];
+        state
+            .encrypted
+            .insert(ROOM_ID.to_owned(), "m.megolm.v1.aes-sha2".to_owned());
+    });
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut cfg = config(dir.path(), &home.base_url);
+    cfg.brain = None;
+    let checks = rows(&cfg, Some(&home)).await;
+    let row = &checks[&room_row()];
+    assert_eq!(row.status, Status::Fail, "{row:?}");
+    assert!(row.detail.contains("ENCRYPTED"), "{row:?}");
+    assert!(row.detail.contains("m.megolm.v1.aes-sha2"), "{row:?}");
+    assert!(row.fix.contains("agent-room run"), "{row:?}");
+    assert_eq!(code(&checks), 1);
+
+    // The teeth: the SAME room in a CONNECTOR's config is not a failure at all.
+    // The connector has a store and encrypts, and a doctor that failed here
+    // would be telling every friend their encrypted room is broken.
+    let cfg = config(dir.path(), &home.base_url);
+    let checks = rows(&cfg, Some(&home)).await;
+    assert_eq!(checks[&room_row()].status, Status::Pass);
+    assert_eq!(code(&checks), 0);
+}
+
 // -- the brain ---------------------------------------------------------------
 
 /// A real OpenAI-compatible `/models`, on a real socket.
