@@ -5,6 +5,11 @@
 //! read and wrote, so a state directory either one left behind keeps every
 //! promise it made (no double replies, no budget reset by kill -9). The clock
 //! is injected so tests can drive it.
+//!
+//! What is written WHEN is a decision, not an accident: anything that spends a
+//! budget or makes a promise writes the file there and then, and the "I have
+//! seen this event" marks are debounced behind a dirty flag ([`Ledger::flush`])
+//! because they are the one fact a restart can rediscover for free.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -164,6 +169,10 @@ pub struct Ledger {
     pub counters: BTreeMap<String, i64>,
     consumed: Vec<String>,
     consumed_set: HashSet<String>,
+    /// Something is in memory that is not on disk yet. Set by the paths that do
+    /// NOT write for themselves - [`Self::mark_consumed`] - and cleared by
+    /// every write. See [`Self::flush`].
+    dirty: bool,
 }
 
 impl Ledger {
@@ -181,6 +190,7 @@ impl Ledger {
             counters: BTreeMap::from([("posts".to_owned(), 0), ("consumed".to_owned(), 0)]),
             consumed: Vec::new(),
             consumed_set: HashSet::new(),
+            dirty: false,
         }
     }
 
@@ -237,10 +247,35 @@ impl Ledger {
     ///
     /// A failure is logged, never raised: losing a turn because the budget file
     /// could not be written is worse than carrying on with the in-memory copy,
-    /// and the next save will try again.
-    pub fn save(&self) {
+    /// and the next save will try again. The dirty flag is cleared either way -
+    /// a file that cannot be written now will not be written by asking again
+    /// two seconds later, and the next real save tries the whole state anyway.
+    pub fn save(&mut self) {
+        self.dirty = false;
         if let Err(exc) = self.try_save() {
             error!("cannot write the ledger {}: {exc}", self.path.display());
+        }
+    }
+
+    /// Write the ledger IF something is waiting to be written.
+    ///
+    /// The debounce's other half: [`Self::mark_consumed`] only marks memory, so
+    /// something has to put it on disk. Three callers, and they are the whole
+    /// contract:
+    ///
+    /// - the room's flush loop, every couple of seconds while it is dirty;
+    /// - shutdown, before the process goes away;
+    /// - anything about to let ANOTHER reader see the file (a test that reads
+    ///   it back, a tool that reads a running agent's ledger).
+    ///
+    /// A crash between two flushes therefore costs the consumed marks of that
+    /// window and nothing else: the events are re-delivered on the next start,
+    /// where the backlog sweep consumes them without answering (see the design's
+    /// "Restart semantics"), so the cost is a line in the transcript twice, not
+    /// a reply to something old.
+    pub fn flush(&mut self) {
+        if self.dirty {
+            self.save();
         }
     }
 
@@ -361,8 +396,9 @@ impl Ledger {
     /// to nothing. That is the whole mechanism behind "the thread winds down
     /// like people running out of things to say".
     ///
-    /// This does NOT write the file: every path that follows it ends in
-    /// [`Self::mark_consumed`] or [`Self::record_post`], both of which save.
+    /// This does NOT write the file for itself: every path that follows it ends
+    /// in [`Self::mark_consumed`] (which marks the ledger dirty for the next
+    /// [`Self::flush`]) or [`Self::record_post`] (which writes at once).
     pub fn note_event(&mut self, thread_root: &str, from_bot: bool) {
         if thread_root.is_empty() {
             return;
@@ -572,6 +608,16 @@ impl Ledger {
     }
 
     /// Remember that this event has been handled; never act on it again.
+    ///
+    /// This marks memory and does NOT write the file. Every event the connector
+    /// sees comes through here, and re-serialising the whole ledger and calling
+    /// `fsync` on a busy room's every message is a write per message for a fact
+    /// that costs nothing to rediscover: an unflushed consumed mark is
+    /// re-delivered as backlog after a crash, and backlog is never answered.
+    /// What DOES write for itself is anything that spends a budget
+    /// ([`Self::record_post`]) or makes a promise ([`Self::open_loop`] and the
+    /// rest), because losing one of those would change what the agent does.
+    /// [`Self::flush`] puts the rest on disk.
     pub fn mark_consumed(&mut self, event_id: &str) {
         if self.consumed_set.contains(event_id) {
             return;
@@ -580,10 +626,15 @@ impl Ledger {
         self.consumed_set.insert(event_id.to_owned());
         *self.counters.entry("consumed".to_owned()).or_insert(0) += 1;
         self.trim_consumed();
-        self.save();
+        self.dirty = true;
     }
 
     /// Mark a batch consumed with a single save. Returns how many were new.
+    ///
+    /// This one DOES write, and immediately: the batch is the startup sweep,
+    /// where "I have seen the room as it was" is the promise a restart makes
+    /// (the design's "Restart semantics"), and it is one write per room per
+    /// start rather than one per message.
     pub fn mark_many_consumed(&mut self, event_ids: &[String]) -> usize {
         let mut new = 0;
         for event_id in event_ids {
@@ -838,8 +889,74 @@ mod tests {
         let clock = FakeClock::new();
         let mut led = ledger(dir.path(), &clock, BudgetsConfig::default());
         led.mark_consumed("$a");
+        led.flush();
         let mode = fs::metadata(&led.path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn a_flush_puts_the_consumed_ids_on_disk() {
+        // (i) of the debounce's contract: the marks are in memory until
+        // something flushes, and after a flush they are in the file - the same
+        // file the Python reads, with everything else still in it.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let path = dir.path().join("ledger.json");
+        let mut led = Ledger::load(&path, BudgetsConfig::default(), clock.as_clock());
+        led.mark_consumed("$seen");
+        assert!(
+            !path.exists(),
+            "mark_consumed wrote the file: the debounce is gone and every event \
+             fsyncs the whole ledger again"
+        );
+        led.flush();
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("the flush wrote it"))
+                .expect("valid JSON");
+        assert_eq!(written["consumed"][0], "$seen");
+        assert_eq!(written["counters"]["consumed"], 1);
+    }
+
+    #[test]
+    fn nothing_is_lost_when_a_flushed_ledger_is_dropped_and_reloaded() {
+        // (ii): the crash test. Everything up to the last flush comes back -
+        // and what a post spent is on disk WITHOUT a flush, because a budget is
+        // not something a restart may rediscover.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let clock = FakeClock::new();
+        let path = dir.path().join("ledger.json");
+        let mut led = Ledger::load(&path, BudgetsConfig::default(), clock.as_clock());
+        for index in 0..5 {
+            led.mark_consumed(&format!("$flushed{index}"));
+        }
+        led.note_event("$root", true);
+        led.flush();
+        led.record_post("$mine", "$root", HUMAN, None, 2);
+        // What arrives after the last flush is the window a crash costs.
+        led.mark_consumed("$after-the-flush");
+        drop(led);
+
+        let restarted = Ledger::load(&path, BudgetsConfig::default(), clock.as_clock());
+        for index in 0..5 {
+            assert!(
+                restarted.is_consumed(&format!("$flushed{index}")),
+                "a consumed id that was flushed did not survive the reload"
+            );
+        }
+        assert!(restarted.is_my_event(Some("$mine")), "a post was lost");
+        assert_eq!(restarted.counters.get("posts"), Some(&1));
+        assert_eq!(restarted.bot_only_turns("$root"), 1, "energy was lost");
+        let tier2 = restarted.tier2_hour_allows(clock.now());
+        assert!(
+            tier2.reason.contains("1/"),
+            "the unprompted post it spent was not on disk: {}",
+            tier2.reason
+        );
+        assert!(
+            !restarted.is_consumed("$after-the-flush"),
+            "the unflushed mark is the debounce window, and this test is what \
+             measures it: it is re-delivered as backlog, never answered"
+        );
     }
 
     #[test]
@@ -950,9 +1067,11 @@ mod tests {
         let mut led = Ledger::load(&path, budgets.clone(), clock.as_clock());
         led.note_event("$root", true);
         led.note_event("$root", true);
-        // `note_event` deliberately does not fsync per message; the save that
-        // follows it in every connector path is what puts it on disk.
+        // `note_event` deliberately does not write for itself; the consumed
+        // mark that follows it in every connector path carries it to disk on
+        // the next flush.
         led.mark_consumed("$whatever-came-with-it");
+        led.flush();
 
         let restarted = Ledger::load(&path, budgets, clock.as_clock());
         assert_eq!(restarted.bot_only_turns("$root"), 2);

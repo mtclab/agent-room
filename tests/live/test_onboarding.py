@@ -88,16 +88,22 @@ async def test_d1_doctor_passes_a_real_config_and_fails_a_wrong_token(
     assert code == 0, f"doctor failed on a config that works:\n{output}"
     assert set(table) == {
         "token file",
+        "state_dir",
+        "persona",
         "homeserver",
         "token",
         "device",
         f"room {room_session}",
         "brain",
     }
-    # No store exists before the first run, so the device row can only SKIP.
-    assert table["device"] == "SKIP", table
-    assert {name: status for name, status in table.items() if name != "device"} == {
-        name: "PASS" for name in table if name != "device"
+    # Nothing exists before the first run: no store (device), no state directory
+    # (state_dir); and this config names no persona file. Those three can only
+    # SKIP, and a SKIP is not a failure. Everything else must PASS.
+    skipped = {"device", "state_dir", "persona"}
+    for name in skipped:
+        assert table[name] == "SKIP", table
+    assert {name: status for name, status in table.items() if name not in skipped} == {
+        name: "PASS" for name in table if name not in skipped
     }, table
     assert MCP_SESSION in output, "the report names the account it checked"
 

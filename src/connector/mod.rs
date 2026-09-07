@@ -73,6 +73,77 @@ const BACKLOG_SNAPSHOT: u32 = 100;
 /// read and thrown away, and any fewer would miss a conversation whose last few
 /// lines all came from one burst.
 pub(crate) const LAST_SPEAKER_TAIL: usize = 8;
+/// The first wait after a failed `/sync`, and the ceiling the waits grow to.
+///
+/// Constants, not knobs: a homeserver that blinks is worth retrying in seconds
+/// and one that is gone is worth retrying every few minutes, and no deployment
+/// has a different answer to that. Five minutes is also short enough that an
+/// operator who has just fixed the homeserver sees the room come back while
+/// they are still watching.
+const SYNC_RETRY_START_S: f64 = 2.0;
+const SYNC_RETRY_CAP_S: f64 = 300.0;
+/// How often a room's ledger is written while it is dirty. See
+/// [`crate::ledger::Ledger::flush`]: consumed-event marks are debounced, and
+/// this is the window a crash may re-deliver.
+const LEDGER_FLUSH_S: f64 = 2.0;
+
+/// How long to wait before the next `/sync` after `failures` consecutive
+/// failures, given a `jitter` draw in `[0, 1)`.
+///
+/// Exponential from [`SYNC_RETRY_START_S`], doubling per failure and capped at
+/// [`SYNC_RETRY_CAP_S`]; half of the wait is then randomised (equal jitter), so
+/// that every connector on a homeserver that came back does not knock on it in
+/// the same millisecond, and no wait ever collapses to nothing the way full
+/// jitter can.
+fn sync_backoff_s(failures: u32, jitter: f64) -> f64 {
+    // 31 doublings is already past the cap; capping the exponent keeps the
+    // arithmetic finite however long the homeserver has been gone.
+    let doublings = f64::from(failures.saturating_sub(1).min(31));
+    let full = (SYNC_RETRY_START_S * 2.0_f64.powf(doublings)).min(SYNC_RETRY_CAP_S);
+    full.mul_add(jitter.clamp(0.0, 1.0), full) / 2.0
+}
+
+/// The `/sync` retry state: how long to wait, and when to say something.
+///
+/// One WARN when the homeserver becomes unreachable and one INFO when it is
+/// back - not a line per attempt. The five-second retry this replaces wrote a
+/// warning twelve times a minute for as long as the homeserver was down, which
+/// is a log nobody can read a real fault out of afterwards.
+#[derive(Debug, Default)]
+struct SyncRetry {
+    failures: u32,
+}
+
+impl SyncRetry {
+    /// Record a failed sync: how long to wait, and whether this is the failure
+    /// worth a WARN (the first of a run of them).
+    fn failed(&mut self, jitter: f64) -> (Duration, bool) {
+        self.failures = self.failures.saturating_add(1);
+        (
+            Duration::from_secs_f64(sync_backoff_s(self.failures, jitter)),
+            self.failures == 1,
+        )
+    }
+
+    /// Record a sync that worked: whether the homeserver has just come back,
+    /// which is the one INFO.
+    fn succeeded(&mut self) -> bool {
+        let recovered = self.failures > 0;
+        self.failures = 0;
+        recovered
+    }
+}
+
+/// Sleep for `wait`, unless the process is asked to stop first. True = stop.
+///
+/// Every wait in this file goes through here rather than a bare `sleep`: a
+/// five-minute back-off that ignores SIGTERM is a five-minute shutdown.
+async fn stop_or_sleep(stop: &mut watch::Receiver<bool>, wait: Duration) -> bool {
+    tokio::select! {
+        changed = stop.changed() => changed.is_err() || *stop.borrow(),
+        () = tokio::time::sleep(wait) => false,
+    }
+}
 
 /// One room's mutable state. Everything that decides whether to speak is behind
 /// this lock, so two events arriving at once cannot both find the room idle.
@@ -303,7 +374,16 @@ impl Connector {
             self.cfg.rooms.join(", ")
         );
 
+        let mut retry = SyncRetry::default();
+        let mut backoff = Duration::ZERO;
         loop {
+            // The back-off from the previous failure, waited out here so it can
+            // listen for the stop signal: a homeserver that has been gone for
+            // five minutes must not hold a SIGTERM for five minutes.
+            if backoff > Duration::ZERO && stop_or_sleep(&mut stop, backoff).await {
+                break;
+            }
+            backoff = Duration::ZERO;
             let settings = SyncSettings::new().timeout(Duration::from_secs(SYNC_TIMEOUT_S));
             tokio::select! {
                 changed = stop.changed() => {
@@ -324,14 +404,13 @@ impl Connector {
                     }
                 }
                 response = self.client.sync_once(settings) => match response {
-                    Ok(response) => self.handle_sync(&response).await,
-                    Err(exc) => {
-                        // A homeserver that blinks is not a reason to give up
-                        // the room; a homeserver that is gone is the operator's
-                        // problem and says so in the log every time it retries.
-                        warn!("sync failed ({exc}); retrying");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(response) => {
+                        if retry.succeeded() {
+                            info!("{} is answering again; sync resumed", self.cfg.homeserver);
+                        }
+                        self.handle_sync(&response).await;
                     }
+                    Err(exc) => backoff = self.note_sync_failure(&mut retry, &exc),
                 },
             }
         }
@@ -342,11 +421,14 @@ impl Connector {
         Ok(())
     }
 
-    /// The per-room clocks: the unprompted poll, and maybe the heartbeat.
+    /// The per-room clocks: the unprompted poll, the ledger flush, and maybe
+    /// the heartbeat.
     ///
     /// The unprompted loop always runs - it is what notices an impulse, a due
     /// follow-up and a human turning up, none of which any sync will tell us
-    /// about. The heartbeat only runs when somebody asked for a timer.
+    /// about. The flush loop always runs too: consumed marks are debounced
+    /// (see [`Ledger::flush`]), and this is what bounds how much of that a
+    /// crash can cost. The heartbeat only runs when somebody asked for a timer.
     async fn start_room_loops(&self, stop: &watch::Receiver<bool>) {
         let minutes = self.cfg.policy.heartbeat_minutes;
         if minutes > 0 {
@@ -359,6 +441,11 @@ impl Connector {
             let mut stop_rx = stop.clone();
             loops.push(tokio::spawn(async move {
                 runner.unprompted_loop(polled, &mut stop_rx).await;
+            }));
+            let flushed = Arc::clone(worker);
+            let mut stop_rx = stop.clone();
+            loops.push(tokio::spawn(async move {
+                Self::flush_loop(flushed, &mut stop_rx).await;
             }));
             if minutes > 0 {
                 #[allow(clippy::cast_precision_loss)]
@@ -373,7 +460,42 @@ impl Connector {
         }
     }
 
-    /// Let in-flight turns finish, then flush every room's state.
+    /// A failed `/sync`: the log line it is worth, and how long to wait.
+    ///
+    /// A homeserver that blinks is not a reason to give up the room, and one
+    /// that is gone is not a reason to say so every few seconds for a night:
+    /// ONE warning when it goes, one line when it comes back (in the caller),
+    /// and a debug per attempt in between for whoever is watching.
+    fn note_sync_failure(&self, retry: &mut SyncRetry, exc: &dyn std::fmt::Display) -> Duration {
+        let (wait, first) = retry.failed(rand::random_range(0.0..1.0));
+        let seconds = wait.as_secs_f64();
+        if first {
+            warn!(
+                "{} is unreachable (sync failed: {exc}); retrying in {seconds:.0} s \
+                 and backing off up to {SYNC_RETRY_CAP_S:.0} s",
+                self.cfg.homeserver
+            );
+        } else {
+            debug!("sync failed again ({exc}); retrying in {seconds:.0} s");
+        }
+        wait
+    }
+
+    /// One room's ledger flush tick.
+    ///
+    /// It writes only when there is something to write, so a quiet room costs a
+    /// lock and a boolean every couple of seconds and no disk at all. Its whole
+    /// job is to bound the debounce: whatever [`Ledger::mark_consumed`] left in
+    /// memory is on disk within [`LEDGER_FLUSH_S`], so that is the most a crash
+    /// can cost.
+    async fn flush_loop(worker: Arc<RoomWorker>, stop: &mut watch::Receiver<bool>) {
+        let period = Duration::from_secs_f64(LEDGER_FLUSH_S);
+        while !stop_or_sleep(stop, period).await {
+            worker.state.lock().await.ledger.flush();
+        }
+    }
+
+    /// Let in-flight turns finish, then write every room's state.
     async fn shutdown(&self) {
         // The room loops watch the same stop signal, so they are already on
         // their way out; give them the same grace as a turn rather than
@@ -403,7 +525,9 @@ impl Connector {
         }
         self.brain.close().await;
         for worker in self.workers.values() {
-            worker.state.lock().await.ledger.save();
+            // The last flush of the process: whatever the debounce was still
+            // holding goes to disk before the binary does.
+            worker.state.lock().await.ledger.flush();
         }
         info!("connector {} stopped", self.me);
     }
@@ -1214,6 +1338,83 @@ mod tests {
 
     const ME: &str = testkit::ME;
     const HUMAN: &str = "@human:example.com";
+
+    #[test]
+    fn the_sync_back_off_doubles_from_two_seconds_and_stops_at_five_minutes() {
+        // With the jitter draw pinned at its top, the schedule is the plain
+        // doubling; the cap is what stops "the homeserver has been down all
+        // night" becoming an hour between attempts.
+        let waits: Vec<f64> = (1..=10).map(|n| sync_backoff_s(n, 1.0)).collect();
+        assert_eq!(
+            waits,
+            vec![2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 300.0, 300.0]
+        );
+        // And it stays finite however long it has been: a `u32` of failures is
+        // twelve years at this cap, and it must not overflow into a wait of NaN.
+        assert!((sync_backoff_s(u32::MAX, 1.0) - SYNC_RETRY_CAP_S).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn every_wait_is_jittered_and_none_of_them_is_zero() {
+        // Equal jitter: half the wait is fixed, half is the draw. Two
+        // connectors that lost the same homeserver do not come back in
+        // lockstep, and nobody ever retries in a tight loop.
+        for failures in 1..=12 {
+            let full = sync_backoff_s(failures, 1.0);
+            for draw in [0.0, 0.25, 0.5, 0.75, 0.999] {
+                let wait = sync_backoff_s(failures, draw);
+                assert!(
+                    wait >= full / 2.0 && wait <= full,
+                    "failures={failures} draw={draw} wait={wait} full={full}"
+                );
+            }
+            assert!(
+                sync_backoff_s(failures, 0.0) < sync_backoff_s(failures, 1.0),
+                "the draw changes nothing at {failures} failures: every connector \
+                 on this homeserver comes back in the same millisecond"
+            );
+        }
+        assert!(sync_backoff_s(1, 0.0) >= SYNC_RETRY_START_S / 2.0);
+    }
+
+    #[test]
+    fn the_homeserver_going_away_is_one_warning_and_coming_back_is_one_line() {
+        // The defect this replaces: a warning per attempt, every five seconds,
+        // for as long as the homeserver was down.
+        let mut retry = SyncRetry::default();
+        let (first_wait, first) = retry.failed(0.5);
+        assert!(first, "the first failure is the one worth a warning");
+        for attempt in 2..=20 {
+            let (wait, warn) = retry.failed(0.5);
+            assert!(!warn, "attempt {attempt} wanted a second warning");
+            assert!(
+                wait >= first_wait,
+                "attempt {attempt} backed off less than the first"
+            );
+        }
+        assert!(retry.succeeded(), "coming back is worth exactly one line");
+        assert!(!retry.succeeded(), "a working sync says nothing");
+    }
+
+    #[test]
+    fn a_sync_that_works_puts_the_back_off_back_to_the_start() {
+        // Otherwise a homeserver that blinks once an hour ends the day waiting
+        // five minutes between syncs on a homeserver that is perfectly fine.
+        let mut retry = SyncRetry::default();
+        for _ in 0..8 {
+            let _ignored = retry.failed(1.0);
+        }
+        let (long, _) = retry.failed(1.0);
+        assert!(long >= Duration::from_secs(150), "{long:?}");
+        assert!(retry.succeeded());
+        let (again, warned) = retry.failed(1.0);
+        assert_eq!(
+            again,
+            Duration::from_secs_f64(SYNC_RETRY_START_S),
+            "the next outage starts at the beginning again"
+        );
+        assert!(warned, "and it is worth its own warning");
+    }
 
     #[test]
     fn the_member_list_is_read_for_names_only_while_the_policy_says_so() {

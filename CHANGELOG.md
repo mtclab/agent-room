@@ -26,6 +26,19 @@ and so on, one tag to the next.
   here instead of a list of pull-request titles.
 - `docs/ROADMAP.md`: what 1.0.0 means, what each remaining release candidate has
   to prove, and what waits until after it.
+- `doctor` rows: **state_dir** (there, 0700, and writable - proven by writing a
+  probe file and removing it), **persona** (readable and not empty), and
+  **judge** (the `/models` question asked of `judge_base_url` / `judge_model`
+  when you configure one, with the judge's own key). A judge that is down is a
+  silence of its own: the agent still answers when addressed and never speaks
+  unprompted.
+- `doctor` WARN rows, which do not change the exit code: **tls** when
+  `tls.verify: false` leaves the homeserver unauthenticated, and **perms** when
+  `AGENT_ROOM_ALLOW_LOOSE_PERMS` is in force.
+- `run` and `mcp` log one WARN at start-up when
+  `AGENT_ROOM_ALLOW_LOOSE_PERMS=1` actually waived the 0600 rule, naming the
+  files it let through. Silent when the variable is set but every secret is
+  0600 anyway.
 
 ### Changed
 
@@ -33,6 +46,16 @@ and so on, one tag to the next.
   September: the repository is public with CI, the room is encrypted, seven MCP
   tools, a typed name reaches other agents (rc.3), and the judge timeout exists
   (rc.3).
+- A failed `/sync` now backs off exponentially with jitter - about 2 s, doubling
+  to a 5 minute ceiling - and says so ONCE: one warning when the homeserver
+  becomes unreachable and one line when it answers again, instead of a warning
+  every five seconds for as long as it was down. The back-off is interruptible,
+  so a stop signal during one is still honoured at once.
+- The ledger is written once per turn or every couple of seconds, not `fsync`ed
+  on every event the room contains. Anything that spends a budget or makes a
+  promise still writes immediately; a crash between flushes costs at most a
+  couple of seconds of "I have seen this", which the next start rediscovers as
+  backlog and never answers (`docs/DESIGN.md`, "Restart semantics").
 
 ### Fixed
 
@@ -55,6 +78,10 @@ and so on, one tag to the next.
   nothing.
 - `examples/docker/compose.yaml`: the commented-out pull line named rc.3; it now
   names the current release.
+- `examples/agent-room.service` carries `RestartPreventExitStatus=3`: a wedged
+  device is not cured by restarting, and the unit used to retry it every ten
+  seconds for ever. `examples/docker/README.md` says what to do under compose,
+  which has no per-exit-code policy.
 
 ## [1.0.0-rc.5] - 2026-09-04
 

@@ -185,12 +185,42 @@ private details) as they are; change only the names in them.
 One row per thing that can be wrong, each with a one-line fix:
 
     PASS  token file  /home/you/.local/state/.../_riku_example.com.access is 0600
+    PASS  state_dir   /home/you/.local/state/agent-room is 0700 and writable
+    PASS  persona     /home/you/.config/agent-room/persona.md is 412 characters
     PASS  homeserver  https://matrix.example.com answers, spec v1.12
     PASS  token       accepted, and it is @riku:example.com
     PASS  room !theroom:example.com  invited; the connector joins it when it starts
     PASS  brain       http://localhost:11434/v1/models answers and serves qwen3
 
-    5 passed, 0 failed, 0 skipped
+    7 passed, 0 failed, 0 skipped
+
+The rows come in the order the connector meets them:
+
+- **token file**, and **config file** when your password is in it, and **tls
+  key** when you use client certificates: each has to be 0600, because whoever
+  can read one can be your account.
+- **state_dir**: there, 0700, and writable - proven by writing a small file and
+  removing it again. It holds the encryption store, the transcripts and the
+  budgets; an agent that cannot write it forgets what it has answered. Before
+  your first `run` it says SKIP, because `run` is what creates it.
+- **persona**: readable and not empty. No `persona_file:` at all is a
+  legitimate config and skips.
+- **homeserver**, **token**, **device**, one row per **room**: the account, and
+  whether it is in the rooms you listed.
+- **brain**: `GET {base_url}/models`, with your `api_key` if you set one.
+- **judge**: the same question asked of `judge_base_url` and `judge_model`, and
+  only when you set one of them. Worth its own row because a judge that is down
+  is a different silence: the agent still answers when addressed and never says
+  anything unprompted.
+
+Two rows are WARN rather than PASS or FAIL, and they do not change the exit
+code:
+
+- **tls**: `tls.verify: false` is set, so the homeserver's certificate is not
+  checked and anything on the path can be the homeserver.
+- **perms**: `AGENT_ROOM_ALLOW_LOOSE_PERMS=1` is set, so the 0600 rule above is
+  advisory for this run. `run` and `mcp` log the same thing once at start-up,
+  naming the file it let through.
 
 It exits 1 if anything failed, so you can put it in a script. Run it whenever
 your agent has gone quiet: nine times out of ten it is a model server that is
@@ -221,6 +251,12 @@ The unit runs `~/.local/bin/agent-room run --config
 ~/.config/agent-room/config.yaml`, restarts on failure after 10 s, and gives the
 process 30 s to shut down cleanly (it finishes the reply it is writing and
 flushes its ledgers). If you installed somewhere else, edit `ExecStart`.
+
+It also carries `RestartPreventExitStatus=3`. Exit 3 is the wedged device
+below: restarting cannot cure it, so the unit stops instead of trying again
+every ten seconds until you notice. `systemctl --user status agent-room` then
+shows it failed, and the last log line says why. Under docker compose there is
+no per-exit-code policy - `examples/docker/README.md` says what to do instead.
 
 ## Back it up
 

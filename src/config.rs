@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::addressing::MIN_NAME_CHARS;
 use crate::brain::MAX_JUDGE_SCORE;
@@ -1237,6 +1238,82 @@ fn permission_verdict(mode: u32, allow_loose: bool) -> std::result::Result<(), S
     ))
 }
 
+/// Every file this config keeps a secret in, whether or not it exists.
+///
+/// The list is the one `require_private_mode` is applied to elsewhere: the
+/// config file when the password is in it, the token file, the token a password
+/// login caches, and the TLS client key when TLS is on.
+#[must_use]
+pub fn secret_files(cfg: &Config, config_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if cfg.password.is_some() {
+        paths.push(config_path.to_path_buf());
+    }
+    if let Some(token) = &cfg.access_token_file {
+        paths.push(token.clone());
+    }
+    paths.push(cfg.cached_token_path());
+    if cfg.tls.enabled
+        && let Some(key) = &cfg.tls.client_key
+    {
+        paths.push(key.clone());
+    }
+    paths
+}
+
+/// Which of `paths` the escape hatch is excusing right now.
+///
+/// Empty when the hatch is off, and empty when it is on and every secret is
+/// 0600 anyway: what is worth a warning is a rule that is ACTUALLY being
+/// waived, not a variable somebody exported once and forgot about.
+#[must_use]
+pub fn excused_paths(paths: &[PathBuf], allow_loose: bool) -> Vec<PathBuf> {
+    if !allow_loose {
+        return Vec::new();
+    }
+    paths
+        .iter()
+        .filter(|path| {
+            fs::metadata(path).is_ok_and(|meta| {
+                permission_verdict(meta.permissions().mode() & 0o7777, false).is_err()
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// The one line the escape hatch is worth, or nothing when it excused nothing.
+///
+/// It names the files, because "loose permissions are allowed" tells an
+/// operator nothing they can act on and "this token is world-readable" does.
+#[must_use]
+pub fn loose_perms_line(excused: &[PathBuf]) -> Option<String> {
+    if excused.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = excused
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    Some(format!(
+        "{ALLOW_LOOSE_PERMS_ENV}=1 is waiving the 0600 rule for {}: \
+         anyone on this machine may be able to read what makes this agent this account. \
+         chmod 600 them and unset it",
+        named.join(", ")
+    ))
+}
+
+/// One WARN at start-up when the escape hatch is doing something, for `run` and
+/// `mcp` both. Silent otherwise.
+pub fn warn_loose_perms(cfg: &Config, config_path: &Path) {
+    if let Some(line) = loose_perms_line(&excused_paths(
+        &secret_files(cfg, config_path),
+        loose_perms_allowed(),
+    )) {
+        warn!("{line}");
+    }
+}
+
 fn read_bytes(path: &Path, label: &str) -> Result<Vec<u8>> {
     fs::read(path)
         .map_err(|exc| ConfigError::msg(format!("cannot read {label} {}: {exc}", path.display())))
@@ -1512,6 +1589,86 @@ mod tests {
                 "the override must waive {mode:04o}"
             );
         }
+    }
+
+    #[test]
+    fn the_hatch_only_excuses_a_file_that_is_actually_loose() {
+        // The startup warning is about a rule being BROKEN, not about a
+        // variable being exported: an operator who set it once for a throwaway
+        // setup and then chmod'ed everything must not be warned for ever.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let loose = write(dir.path(), "loose.access", "syt_dummy", 0o644);
+        let tight = write(dir.path(), "tight.access", "syt_dummy", 0o600);
+        let missing = dir.path().join("never-written.access");
+        let paths = vec![loose.clone(), tight, missing];
+        assert_eq!(excused_paths(&paths, true), vec![loose]);
+        assert!(
+            excused_paths(&paths, false).is_empty(),
+            "the hatch is off: nothing is being excused, however loose the file is"
+        );
+    }
+
+    #[test]
+    fn the_startup_warning_names_the_file_it_excused() {
+        // "loose permissions are allowed" tells an operator nothing they can
+        // act on; the path does.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let loose = write(dir.path(), "loose.access", "syt_dummy", 0o644);
+        let line = loose_perms_line(std::slice::from_ref(&loose)).expect("a line to log");
+        assert!(line.contains(&loose.display().to_string()), "{line}");
+        assert!(line.contains(ALLOW_LOOSE_PERMS_ENV), "{line}");
+        assert!(line.contains("chmod 600"), "{line}");
+        assert!(
+            loose_perms_line(&[]).is_none(),
+            "nothing excused is nothing to say"
+        );
+    }
+
+    #[test]
+    fn the_warning_looks_at_every_file_the_0600_rule_covers() {
+        // Whatever the rule is applied to elsewhere has to be in this list, or
+        // the escape hatch would waive a check nobody is ever told about. The
+        // two credential shapes are exclusive, so this is both of them.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = minimal(dir.path(), "");
+        let cfg = load_config(&path).expect("the token config loads");
+        let files = secret_files(&cfg, &path);
+        assert!(
+            files.contains(&dir.path().join("token")),
+            "the token file: {files:?}"
+        );
+        assert!(
+            files.contains(&cfg.cached_token_path()),
+            "the token a password login caches: {files:?}"
+        );
+        assert!(
+            !files.contains(&path),
+            "no password in this one, so the config file is not a secret: {files:?}"
+        );
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let key = write(dir.path(), "client.key", "-----BEGIN", 0o600);
+        let cert = write(dir.path(), "client.crt", "-----BEGIN", 0o600);
+        let body = format!(
+            "homeserver: https://matrix.example.com/\n\
+             user_id: \"@bot-a:example.com\"\n\
+             password: hunter2\n\
+             rooms:\n  - \"!room:example.com\"\n\
+             state_dir: {}\n\
+             brain:\n  kind: echo\n\
+             tls:\n  enabled: true\n  client_cert: {}\n  client_key: {}\n",
+            dir.path().join("state").display(),
+            cert.display(),
+            key.display()
+        );
+        let path = write(dir.path(), "config.yaml", &body, 0o600);
+        let cfg = load_config(&path).expect("the password config loads");
+        let files = secret_files(&cfg, &path);
+        assert!(
+            files.contains(&path),
+            "the config file holds the password: {files:?}"
+        );
+        assert!(files.contains(&key), "the tls client key: {files:?}");
     }
 
     #[test]

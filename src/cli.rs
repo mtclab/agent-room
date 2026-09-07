@@ -23,7 +23,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::brain::build_brain;
-use crate::config::load_config;
+use crate::config::{load_config, warn_loose_perms};
 use crate::connector::{Connector, describes_bot_policy};
 use crate::doctor;
 use crate::impulses::write_impulse;
@@ -259,13 +259,18 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
         },
         Command::Mcp { config } => match load_config(&config) {
-            Ok(cfg) => match mcp_server::serve(cfg).await {
-                Ok(code) => Ok(code),
-                Err(exc) => {
-                    error!("{exc:#}");
-                    Ok(BAD_CONFIG)
+            Ok(cfg) => {
+                // Before the first tool call, while a person is still watching
+                // the session start: what the escape hatch let through.
+                warn_loose_perms(&cfg, &config);
+                match mcp_server::serve(cfg).await {
+                    Ok(code) => Ok(code),
+                    Err(exc) => {
+                        error!("{exc:#}");
+                        Ok(BAD_CONFIG)
+                    }
                 }
-            },
+            }
             Err(exc) => {
                 error!("{exc}");
                 Ok(BAD_CONFIG)
@@ -345,6 +350,9 @@ async fn run_connector(path: &std::path::Path) -> Result<i32> {
         cfg.user_id,
         describes_bot_policy(&cfg)
     );
+    // Said out loud at every start, not only by `doctor`: an escape hatch
+    // nobody is reminded of is an escape hatch that becomes the deployment.
+    warn_loose_perms(&cfg, path);
     let http = cfg.tls.build_client()?;
     let clock = system_clock();
     let brain = build_brain(&brain_cfg, http.clone(), &cfg.state_dir, Arc::clone(&clock))?;

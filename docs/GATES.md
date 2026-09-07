@@ -2607,3 +2607,111 @@ last here 3 s ago`); restored, it passes.
 
 **Live.** G1-G12 and N1-N4 re-run on the musl binary after the fix; recorded
 in the rc.6 release entry below.
+
+# Runtime and doctor (rc.6, 2026-09-06)
+
+Four defects that only appear where nobody is watching: a homeserver that goes
+away for a night, a ledger `fsync`ed once per message in the room, a state
+directory anyone on the machine can read, and a supervisor restarting a process
+that can never come back. None of them is a crash, so none of them was ever
+going to be found by running the product for an hour.
+
+- **`/sync` retried every five seconds, for ever, with a warning per attempt.**
+  A homeserver down for eight hours wrote 5,760 identical warnings, which is a
+  log a real fault cannot be read out of, and 5,760 connection attempts at a
+  server that is already having a bad day. Now: exponential from 2 s with equal
+  jitter, capped at five minutes, ONE warning when it goes and one line when it
+  comes back, a debug per attempt in between - and the wait listens for the stop
+  signal, so a `systemctl stop` during a five-minute back-off is still immediate.
+- **The ledger was re-serialised and `fsync`ed on every event seen.** Every
+  message in the room, mine or not, addressed to me or not, cost a full write of
+  the whole ledger. Now the "I have seen this" marks are debounced behind a
+  dirty flag and written by the room's flush loop (2 s), at shutdown, and by the
+  next thing that spends a budget. Everything that SPENDS - a post, a loop
+  opened, raised or closed, the startup sweep's batch - still writes at once,
+  because those are promises and a consumed mark is not.
+- **`doctor` never looked at the state directory or the persona**, and never
+  asked the judge's endpoint anything - the three places a silent agent's cause
+  hides that the table had no row for.
+- **The systemd unit restarted a wedged device every ten seconds for ever.**
+  Exit 3 means this store did not publish the device's keys; no number of
+  restarts changes that.
+
+## Unit gates, 2026-09-06
+
+`make gate`: **403 tests** (284 in the crate, 103 R4 commands, 8 state-compat,
+4 changelog, 2 encrypted-room, the publish scrub and the knob-coverage gate),
+clippy pedantic clean with warnings as errors, `cargo fmt --check` clean. 26
+tests more than the 377 of 2026-09-05. No new knob: the back-off bounds and the
+flush interval are constants, and `tests/knob_coverage.rs` is unchanged at 81
+knobs.
+
+| Guard | Gate |
+|---|---|
+| the back-off doubles from 2 s and stops at five minutes | `connector::the_sync_back_off_doubles_from_two_seconds_and_stops_at_five_minutes` - the schedule as a list of ten waits, and `u32::MAX` failures still finite rather than `inf` |
+| every wait is jittered, and none of them is zero | `connector::every_wait_is_jittered_and_none_of_them_is_zero` - each wait inside `[full/2, full]`, and the draw actually moves it |
+| one warning when the homeserver goes, one line when it is back | `connector::the_homeserver_going_away_is_one_warning_and_coming_back_is_one_line` - twenty failures, exactly one "say it", and the recovery line only after a failure |
+| a sync that works puts the back-off back to the start | `connector::a_sync_that_works_puts_the_back_off_back_to_the_start` - otherwise a homeserver that blinks once an hour ends the day five minutes behind |
+| a consumed mark is debounced, and a flush writes it | `ledger::a_flush_puts_the_consumed_ids_on_disk` - the file does not exist before the flush and holds the id and the counter after |
+| nothing that was flushed is lost, and a post is never debounced | `ledger::nothing_is_lost_when_a_flushed_ledger_is_dropped_and_reloaded` - drop and reload: five consumed ids, the post, its tier-2 budget and the thread energy all came back; the one mark written after the flush did not, which IS the window |
+| the file the Python reads is still that file | `state_compat::a_promise_the_python_made_is_not_dropped_when_this_build_writes_the_file` - it now flushes before reading, which is the debounce's own rule ("anything that lets another reader see the file flushes first") |
+| the state directory is 0700 | `doctor::a_state_directory_anybody_can_read_fails_with_chmod_700` - 0755 on it is the crypto store, every transcript and the budgets readable by anyone with an account on the machine |
+| the state directory is writable, proven by writing | `doctor::a_state_directory_this_user_cannot_write_fails` - a probe file written and removed; mode bits alone cannot tell a read-only mount from a writable one |
+| not there yet is not a failure | `doctor::a_state_directory_that_is_not_there_yet_skips_rather_than_failing` - `doctor` before the first `run` is the normal case |
+| the probe leaves nothing behind | `doctor::the_probe_file_does_not_stay_behind` |
+| the persona is readable and not empty | `doctor::a_persona_that_cannot_be_read_or_is_empty_fails` - and no `persona_file` at all skips, because that is a legitimate config |
+| a judge of its own is a row of its own | `doctor::a_judge_endpoint_that_is_down_fails_on_its_own_row` - the brain row PASSes while the agent can never speak unprompted |
+| the judge is asked with the JUDGE's key | `doctor::a_judge_on_its_own_endpoint_is_asked_with_its_own_key` - a key-protected judge endpoint passes with `judge_api_key` and 401s without it, even with the reply endpoint's key set |
+| a judge model the endpoint does not serve | `doctor::a_judge_model_the_endpoint_does_not_serve_fails_on_the_judge_row` |
+| a judge that IS the brain is not a second row | `doctor::a_judge_that_shares_the_brain_is_not_a_row_of_its_own` |
+| `tls.verify: false` is said out loud, and does not fail the run | `doctor::tls_verification_off_is_a_warning_and_the_run_still_passes` |
+| the loose-permission hatch is a row while it is in force | `doctor::the_loose_permission_hatch_is_a_warning_row_when_it_is_in_force` - the flag, not the environment, so it says nothing about the variable the whole suite depends on being unset |
+| a WARN prints its fix, is counted apart, and is not a failure | `doctor::a_warning_prints_its_fix_and_is_counted_apart_from_the_failures` |
+| the hatch only excuses what is actually loose | `config::the_hatch_only_excuses_a_file_that_is_actually_loose` - a variable exported once, with every secret 0600, is not a warning for ever |
+| the start-up warning names the file | `config::the_startup_warning_names_the_file_it_excused` - "loose permissions are allowed" is not something an operator can act on; the path is |
+| every file the 0600 rule covers is in the list | `config::the_warning_looks_at_every_file_the_0600_rule_covers` - both credential shapes: token file plus cached token, and config file plus TLS key |
+
+The two escape hatches are deliberately different shapes. `doctor` shows the
+`perms` row whenever the variable is SET, because a person running `doctor` is
+asking what this configuration is; `run` and `mcp` warn only when it actually
+waived something, because a line at every start that nothing acted on is a line
+people learn to skip.
+
+## Teeth run, 2026-09-06
+
+One mutation at a time in `src/`, rebuilt, and only the gate that guard protects
+run against it. Nineteen mutants; every one of them failed its gate.
+
+| Guard removed | Gate | Result |
+|---|---|---|
+| `sync_backoff_s`: the doubling and the cap, back to a flat five seconds | `the_sync_back_off_doubles_from_two_seconds_and_stops_at_five_minutes` | FAILED |
+| `sync_backoff_s`: the jitter (the draw ignored, every wait the full one) | `every_wait_is_jittered_and_none_of_them_is_zero` | FAILED |
+| `SyncRetry::failed`: "say it" always true - the warning per attempt this slice removes | `the_homeserver_going_away_is_one_warning_and_coming_back_is_one_line` | FAILED |
+| `SyncRetry::succeeded`: the reset (`self.failures = 0`) | `a_sync_that_works_puts_the_back_off_back_to_the_start` | FAILED |
+| `Ledger::mark_consumed`: `save()` back in place of the dirty flag | `a_flush_puts_the_consumed_ids_on_disk` | FAILED - the file existed before the flush |
+| `Ledger::flush`: clears the flag and writes nothing | `a_flush_puts_the_consumed_ids_on_disk` | FAILED - `the flush wrote it: Os { code: 2, kind: NotFound }` |
+| `Ledger::record_post`: the immediate write replaced by the dirty flag | `nothing_is_lost_when_a_flushed_ledger_is_dropped_and_reloaded` | FAILED - a post was lost |
+| `config::excused_paths`: the hatch flag ignored | `the_hatch_only_excuses_a_file_that_is_actually_loose` | FAILED |
+| `config::loose_perms_line`: a count instead of the paths | `the_startup_warning_names_the_file_it_excused` | FAILED |
+| `config::secret_files`: the cached token dropped from the list | `the_warning_looks_at_every_file_the_0600_rule_covers` | FAILED |
+| `doctor::check_state_dir`: the 0700 check made unconditionally Ok | `a_state_directory_anybody_can_read_fails_with_chmod_700` | FAILED |
+| `doctor::check_state_dir`: the probe write made unconditionally Ok | `a_state_directory_this_user_cannot_write_fails` | FAILED |
+| `doctor::check_persona`: the empty-persona arm | `a_persona_that_cannot_be_read_or_is_empty_fails` | FAILED |
+| `doctor::check_judge`: the row never produced | `a_judge_endpoint_that_is_down_fails_on_its_own_row` | FAILED |
+| `doctor::check_judge`: the reply endpoint's key sent instead of the judge's | `a_judge_on_its_own_endpoint_is_asked_with_its_own_key` | FAILED |
+| `doctor::check_tls_verify`: the warning never produced | `tls_verification_off_is_a_warning_and_the_run_still_passes` | FAILED |
+| `doctor::perms_hatch`: the warning never produced | `the_loose_permission_hatch_is_a_warning_row_when_it_is_in_force` | FAILED |
+| `doctor::exit_code`: a WARN counted as a failure | `a_warning_prints_its_fix_and_is_counted_apart_from_the_failures` | FAILED |
+
+### A toothless pairing the run found in itself
+
+The first attempt pointed the gutted `flush()` at
+`nothing_is_lost_when_a_flushed_ledger_is_dropped_and_reloaded`, and that gate
+PASSED with the mutant in place. It is right to: the `record_post` that follows
+the flush in that test writes the whole ledger anyway, so what the gate proves
+is "a post writes", which is a different guard (and the mutant two rows above
+proves it). The gate that proves a FLUSH writes is
+`a_flush_puts_the_consumed_ids_on_disk`, which reads the file immediately after
+one and has nothing else in between - re-aimed, the same mutant failed it on the
+missing file. Recorded rather than quietly re-run: a mutant that survives is
+always information about the gate.
