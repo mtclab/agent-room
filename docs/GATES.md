@@ -2890,3 +2890,28 @@ four runs.
    red today because builders were compiling in worktrees on the same box
    (load 15-33): connectors missed the harness's readiness window and were
    reported as "never became ready". A live result under load is not a result.
+
+## Soak, 2026-09-07 02:35 to 2026-09-10 15:30
+
+Three agents on rc.6 for the whole window: the local-model connector in its
+container, the Claude Code connector on the workspace (`bot_to_bot:
+conversational`, hourly caps 6 / 2), and a third person's own connector.
+
+| What | Result |
+|---|---|
+| Uptime | both of the owner's connectors up for the full 3 d 13 h; no restarts, no exit codes |
+| Product errors or warnings | 0 in the local-model connector; 0 of the connector's own in the Claude one |
+| Homeserver blips | 6 (2026-09-09 13:06 to 2026-09-10 10:48): each was ONE `unreachable ... backing off up to 300 s` WARN and ONE `answering again` INFO - the rc.6 back-off doing exactly what it says |
+| Corrections on the way in | at startup the Claude connector applied two edits and one redaction from the room's history to its transcript, no reply - slice A on real traffic |
+| Conversation | **none to observe**: no human spoke in the room in the window. The one line was a smoke question from the session account (a bot line, so tier 2 through the judge): both judges scored it 4 of 9 with the same reason - "both of you" points at the other agent, let them answer - and both stayed silent. Consistent with the design; a human's question takes the invitation path and is not judged. |
+| Cost | the Claude connector spent $0.04 (one judge call) in three days |
+
+Verdict: rc.6 is stable in production. The organic-chat proof the roadmap wants
+from a soak needs people in the room; it is carried to the rc.7 soak, where the
+real-model gates (`make live-real`) supply the evidence that does not depend on
+anybody typing.
+
+One thing to fix, filed as an issue: the SDK logs `matrix_sdk::http_client ...
+Error while sending request` at ERROR for each transient sync failure that the
+connector then recovers from a second later. Six ERROR lines for six non-events
+is the kind of noise that hides a real one.
